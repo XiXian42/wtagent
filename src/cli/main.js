@@ -126,6 +126,8 @@ class ConversationRunner {
       profileDir: this.paths.profileDir,
       chromePath: options.chromePath,
       debug: options.debug,
+      // Minimize by default; `--no-minimize` sets options.minimize === false.
+      minimized: options.minimize !== false,
     });
     this.interrupted = false;
     this.closed = false;
@@ -514,6 +516,10 @@ const program = new Command()
   .option(
     "--model-turn-timeout-ms <milliseconds>",
     "Maximum wait for one ChatGPT response (default: 600000)",
+  )
+  .option(
+    "--no-minimize",
+    "Keep the Chrome window visible instead of minimizing it",
   )
   .option("--debug", "Write browser diagnostics", false)
   .argument(
