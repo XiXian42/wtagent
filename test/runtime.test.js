@@ -153,6 +153,57 @@ test("records @file attachments on the opening message and passes them to the ad
   ]);
 });
 
+test("restores the window for manual login, then re-minimizes", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // Guest shell first: the grace-period login check throws, forcing the
+  // explicit auth_required path that restores/minimizes the window.
+  class LoginNeededAdapter extends FakeWebModelAdapter {
+    constructor(responses) {
+      super(responses);
+      this.loginCalls = 0;
+    }
+
+    async getAuthState() {
+      return "unauthenticated";
+    }
+
+    async waitForManualLogin() {
+      this.loginCalls += 1;
+      if (this.loginCalls === 1) {
+        throw new Error("still guest");
+      }
+      // Second (real) call succeeds.
+    }
+  }
+
+  const adapter = new LoginNeededAdapter([
+    `<agent_response><done>true</done><message>Done.</message></agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Do a thing",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await runtime.run();
+
+  // The window is brought forward for login and sent back afterward.
+  assert.deepEqual(adapter.windowStateCalls, ["restore", "minimize"]);
+});
+
 test("conversation.started reports the actual mode, not the requested one", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");

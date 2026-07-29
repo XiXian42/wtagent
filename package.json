@@ -2,6 +2,14 @@
   "name": "wtagent",
   "version": "0.1.0-alpha.0",
   "description": "Turn your own web AI session into a local tool-using agent.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XiXian42/wtagent.git"
+  },
+  "homepage": "https://github.com/XiXian42/wtagent#readme",
+  "bugs": {
+    "url": "https://github.com/XiXian42/wtagent/issues"
+  },
   "type": "module",
   "bin": {
     "wtagent": "src/cli/main.js"

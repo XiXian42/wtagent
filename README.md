@@ -8,7 +8,7 @@ ChatGPT Web 负责推理并通过 XML 提出工具调用；本地 Node.js Runtim
 
 ## 当前能力
 
-- 独立、可见、持久化的 Chrome Profile。
+- 独立、可见、持久化的 Chrome Profile；默认启动后自动最小化窗口，需要登录或人机验证时自动恢复，随后再最小化（`--no-minimize` 可保持窗口可见）。
 - 原生 Chrome 登录，随后通过 CDP 连接同一个 Profile。
 - 自动选择 ChatGPT `Pro` 模式；按稳定的 DOM 属性（非显示文字）识别，兼容多语言界面。`Pro` 被限流不可选时，自动回退到菜单中它前一个可用模式（如 Extra high），并在 CLI 中打印所选模式或回退原因。
 - XML 单工具调用协议和有限格式重试。
@@ -99,6 +99,12 @@ wtagent -C ./my-site --mode Pro "添加联系页面并运行测试"
 
 ```bash
 wtagent --model-turn-timeout-ms 900000 -C ./my-site "执行 Extra High 代码审查"
+```
+
+Chrome 窗口默认在启动后最小化，不干扰桌面；需要人工登录或人机验证时会自动恢复，处理完再最小化。若想全程保持窗口可见：
+
+```bash
+wtagent --no-minimize -C ./my-site "调试这个页面"
 ```
 
 执行期间终端会显示：
@@ -243,6 +249,6 @@ npm pack --dry-run
 - V1 每轮只执行一个工具，不并行执行多个模型工具调用。
 - Session 恢复依赖已保存的 ChatGPT 会话 URL；URL 失效时需要新建 Session。
 - Windows/Linux 的真实 ChatGPT 网页端到端验收尚未在本工作区执行。
-- 不支持无头（headless）模式。实测无头 Chrome（`--headless` 与 `--headless=new`）访问 `chatgpt.com` 会被 Cloudflare 拦到验证页（标题为“请稍候…”，页面含 `challenges.cloudflare.com` / `cf-turnstile`），无法加载聊天界面；有头模式正常。因此浏览器必须以可见窗口运行。
+- 不支持无头（headless）模式。实测无头 Chrome（`--headless` 与 `--headless=new`）访问 `chatgpt.com` 会被 Cloudflare 拦到验证页（标题为“请稍候…”，页面含 `challenges.cloudflare.com` / `cf-turnstile`），无法加载聊天界面；有头模式正常。因此浏览器必须以可见窗口运行。若只是想让窗口不占用桌面，使用默认的自动最小化即可——最小化窗口不影响页面渲染（ChatGPT 仍正常加载）。
 
 完整架构与状态设计见 [技术方案](docs/technical-design.md)。

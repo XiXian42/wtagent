@@ -179,7 +179,7 @@ export class WebModelAdapter {
 
 - 在三个操作系统上发现已安装的 Chrome。
 - 为每个 CLI 用户创建独立 Profile 目录。
-- 以非 headless 方式启动 Chrome。
+- 以非 headless 方式启动 Chrome；默认启动后通过 CDP `Browser.setWindowBounds` 最小化窗口（macOS 上 `--start-minimized` 和离屏定位无效，故用 CDP 最小化），需要人工登录或人机验证时恢复、随后再最小化。最小化不影响页面渲染。
 - 保持浏览器进程、Context 和 Page 的生命周期。
 - 崩溃后尝试重启并重新打开任务会话。
 - 只允许连接由本应用启动的浏览器实例。

@@ -10,6 +10,8 @@ export class FakeWebModelAdapter {
     this.responseNumber = 0;
     this.startConversationCalls = [];
     this.sentAttachments = [];
+    // Records window-state calls so tests can assert restore/minimize ordering.
+    this.windowStateCalls = [];
   }
 
   async launch() {
@@ -18,6 +20,14 @@ export class FakeWebModelAdapter {
 
   async close() {
     this.launched = false;
+  }
+
+  async restoreWindow() {
+    this.windowStateCalls.push("restore");
+  }
+
+  async minimizeWindow() {
+    this.windowStateCalls.push("minimize");
   }
 
   async getAuthState() {

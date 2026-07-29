@@ -94,6 +94,50 @@ async function runLogin(options) {
   }
 }
 
+// Resets local login by deleting the dedicated Chrome profile. Login state for
+// this app lives entirely in that profile (chatgpt.com cookies + localStorage),
+// so removing it returns wtagent to a clean guest state — useful for testing the
+// full login → run flow. It never touches the real account server-side.
+async function runLogout(options) {
+  const { profileDir } = resolveRuntimePaths(options);
+  const exists = await fs.stat(profileDir)
+    .then((stat) => stat.isDirectory())
+    .catch(() => false);
+  if (!exists) {
+    console.log(`No Chrome profile found at ${profileDir}; already logged out.`);
+    return;
+  }
+
+  // Guard: only ever delete something that is actually the dedicated profile.
+  // A profile Chrome has used contains a "Default" profile directory; otherwise
+  // require the conventional "chrome-profile" basename before removing.
+  const looksLikeProfile = await fs.stat(path.join(profileDir, "Default"))
+    .then((stat) => stat.isDirectory())
+    .catch(() => false);
+  if (!looksLikeProfile && path.basename(profileDir) !== "chrome-profile") {
+    throw new Error(
+      `Refusing to delete ${profileDir}: it does not look like a wtagent Chrome profile.`,
+    );
+  }
+
+  if (!options.yes) {
+    const confirmed = await confirm({
+      message:
+        `This deletes the local ChatGPT session (Chrome profile at ${profileDir}) `
+        + "and requires a new login. Continue?",
+      default: false,
+    });
+    if (!confirmed) {
+      console.log("Logout cancelled.");
+      return;
+    }
+  }
+
+  await fs.rm(profileDir, { recursive: true, force: true });
+  console.log(`Logged out. Removed ${profileDir}.`);
+  console.log("Run `wtagent login` to sign in again.");
+}
+
 async function runDoctor(options) {
   const paths = resolveRuntimePaths(options);
   const chromePath = discoverChromeExecutable(options.chromePath);
@@ -539,6 +583,14 @@ program
   .command("login")
   .description("Open the dedicated Chrome profile and wait for ChatGPT login.")
   .action(async (_, command) => runLogin(command.optsWithGlobals()));
+
+program
+  .command("logout")
+  .description("Delete the local Chrome profile to reset the ChatGPT session.")
+  .option("--yes", "Skip the confirmation prompt", false)
+  .action(async (options, command) => {
+    await runLogout({ ...command.optsWithGlobals(), ...options });
+  });
 
 program
   .command("resume")
