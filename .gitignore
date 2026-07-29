@@ -1,0 +1,11 @@
+node_modules/
+.omx/
+.webagent/
+.wtagent/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+test.md

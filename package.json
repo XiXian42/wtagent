@@ -1,0 +1,47 @@
+{
+  "name": "wtagent",
+  "version": "0.1.0-alpha.0",
+  "description": "Turn your own web AI session into a local tool-using agent.",
+  "type": "module",
+  "bin": {
+    "wtagent": "src/cli/main.js"
+  },
+  "keywords": [
+    "agent",
+    "web-ai",
+    "chatgpt",
+    "cli",
+    "local-tools",
+    "browser"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "docs/technical-design.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:unit": "node --test test/protocol.test.js test/policy.test.js test/tools.test.js test/prompt-builder.test.js test/session-export.test.js test/platform.test.js test/cli.test.js test/at-files.test.js",
+    "test:integration": "node --test test/runtime.test.js",
+    "check": "node scripts/check-syntax.js",
+    "doctor": "node src/cli/main.js doctor",
+    "login": "node src/cli/main.js login",
+    "prepack": "npm run check && npm test",
+    "release:alpha": "npm publish --tag alpha"
+  },
+  "engines": {
+    "node": ">=20.17.0"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
+    "commander": "^15.0.0",
+    "fast-xml-parser": "^5.10.1",
+    "playwright-core": "^1.62.0",
+    "zod": "^4.4.3"
+  }
+}
