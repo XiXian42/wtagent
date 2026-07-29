@@ -18,7 +18,7 @@ ChatGPT Web 负责推理并通过 XML 提出工具调用；本地 Node.js Runtim
 - 项目外路径、提权、删除、推送、发布、部署和敏感环境变量的本地审批。
 - 一网页会话一份 Codex rollout、JSONL 事件日志、工具调用去重和待回传结果恢复。
 - 消息中用 `@文件` 附带本地文件，通过网页上传交给 ChatGPT（支持项目内外的任意路径）。
-- 默认对话入口，以及 `resume`、`status`、`login`、`doctor` CLI 命令。
+- 默认对话入口，以及 `resume`、`status`、`login`、`logout`、`doctor` CLI 命令。
 
 ## 环境要求
 
@@ -70,6 +70,15 @@ wtagent login
 CLI 会关闭原生窗口，用同一个 Profile 建立一次新的 CDP 连接并验证登录态。验证失败时会重新打开原生登录窗口，不会把 Google 登录成功误判为 ChatGPT 登录成功。
 
 不要在 `wtagent` 打开的 CDP 窗口中重新执行 Google OAuth；使用 `wtagent login` 更新登录状态。
+
+## 退出登录
+
+```bash
+wtagent logout          # 确认后删除本地 Chrome Profile
+wtagent logout --yes    # 跳过确认（用于脚本化测试）
+```
+
+登录状态完全保存在专用 Chrome Profile（chatgpt.com 的 Cookie 与 localStorage）中，没有单独的 token 文件。`logout` 只删除本地 Profile 目录，把 wtagent 恢复到全新的“游客”状态，方便从头验证 `login → run` 全流程；它不会影响你 ChatGPT 账号在其他浏览器/设备上的登录，也不会调用网页端的退出。下次 `wtagent login` 会重新创建 Profile。
 
 ## 新建会话
 
