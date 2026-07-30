@@ -64,6 +64,10 @@ export class Renderer {
     // line so the several completion-shaped events never double-print.
     this.handled = new Set();
     this.toolStart = new Map();
+    // A renderer lives for the whole interactive CLI session. Runtime turns
+    // still emit lifecycle events when they resume the same web conversation,
+    // but those milestones are only useful on the first turn.
+    this.lifecycleShown = new Set();
   }
 
   // ---- spinner -----------------------------------------------------------
@@ -251,6 +255,10 @@ export class Renderer {
     const { type, payload = {} } = event ?? {};
     switch (type) {
       case "browser.started":
+        if (this.lifecycleShown.has(type)) {
+          break;
+        }
+        this.lifecycleShown.add(type);
         this.status("Chrome started.");
         break;
       case "browser.auth_required":
@@ -272,6 +280,10 @@ export class Renderer {
         break;
       }
       case "conversation.started":
+        if (this.lifecycleShown.has(type)) {
+          break;
+        }
+        this.lifecycleShown.add(type);
         if (payload.mode) {
           this.status(`Conversation ready (${payload.mode}).`);
         } else {

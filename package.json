@@ -1,6 +1,6 @@
 {
   "name": "wtagent",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Turn your own web AI session into a local tool-using agent.",
   "repository": {
     "type": "git",
