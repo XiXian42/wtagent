@@ -198,10 +198,19 @@ export class AgentRuntime {
       await this.emit("browser.authenticated");
     }
 
-    await this.adapter.startConversation(resume ? previousConversationUrl : null);
+    await this.adapter.startConversation(
+      resume ? previousConversationUrl : null,
+      {
+        expectedAssistantMessageId: resume
+          ? this.session.state.lastAssistantMessageId
+          : null,
+      },
+    );
     // The actual mode may differ from the requested one (Pro limited, fallback,
     // or switcher not found), so report what was really selected.
-    let activeMode = mode;
+    let activeMode = resume
+      ? (this.session.state.activeMode ?? null)
+      : null;
     if (!resume) {
       const modeResult = await this.adapter.selectMode(mode);
       if (modeResult) {
@@ -226,6 +235,7 @@ export class AgentRuntime {
     await this.session.update({
       phase: "running",
       conversationUrl: await this.adapter.getConversationUrl(),
+      activeMode,
     });
     await this.emit("conversation.started", {
       url: this.session.state.conversationUrl,
@@ -251,6 +261,14 @@ export class AgentRuntime {
         initialTranscript = [userMessage(instruction, messageOptions)];
       }
       initialKind = "pending_tool_result";
+    } else if (resume && instruction?.trim()) {
+      // The live ChatGPT conversation already contains the bootstrap protocol
+      // and tool catalog. A normal follow-up should be the user's message, not
+      // another several-thousand-character protocol bootstrap. sendMessage()
+      // still appends the short format reminder.
+      initialMessage = instruction.trim();
+      initialTranscript = [userMessage(instruction.trim(), messageOptions)];
+      initialKind = "follow_up";
     } else if (resume) {
       const prompt = buildResumePrompt({
         instruction,
@@ -302,16 +320,22 @@ export class AgentRuntime {
           });
         },
       });
+      const assistantMessageId = await this.adapter
+        .getLastAssistantMessageId?.() ?? null;
       if (awaitingPendingAcknowledgement) {
         await this.session.clearPendingToolResult();
         awaitingPendingAcknowledgement = false;
       }
       await this.session.update({
         conversationUrl: await this.adapter.getConversationUrl(),
+        // Null is meaningful: retaining an older ID would falsely prove only
+        // that stale history had hydrated on the next resume.
+        lastAssistantMessageId: assistantMessageId,
       });
       await this.emit("model.message_complete", {
         turn: turnNumber,
         raw,
+        assistantMessageId,
       });
 
       let parsed;
@@ -391,8 +415,6 @@ export class AgentRuntime {
         continue;
       }
 
-      const assistantMessageId = await this.adapter
-        .getLastAssistantMessageId?.() ?? null;
       const identity = deriveToolIdentity({
         sessionId: this.session.sessionId,
         assistantMessageId,

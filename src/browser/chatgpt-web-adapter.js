@@ -42,6 +42,22 @@ function hasCompleteAgentEnvelope(text) {
   return start >= 0 && end >= start;
 }
 
+function sameConversationUrl(left, right) {
+  try {
+    const leftUrl = new URL(left);
+    const rightUrl = new URL(right);
+    return leftUrl.origin === rightUrl.origin
+      && leftUrl.pathname === rightUrl.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function parseConversationTurn(value) {
+  const match = String(value ?? "").match(/^conversation-turn-(\d+)$/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
 export class ChatGPTWebAdapter {
   constructor({
     profileDir,
@@ -58,9 +74,9 @@ export class ChatGPTWebAdapter {
     this.context = null;
     this.cdpChrome = null;
     this.page = null;
-    this.assistantCountBeforeSend = 0;
-    this.assistantIdBeforeSend = null;
-    this.assistantTextBeforeSend = "";
+    this.assistantIdsBeforeSend = new Set();
+    this.assistantMaxTurnBeforeSend = null;
+    this.sentUserTurn = null;
     this.lastAssistantMessageId = null;
     this.lastModeSelection = null;
   }
@@ -147,7 +163,10 @@ export class ChatGPTWebAdapter {
     );
   }
 
-  async startConversation(conversationUrl = null) {
+  async startConversation(
+    conversationUrl = null,
+    { expectedAssistantMessageId = null } = {},
+  ) {
     this.#requirePage();
     let target = this.baseUrl;
     if (conversationUrl) {
@@ -162,13 +181,26 @@ export class ChatGPTWebAdapter {
       target = parsed.href;
     }
 
-    await this.page.goto(target, { waitUntil: "domcontentloaded" });
+    const reuseCurrent = Boolean(
+      conversationUrl
+      && sameConversationUrl(this.page.url(), target),
+    );
+    if (!reuseCurrent) {
+      await this.page.goto(target, { waitUntil: "domcontentloaded" });
+    }
     const composer = await this.#waitForComposer(30_000);
     if (!composer) {
       throw new BrowserAdapterError(
         "ChatGPT composer was not found after opening a new conversation.",
         { code: "COMPOSER_NOT_FOUND" },
       );
+    }
+
+    if (conversationUrl) {
+      await this.#waitForConversationHistory({
+        expectedAssistantMessageId,
+      });
+      return;
     }
 
     if (!conversationUrl && !await this.#isFreshConversation()) {
@@ -321,17 +353,15 @@ export class ChatGPTWebAdapter {
     }
 
     const assistantMessages = this.#assistantMessages();
-    this.assistantCountBeforeSend = await assistantMessages.count();
-    if (this.assistantCountBeforeSend > 0) {
-      const lastAssistant = assistantMessages.last();
-      this.assistantIdBeforeSend = await lastAssistant
-        .getAttribute("data-message-id")
-        .catch(() => null);
-      this.assistantTextBeforeSend = await this.#assistantText(lastAssistant);
-    } else {
-      this.assistantIdBeforeSend = null;
-      this.assistantTextBeforeSend = "";
-    }
+    const assistantBaseline = await this.#captureMessageIdentities(
+      assistantMessages,
+    );
+    const userBaseline = await this.#captureMessageIdentities(
+      this.#userMessages(),
+    );
+    this.assistantIdsBeforeSend = assistantBaseline.ids;
+    this.assistantMaxTurnBeforeSend = assistantBaseline.maxTurn;
+    this.sentUserTurn = null;
 
     try {
       await composer.fill(text);
@@ -367,6 +397,7 @@ export class ChatGPTWebAdapter {
       ).catch(() => null);
     }
 
+    await this.#waitForSentUserMessage(userBaseline);
     return { attachment };
   }
 
@@ -433,15 +464,30 @@ export class ChatGPTWebAdapter {
       const candidateId = lastMessage
         ? await lastMessage.getAttribute("data-message-id").catch(() => null)
         : null;
-      const hasNewAssistant = count > this.assistantCountBeforeSend
-        || (
-          candidateId
-          && candidateId !== this.assistantIdBeforeSend
-        )
-        || (
-          candidateText
-          && candidateText !== this.assistantTextBeforeSend
-        );
+      const candidateTurn = lastMessage
+        ? await this.#messageTurn(lastMessage)
+        : null;
+      let hasNewAssistant;
+      if (this.sentUserTurn != null && candidateTurn != null) {
+        // Strongest boundary: the answer must be a conversation turn after
+        // the exact user message that sendMessage() observed in the DOM.
+        hasNewAssistant = candidateTurn > this.sentUserTurn;
+      } else if (candidateId) {
+        // Stable ChatGPT message IDs are the next-best boundary. Never accept
+        // an ID that existed before this send, even if its text or DOM position
+        // changed during hydration.
+        hasNewAssistant = !this.assistantIdsBeforeSend.has(candidateId);
+      } else if (
+        candidateTurn != null
+        && this.assistantMaxTurnBeforeSend != null
+      ) {
+        hasNewAssistant = candidateTurn > this.assistantMaxTurnBeforeSend;
+      } else {
+        // Without a stable message ID or turn boundary we cannot prove this
+        // reply belongs to the current send. Timing/count heuristics caused the
+        // stale-answer bug, so fail closed and let the bounded wait time out.
+        hasNewAssistant = false;
+      }
 
       if (hasNewAssistant) {
         sawAssistant = true;
@@ -561,6 +607,124 @@ export class ChatGPTWebAdapter {
 
   #assistantMessages() {
     return this.page.locator('[data-message-author-role="assistant"]');
+  }
+
+  #userMessages() {
+    return this.page.locator('[data-message-author-role="user"]');
+  }
+
+  async #messageTurn(message) {
+    if (typeof message?.evaluate !== "function") {
+      return null;
+    }
+    const testId = await message.evaluate((element) => (
+      element.closest('[data-testid^="conversation-turn-"]')
+        ?.getAttribute("data-testid") ?? null
+    )).catch(() => null);
+    return parseConversationTurn(testId);
+  }
+
+  async #messageIdentity(message) {
+    const [id, turn] = await Promise.all([
+      message.getAttribute("data-message-id").catch(() => null),
+      this.#messageTurn(message),
+    ]);
+    return { id, turn };
+  }
+
+  async #captureMessageIdentities(messages) {
+    const count = await messages.count().catch(() => 0);
+    const ids = new Set();
+    let maxTurn = null;
+    for (let index = 0; index < count; index += 1) {
+      const identity = await this.#messageIdentity(messages.nth(index));
+      if (identity.id) {
+        ids.add(identity.id);
+      }
+      if (identity.turn != null) {
+        maxTurn = maxTurn == null
+          ? identity.turn
+          : Math.max(maxTurn, identity.turn);
+      }
+    }
+    return { count, ids, maxTurn };
+  }
+
+  async #waitForSentUserMessage(baseline, attempts = 50) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const messages = this.#userMessages();
+      const count = await messages.count().catch(() => 0);
+      for (let index = count - 1; index >= 0; index -= 1) {
+        const identity = await this.#messageIdentity(messages.nth(index));
+        const newByTurn = identity.turn != null
+          && (
+            baseline.maxTurn == null
+            || identity.turn > baseline.maxTurn
+          );
+        const newById = Boolean(
+          identity.id
+          && !baseline.ids.has(identity.id),
+        );
+        if (newByTurn || newById) {
+          this.sentUserTurn = identity.turn;
+          return identity;
+        }
+      }
+      await this.page.waitForTimeout(100);
+    }
+    return null;
+  }
+
+  async #waitForConversationHistory({
+    expectedAssistantMessageId = null,
+    attempts = 60,
+  } = {}) {
+    let previousSignature = null;
+    let stableChecks = 0;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const assistant = await this.#captureMessageIdentities(
+        this.#assistantMessages(),
+      );
+      if (
+        expectedAssistantMessageId
+        && assistant.ids.has(expectedAssistantMessageId)
+      ) {
+        return;
+      }
+
+      if (!expectedAssistantMessageId) {
+        const totalMessages = await this.#conversationMessages()
+          .count()
+          .catch(() => 0);
+        const signature = [
+          totalMessages,
+          assistant.count,
+          assistant.maxTurn ?? "",
+          [...assistant.ids].join(","),
+        ].join(":");
+        if (totalMessages > 0 && signature === previousSignature) {
+          stableChecks += 1;
+          if (stableChecks >= 3) {
+            return;
+          }
+        } else {
+          stableChecks = 0;
+          previousSignature = signature;
+        }
+      }
+
+      await this.page.waitForTimeout(250);
+    }
+
+    await this.#writeDiagnostics("conversation-history-mismatch");
+    const detail = expectedAssistantMessageId
+      ? ` Expected assistant message ${expectedAssistantMessageId} was not found.`
+      : " Existing conversation history did not become stable.";
+    throw new BrowserAdapterError(
+      `ChatGPT conversation history could not be verified.${detail}`,
+      { code: "CONVERSATION_HISTORY_MISMATCH" },
+    );
   }
 
   async #assistantText(message) {

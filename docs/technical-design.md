@@ -593,7 +593,7 @@ sessions/<session-id>/
   tool-output.jsonl
 ```
 
-`session.json` 保存项目根目录、ChatGPT 会话 URL、当前 run phase、最近 turn、等待回填的工具结果和副作用恢复日志。它没有不可继续的 `completed task` 状态；`done=true` 只结束当前 run，Session 回到 `idle`。
+`session.json` 保存项目根目录、ChatGPT 会话 URL、最近确认的 assistant message ID、最近确认的实际模式、当前 run phase、最近 turn、等待回填的工具结果和副作用恢复日志。它没有不可继续的 `completed task` 状态；`done=true` 只结束当前 run，Session 回到 `idle`。
 
 `rollout-*.jsonl` 从创建时起直接使用 **Codex rollout 风格**：首行 `session_meta`，后续每行 `{timestamp, type: "response_item", payload}`，payload 采用 OpenAI Responses 形状（`message` / `function_call` / `function_call_output`）。
 
@@ -628,6 +628,8 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 
 - Chrome 仍在：根据专用 Profile、PID、CDP 端口和健康检查验证身份，复用浏览器并创建新的 Page。
 - Chrome 崩溃：用相同 Profile 重启并打开会话 URL。
+- 同一 CLI 进程中的 follow-up 保持在当前会话 Page，不重复导航；跨进程恢复需要等待本地记录的最近 assistant message ID 出现在 DOM 后才能发送。
+- 每次发送记录已有消息 ID 和新 user turn，只接受位于该 user turn 之后的新 assistant turn；无法建立可靠消息身份时超时并保存诊断，禁止退化为基于数量或文本变化猜测。
 - 同一 Profile 同时只允许一个 WTAgent CLI Session；启动和接管过程使用 Profile 级互斥锁。
 - 登录失效或出现验证：进入 `AUTH_REQUIRED`/`PAUSED`，让用户接管。
 - 会话页面丢失：从本地记录打开原会话；无法恢复时创建新的本地 Session 和新的网页对话，不向旧 rollout 继续追加。
@@ -639,6 +641,8 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 1. Agent 协议：只输出 `<agent_response>`。
 2. 当前可用工具及参数 Schema。
 3. 用户任务、项目根目录语义和执行边界。
+
+同一网页会话中的普通 follow-up 只发送新的用户输入，并在末尾追加短 `<system_reminder>`；不得重复发送完整 `<agent_protocol>`、工具目录或初始任务。只有没有新用户输入的中断恢复流程可以发送完整 resume scaffold。
 
 关键规则：
 

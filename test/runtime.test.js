@@ -245,6 +245,30 @@ test("conversation.started reports the actual mode, not the requested one", asyn
   // Actual mode is unknown (not "Pro"), so it must not falsely claim Pro.
   assert.equal(started.payload.mode, null);
   assert.equal(started.payload.requestedMode, "Pro");
+  assert.equal(session.state.activeMode, null);
+
+  const resumedEvents = [];
+  const followUpAdapter = new FakeWebModelAdapter([
+    `<agent_response><done>true</done><message>Still on the current mode.</message></agent_response>`,
+  ]);
+  const resumedRuntime = new AgentRuntime({
+    adapter: followUpAdapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => resumedEvents.push(event),
+  });
+  await resumedRuntime.run({
+    resume: true,
+    instruction: "Continue",
+  });
+
+  const resumedStarted = resumedEvents.find(
+    (event) => event.type === "conversation.started",
+  );
+  assert.equal(resumedStarted.payload.mode, null);
+  assert.equal(resumedStarted.payload.requestedMode, "Pro");
 });
 
 test("returns invalid tool calls to the model instead of executing them", async (t) => {
@@ -339,8 +363,9 @@ test("resumes the saved conversation with a follow-up instruction", async (t) =>
   });
 
   assert.equal(adapter.conversationUrl, conversationUrl);
-  assert.match(adapter.sentMessages[0], /<session_id>/);
-  assert.doesNotMatch(adapter.sentMessages[0], /previous_status/);
+  assert.doesNotMatch(adapter.sentMessages[0], /<agent_protocol>/);
+  assert.doesNotMatch(adapter.sentMessages[0], /<session_id>/);
+  assert.doesNotMatch(adapter.sentMessages[0], /Available tools:/);
   assert.match(adapter.sentMessages[0], /Add a contact page/);
   assertOneTrailingReminder(adapter.sentMessages[0]);
   assert.equal(session.state.turn, 6);
@@ -556,12 +581,71 @@ test("done ends the current run but the same session accepts a follow-up", async
   });
 
   assert.equal(followUpAdapter.startConversationCalls[0], conversationUrl);
+  assert.equal(
+    followUpAdapter.startConversationOptions[0].expectedAssistantMessageId,
+    "assistant-1",
+  );
+  assert.doesNotMatch(followUpAdapter.sentMessages[0], /<agent_protocol>/);
+  assert.match(followUpAdapter.sentMessages[0], /^Now answer again\n/);
   assert.equal(session.state.phase, "idle");
   assert.equal(session.state.lastMessage, "Follow-up answer.");
   const transcript = await session.readTranscript();
   assert.equal(
     transcript.items.filter((entry) => entry.item.role === "user").length,
     2,
+  );
+});
+
+test("does not carry an older assistant id past an unidentified reply", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Answer",
+    projectRoot,
+    mode: "Pro",
+  });
+  await session.update({
+    conversationUrl: "https://chatgpt.com/c/existing",
+    lastAssistantMessageId: "assistant-old",
+  });
+
+  const unidentifiedAdapter = new FakeWebModelAdapter([
+    `<agent_response><done>true</done><message>New unidentified answer.</message></agent_response>`,
+  ]);
+  unidentifiedAdapter.getLastAssistantMessageId = async () => null;
+  const makeRuntime = (adapter) => new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await makeRuntime(unidentifiedAdapter).run({
+    resume: true,
+    instruction: "Next",
+  });
+  assert.equal(
+    unidentifiedAdapter.startConversationOptions[0].expectedAssistantMessageId,
+    "assistant-old",
+  );
+  assert.equal(session.state.lastAssistantMessageId, null);
+
+  const followingAdapter = new FakeWebModelAdapter([
+    `<agent_response><done>true</done><message>Following answer.</message></agent_response>`,
+  ]);
+  await makeRuntime(followingAdapter).run({
+    resume: true,
+    instruction: "Again",
+  });
+  assert.equal(
+    followingAdapter.startConversationOptions[0].expectedAssistantMessageId,
+    null,
   );
 });
 

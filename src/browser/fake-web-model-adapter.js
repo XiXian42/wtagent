@@ -9,6 +9,7 @@ export class FakeWebModelAdapter {
     this.lastAssistantMessageId = null;
     this.responseNumber = 0;
     this.startConversationCalls = [];
+    this.startConversationOptions = [];
     this.sentAttachments = [];
     // Records window-state calls so tests can assert restore/minimize ordering.
     this.windowStateCalls = [];
@@ -36,8 +37,9 @@ export class FakeWebModelAdapter {
 
   async waitForManualLogin() {}
 
-  async startConversation(conversationUrl = null) {
+  async startConversation(conversationUrl = null, options = {}) {
     this.startConversationCalls.push(conversationUrl);
+    this.startConversationOptions.push(options);
     if (conversationUrl) {
       this.conversationUrl = conversationUrl;
     } else {

@@ -179,6 +179,8 @@ export class AgentSession {
       turn: 0,
       runCount: 0,
       conversationUrl: null,
+      lastAssistantMessageId: null,
+      activeMode: null,
       createdAt: now,
       updatedAt: now,
       rolloutFile: rolloutFileName(now, sessionId),
@@ -243,6 +245,8 @@ export class AgentSession {
       ? "idle"
       : (state.status ?? "idle");
     state.runCount ??= 0;
+    state.lastAssistantMessageId ??= null;
+    state.activeMode ??= null;
     state.rolloutFile ??= "transcript.jsonl";
     state.lastMessage ??= state.finalMessage ?? null;
     state.completedTools ??= {};
