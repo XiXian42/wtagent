@@ -335,6 +335,66 @@ export async function discoverReusableCdpState(profileDir, {
   );
 }
 
+// Kills Chrome processes bound to this profile whose CDP endpoint is dead, and
+// clears Chrome's singleton guard files. A half-dead prior instance (main
+// process gone or unresponsive, but renderer children still holding the
+// profile) makes a freshly launched Chrome hang during profile initialization:
+// the new CDP port answers HTTP/WS, but the browser main thread never becomes
+// usable, so connectOverCDP times out. Reaping those stale holders first
+// prevents the hang. Only ever touches processes that use THIS profile dir, and
+// never a live/healthy CDP instance. Best-effort.
+export async function reapStaleProfileChrome(profileDir, {
+  isAlive = isProcessAlive,
+  fetchVersion = fetchCdpVersion,
+  listProcesses = readProcessTable,
+  killTree = null,
+} = {}) {
+  const resolvedProfile = path.resolve(profileDir);
+  let processes;
+  try {
+    processes = await listProcesses();
+  } catch {
+    return { killed: [] };
+  }
+
+  const candidates = processes
+    .map((entry) => candidateFromProcess(entry, resolvedProfile))
+    .filter(Boolean);
+
+  const killed = [];
+  for (const candidate of candidates) {
+    // "Stale" = the CDP endpoint does not answer a healthy version probe. A
+    // healthy instance is left alone (it is a reuse candidate elsewhere).
+    let healthy = false;
+    try {
+      await fetchVersion(`http://127.0.0.1:${candidate.port}`);
+      healthy = true;
+    } catch {
+      healthy = false;
+    }
+    if (healthy) {
+      continue;
+    }
+    if (isAlive(candidate.pid) && typeof killTree === "function") {
+      await killTree(candidate.pid).catch(() => {});
+    }
+    killed.push(candidate.pid);
+  }
+
+  // Chrome's singleton profile guard is a symlink; a crashed instance can leave
+  // it dangling and block the next launch. Clear it when we reaped holders or
+  // when it points at a dead pid.
+  const ownerPid = await singletonOwnerPid(resolvedProfile);
+  if (killed.length > 0 || (ownerPid && !isAlive(ownerPid))) {
+    for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+      await fs.rm(path.join(resolvedProfile, name), { force: true })
+        .catch(() => {});
+    }
+  }
+
+  return { killed };
+}
+
 export async function acquireCdpProfileLock(profileDir, {
   ownerPid = process.pid,
   isAlive = isProcessAlive,

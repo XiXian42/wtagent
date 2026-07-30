@@ -191,3 +191,92 @@ test("does not kill a reused PID after the spawned Chrome has exited", async () 
   assert.equal(killed, false);
   assert.equal(released, true);
 });
+
+test("times out a hung connect, kills the spawned Chrome, and clears state", async (t) => {
+  const state = reusableState();
+  const child = new EventEmitter();
+  child.pid = 7777;
+  child.exitCode = null;
+  child.signalCode = null;
+  let killed = null;
+  let stateCleared = false;
+  let released = false;
+
+  const connect = launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+  }, {
+    acquireProfileLock: async () => async () => { released = true; },
+    // Simulate the real bug: the WS connects but protocol init never resolves.
+    connectOverCDP: () => new Promise(() => {}),
+    discoverReusable: async () => null,
+    fetchVersion: async () => ({ webSocketDebuggerUrl: state.webSocketDebuggerUrl }),
+    reapStale: async () => ({ killed: [] }),
+    killTree: async (pid) => { killed = pid; },
+    matchesState: async () => false,
+    removeState: async (_dir, expected) => { if (expected) stateCleared = true; },
+    reserveCdpPort: async () => state.port,
+    saveState: async () => state,
+    spawnChrome: () => {
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    waitForExit: async () => true,
+    waitForReady: async () => ({
+      Browser: "Chrome/Test",
+      webSocketDebuggerUrl: state.webSocketDebuggerUrl,
+    }),
+    connectTimeoutMs: 50,
+  });
+
+  await assert.rejects(connect, (error) => {
+    assert.match(error.message, /Timed out connecting to Chrome CDP/);
+    assert.match(error.message, /wtagent logout/);
+    return true;
+  });
+  // The hung instance we launched was killed and its stale state removed.
+  assert.equal(killed, child.pid);
+  assert.equal(stateCleared, true);
+  assert.equal(released, true);
+});
+
+test("reaps stale profile holders before launching a fresh Chrome", async () => {
+  const harness = fakeBrowserHarness();
+  const state = reusableState();
+  const child = new EventEmitter();
+  child.pid = 5150;
+  child.exitCode = null;
+  child.signalCode = null;
+  const order = [];
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+  }, {
+    acquireProfileLock: async () => async () => {},
+    connectOverCDP: async () => harness.browser,
+    discoverReusable: async () => null,
+    fetchVersion: async () => ({ webSocketDebuggerUrl: state.webSocketDebuggerUrl }),
+    reapStale: async () => { order.push("reap"); return { killed: [999] }; },
+    killTree: async () => {},
+    matchesState: async () => false,
+    removeState: async () => {},
+    reserveCdpPort: async () => state.port,
+    saveState: async () => state,
+    spawnChrome: () => {
+      order.push("spawn");
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+    waitForExit: async () => true,
+    waitForReady: async () => ({
+      Browser: "Chrome/Test",
+      webSocketDebuggerUrl: state.webSocketDebuggerUrl,
+    }),
+  });
+
+  // Reaping stale holders must happen before the fresh spawn, or the new
+  // Chrome hangs on the locked profile.
+  assert.deepEqual(order, ["reap", "spawn"]);
+  await connection.close();
+});

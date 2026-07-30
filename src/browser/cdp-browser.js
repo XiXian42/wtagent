@@ -7,6 +7,7 @@ import {
   discoverReusableCdpState,
   fetchCdpVersion,
   processMatchesCdpState,
+  reapStaleProfileChrome,
   removeCdpState,
   saveCdpState,
   waitForProcessExit,
@@ -38,6 +39,33 @@ async function settleWithin(promise, timeoutMs) {
       Promise.resolve(promise).catch(() => null),
       new Promise((resolve) => {
         timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Races a promise against a timeout. On timeout the returned promise rejects
+// with a TIMEOUT-tagged error. Used to bound connectOverCDP + the first CDP
+// round-trip: a Chrome whose profile is locked by a stale instance answers the
+// WS handshake but never finishes protocol init, so an unbounded connect hangs
+// for the full Playwright default (30s) before failing.
+class CdpTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CdpTimeoutError";
+    this.code = "CDP_CONNECT_TIMEOUT";
+  }
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new CdpTimeoutError(message)), timeoutMs);
       }),
     ]);
   } finally {
@@ -116,12 +144,14 @@ export async function launchAndConnectCdpChrome({
   fetchVersion = fetchCdpVersion,
   killTree = killProcessTree,
   matchesState = processMatchesCdpState,
+  reapStale = reapStaleProfileChrome,
   removeState = removeCdpState,
   reserveCdpPort = reservePort,
   saveState = saveCdpState,
   spawnChrome = spawn,
   waitForExit = waitForProcessExit,
   waitForReady = waitForCdp,
+  connectTimeoutMs = 20_000,
 } = {}) {
   const releaseProfileLock = await acquireProfileLock(profileDir);
   let child = null;
@@ -140,6 +170,11 @@ export async function launchAndConnectCdpChrome({
       reused = true;
     } else {
       await removeState(profileDir);
+      // A prior instance may have died leaving renderer children (and Chrome's
+      // SingletonLock) still holding this profile. Reap those stale holders
+      // before launching, or the new Chrome hangs during profile init and
+      // connectOverCDP times out.
+      await reapStale(profileDir, { fetchVersion, killTree }).catch(() => null);
       const port = await reserveCdpPort();
       const endpoint = `http://127.0.0.1:${port}`;
       child = spawnChrome(
@@ -192,8 +227,41 @@ export async function launchAndConnectCdpChrome({
       }
     }
 
-    browser = await connectOverCDP(state.endpoint);
-    const context = browser.contexts()[0];
+    // Bound the connect + first CDP round-trip. If Chrome's profile is held by
+    // a stale instance, the WS connects but protocol init never completes;
+    // without this guard Playwright hangs ~30s and leaves a dirty CDP state.
+    let context;
+    try {
+      browser = await withTimeout(
+        connectOverCDP(state.endpoint),
+        connectTimeoutMs,
+        `Timed out connecting to Chrome CDP at ${state.endpoint} after ${connectTimeoutMs}ms.`,
+      );
+      // contexts() forces a real protocol round-trip, so it hangs too when the
+      // browser main thread is stuck — keep it inside the timeout budget.
+      const contexts = await withTimeout(
+        Promise.resolve().then(() => browser.contexts()),
+        connectTimeoutMs,
+        `Timed out reading Chrome browser context at ${state.endpoint}.`,
+      );
+      context = contexts[0];
+    } catch (error) {
+      if (error instanceof CdpTimeoutError) {
+        // The verified-but-unusable instance we launched is a dead end. Kill it
+        // (only if we own it) and drop its CDP state so the next run starts
+        // clean instead of trying to reuse a hung endpoint.
+        await browser?.close().catch(() => null);
+        if (!reused && child?.pid) {
+          await killTree(child.pid).catch(() => null);
+        }
+        await removeState(profileDir, state).catch(() => null);
+        throw new Error(
+          `${error.message} The Chrome profile may be held by another instance. `
+          + "Close other windows using this profile, or run `wtagent logout` to reset it, then retry.",
+        );
+      }
+      throw error;
+    }
     if (!context) {
       throw new Error("Chrome CDP connection did not expose a browser context.");
     }

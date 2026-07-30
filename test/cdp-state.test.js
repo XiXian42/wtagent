@@ -8,6 +8,7 @@ import {
   acquireCdpProfileLock,
   discoverReusableCdpState,
   readCdpState,
+  reapStaleProfileChrome,
   saveCdpState,
 } from "../src/browser/cdp-state.js";
 
@@ -153,4 +154,55 @@ test("profile lock never removes a concurrently initializing lock", async (t) =>
     /still being initialized/,
   );
   assert.equal((await fs.stat(lockFile)).isFile(), true);
+});
+
+test("reaps a stale (dead-CDP) Chrome holding the profile and clears SingletonLock", async (t) => {
+  const profileDir = await createProfile(t);
+  await fs.symlink("HOST-4242", path.join(profileDir, "SingletonLock"));
+  const killed = [];
+
+  const result = await reapStaleProfileChrome(profileDir, {
+    isAlive: () => true,
+    // CDP endpoint is dead → the holder is stale and must be reaped.
+    fetchVersion: async () => {
+      throw new Error("connection refused");
+    },
+    listProcesses: async () => [{
+      pid: 4242,
+      command: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome `
+        + `--remote-debugging-port=57094 --user-data-dir=${profileDir}`,
+    }],
+    killTree: async (pid) => { killed.push(pid); },
+  });
+
+  assert.deepEqual(result.killed, [4242]);
+  assert.deepEqual(killed, [4242]);
+  // The dangling singleton guard is cleared so the next launch is not blocked.
+  await assert.rejects(fs.lstat(path.join(profileDir, "SingletonLock")), {
+    code: "ENOENT",
+  });
+});
+
+test("reap leaves a healthy CDP Chrome and its SingletonLock untouched", async (t) => {
+  const profileDir = await createProfile(t);
+  await fs.symlink("HOST-4242", path.join(profileDir, "SingletonLock"));
+  const killed = [];
+
+  const result = await reapStaleProfileChrome(profileDir, {
+    isAlive: () => true,
+    // Healthy CDP → this is a live instance, do not touch it.
+    fetchVersion: async () => ({ webSocketDebuggerUrl: "ws://x/y" }),
+    listProcesses: async () => [{
+      pid: 4242,
+      command: `Google Chrome --remote-debugging-port=57094 --user-data-dir=${profileDir}`,
+    }],
+    killTree: async (pid) => { killed.push(pid); },
+  });
+
+  assert.deepEqual(result.killed, []);
+  assert.deepEqual(killed, []);
+  assert.equal(
+    (await fs.lstat(path.join(profileDir, "SingletonLock"))).isSymbolicLink(),
+    true,
+  );
 });
