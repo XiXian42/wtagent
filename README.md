@@ -22,7 +22,7 @@ WTAgent 把 GPT 网页聊天连接到本地工具，提供类似 Codex 的 CLI A
 需要 Node.js 20.17+ 和 Chrome/Chromium。
 
 ```bash
-npm install -g wtagent@alpha
+npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
 wtagent login
 ```
 
@@ -60,7 +60,7 @@ No OpenAI API key or ChatGPT Pro subscription is required. WTAgent stores your w
 Requires Node.js 20.17+ and Chrome/Chromium.
 
 ```bash
-npm install -g wtagent@alpha
+npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
 wtagent login
 ```
 
