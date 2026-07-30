@@ -1,0 +1,399 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const CDP_STATE_FILE = ".wtagent-cdp.json";
+const PROFILE_LOCK_FILE = ".wtagent-session.lock";
+const STATE_VERSION = 1;
+const LOCK_INITIALIZATION_GRACE_MS = 5_000;
+
+function statePath(profileDir) {
+  return path.join(profileDir, CDP_STATE_FILE);
+}
+
+function lockPath(profileDir) {
+  return path.join(profileDir, PROFILE_LOCK_FILE);
+}
+
+async function readJson(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeJsonAtomic(filePath, value) {
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(
+      temporary,
+      `${JSON.stringify(value, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    await fs.rename(temporary, filePath);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function readInitializedLock(filePath) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const value = await readJson(filePath);
+    if (
+      Number.isSafeInteger(Number(value?.pid))
+      && Number(value.pid) > 0
+      && typeof value.token === "string"
+      && value.token
+    ) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return null;
+}
+
+export function isProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+export async function waitForProcessExit(
+  pid,
+  timeoutMs,
+  { isAlive = isProcessAlive } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !isAlive(pid);
+}
+
+export async function fetchCdpVersion(endpoint, timeoutMs = 1_500) {
+  const response = await fetch(`${endpoint}/json/version`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(`CDP health check returned HTTP ${response.status}.`);
+  }
+  const version = await response.json();
+  if (!version.webSocketDebuggerUrl) {
+    throw new Error("CDP health check did not return a WebSocket endpoint.");
+  }
+  return version;
+}
+
+function normalizeCandidate(candidate, profileDir) {
+  const pid = Number(candidate?.pid);
+  const port = Number(candidate?.port);
+  if (
+    !Number.isSafeInteger(pid)
+    || pid <= 0
+    || !Number.isSafeInteger(port)
+    || port <= 0
+    || port > 65_535
+  ) {
+    return null;
+  }
+  if (
+    candidate.profileDir
+    && path.resolve(candidate.profileDir) !== profileDir
+  ) {
+    return null;
+  }
+  return {
+    stateVersion: STATE_VERSION,
+    pid,
+    port,
+    endpoint: `http://127.0.0.1:${port}`,
+    profileDir,
+    startedAt: candidate.startedAt ?? null,
+  };
+}
+
+async function probeCandidate(candidate, profileDir, {
+  isAlive = isProcessAlive,
+  fetchVersion = fetchCdpVersion,
+} = {}) {
+  const normalized = normalizeCandidate(candidate, profileDir);
+  if (!normalized || !isAlive(normalized.pid)) {
+    return null;
+  }
+  try {
+    const version = await fetchVersion(normalized.endpoint);
+    if (
+      candidate.webSocketDebuggerUrl
+      && candidate.webSocketDebuggerUrl !== version.webSocketDebuggerUrl
+    ) {
+      return null;
+    }
+    return {
+      ...normalized,
+      browser: version.Browser ?? null,
+      webSocketDebuggerUrl: version.webSocketDebuggerUrl,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function readCdpState(profileDir) {
+  return await readJson(statePath(path.resolve(profileDir)));
+}
+
+export async function saveCdpState(profileDir, state) {
+  const resolvedProfile = path.resolve(profileDir);
+  const normalized = normalizeCandidate(state, resolvedProfile);
+  if (!normalized) {
+    throw new Error("Refusing to save invalid WTAgent CDP state.");
+  }
+  const value = {
+    ...normalized,
+    browser: state.browser ?? null,
+    webSocketDebuggerUrl: state.webSocketDebuggerUrl ?? null,
+    startedAt: state.startedAt ?? new Date().toISOString(),
+  };
+  await writeJsonAtomic(statePath(resolvedProfile), value);
+  return value;
+}
+
+export async function removeCdpState(profileDir, expected = null) {
+  const filePath = statePath(path.resolve(profileDir));
+  if (expected) {
+    const current = await readJson(filePath);
+    if (
+      current
+      && (
+        Number(current.pid) !== Number(expected.pid)
+        || Number(current.port) !== Number(expected.port)
+      )
+    ) {
+      return false;
+    }
+  }
+  await fs.rm(filePath, { force: true });
+  return true;
+}
+
+async function readProcessTable() {
+  if (process.platform === "win32") {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+      ],
+      { maxBuffer: 10 * 1024 * 1024 },
+    );
+    const parsed = JSON.parse(stdout || "[]");
+    return (Array.isArray(parsed) ? parsed : [parsed]).map((entry) => ({
+      pid: Number(entry.ProcessId),
+      command: String(entry.CommandLine ?? ""),
+    }));
+  }
+
+  const { stdout } = await execFileAsync(
+    "ps",
+    ["-axo", "pid=,command="],
+    { maxBuffer: 10 * 1024 * 1024 },
+  );
+  return stdout.split("\n").flatMap((line) => {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/);
+    return match
+      ? [{ pid: Number(match[1]), command: match[2] }]
+      : [];
+  });
+}
+
+function commandUsesProfile(command, profileDir) {
+  return (
+    command.includes(`--user-data-dir=${profileDir}`)
+    || command.includes(`--user-data-dir="${profileDir}"`)
+    || command.includes(`--user-data-dir='${profileDir}'`)
+  );
+}
+
+function candidateFromProcess(entry, profileDir) {
+  if (
+    !entry.command
+    || entry.command.includes("--type=")
+    || !commandUsesProfile(entry.command, profileDir)
+  ) {
+    return null;
+  }
+  const port = entry.command.match(/--remote-debugging-port=(\d+)/)?.[1];
+  return port
+    ? { pid: entry.pid, port: Number(port), profileDir }
+    : null;
+}
+
+async function singletonOwnerPid(profileDir) {
+  if (process.platform === "win32") {
+    return null;
+  }
+  try {
+    const target = await fs.readlink(path.join(profileDir, "SingletonLock"));
+    const pid = Number(target.match(/-(\d+)$/)?.[1]);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function processMatchesCdpState(state) {
+  const profileDir = path.resolve(state.profileDir);
+  const port = Number(state.port);
+  try {
+    const processes = await readProcessTable();
+    return processes.some((entry) => {
+      const candidate = candidateFromProcess(entry, profileDir);
+      return (
+        candidate?.pid === Number(state.pid)
+        && candidate.port === port
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+export async function discoverReusableCdpState(profileDir, {
+  isAlive = isProcessAlive,
+  fetchVersion = fetchCdpVersion,
+  listProcesses = readProcessTable,
+} = {}) {
+  const resolvedProfile = path.resolve(profileDir);
+  const saved = await readCdpState(resolvedProfile);
+  const savedHealthy = await probeCandidate(saved, resolvedProfile, {
+    isAlive,
+    fetchVersion,
+  });
+  if (savedHealthy) {
+    return await saveCdpState(resolvedProfile, savedHealthy);
+  }
+
+  let processes;
+  try {
+    processes = await listProcesses();
+  } catch {
+    return null;
+  }
+
+  const rawCandidates = processes
+    .map((entry) => candidateFromProcess(entry, resolvedProfile))
+    .filter(Boolean);
+  const uniqueCandidates = [...new Map(
+    rawCandidates.map((candidate) => [
+      `${candidate.pid}:${candidate.port}`,
+      candidate,
+    ]),
+  ).values()];
+  const healthy = (await Promise.all(
+    uniqueCandidates.map((candidate) =>
+      probeCandidate(candidate, resolvedProfile, {
+        isAlive,
+        fetchVersion,
+      })
+    ),
+  )).filter(Boolean);
+
+  if (healthy.length === 0) {
+    return null;
+  }
+  if (healthy.length === 1) {
+    return await saveCdpState(resolvedProfile, healthy[0]);
+  }
+
+  const ownerPid = await singletonOwnerPid(resolvedProfile);
+  const singleton = healthy.find((candidate) => candidate.pid === ownerPid);
+  if (singleton) {
+    return await saveCdpState(resolvedProfile, singleton);
+  }
+
+  throw new Error(
+    `Multiple live CDP Chrome instances use ${resolvedProfile}; `
+    + "close the extra instances before starting WTAgent.",
+  );
+}
+
+export async function acquireCdpProfileLock(profileDir, {
+  ownerPid = process.pid,
+  isAlive = isProcessAlive,
+} = {}) {
+  const resolvedProfile = path.resolve(profileDir);
+  const filePath = lockPath(resolvedProfile);
+  const token = randomUUID();
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const handle = await fs.open(filePath, "wx", 0o600);
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({
+            pid: ownerPid,
+            token,
+            createdAt: new Date().toISOString(),
+          })}\n`,
+        );
+      } finally {
+        await handle.close();
+      }
+
+      let released = false;
+      return async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        const current = await readJson(filePath);
+        if (current?.token === token) {
+          await fs.rm(filePath, { force: true });
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+      const existing = await readInitializedLock(filePath);
+      if (existing && isAlive(Number(existing.pid))) {
+        throw new Error(
+          `Another WTAgent session (pid=${existing.pid}) is already using `
+          + `${resolvedProfile}.`,
+        );
+      }
+      if (!existing) {
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (
+          stat
+          && Date.now() - stat.mtimeMs < LOCK_INITIALIZATION_GRACE_MS
+        ) {
+          throw new Error(
+            `The WTAgent profile lock at ${filePath} is still being initialized.`,
+          );
+        }
+      }
+      await fs.rm(filePath, { force: true });
+    }
+  }
+
+  throw new Error(`Could not acquire the WTAgent profile lock at ${filePath}.`);
+}

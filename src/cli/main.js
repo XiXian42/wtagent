@@ -2,7 +2,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
-import { confirm, input } from "@inquirer/prompts";
+import { confirm } from "@inquirer/prompts";
 import { ChatGPTWebAdapter } from "../browser/chatgpt-web-adapter.js";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
 import {
@@ -21,6 +21,12 @@ import { ProcessManager } from "../tools/process-manager.js";
 import { resolveLimits } from "../shared/limits.js";
 import { EXPORTERS } from "../session/session-export.js";
 import { extractAtMentions } from "./at-files.js";
+import {
+  classifyChatInput,
+  promptForText,
+  readChatMessage,
+  ShellChatInput,
+} from "./prompt-input.js";
 import { createRenderer } from "./render-events.js";
 
 function resolveRuntimePaths(options) {
@@ -55,10 +61,13 @@ async function runLogin(options) {
     });
 
     try {
-      await input({
+      const answer = await promptForText({
         message:
           "After the signed-in ChatGPT home is visible, press Enter here to save and verify",
       });
+      if (answer == null) {
+        return;
+      }
       console.log("Closing native Chrome and saving the dedicated profile...");
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     } finally {
@@ -242,7 +251,9 @@ class ConversationRunner {
     this.closed = true;
     this.renderer.finish();
     await this.processManager.stopAll().catch(() => {});
-    await this.adapter.close().catch(() => {});
+    await this.adapter.close().catch((error) => {
+      console.error(`Warning: ${error.message}`);
+    });
   }
 }
 
@@ -252,6 +263,7 @@ async function executeSession({
   resume = false,
   instruction = null,
   files = [],
+  chatInput = null,
 }) {
   const paths = resolveRuntimePaths(options);
   await ensureDirectory(paths.sessionsDir);
@@ -259,7 +271,7 @@ async function executeSession({
 
   const onInterrupt = async () => {
     if (runner.interrupted) {
-      process.exit(130);
+      return;
     }
     runner.interrupted = true;
     runner.renderer.stopSpinner();
@@ -270,6 +282,11 @@ async function executeSession({
   process.on("SIGINT", onInterrupt);
 
   const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
+  const activeChatInput = chatInput
+    ?? (interactive ? new ShellChatInput() : null);
+  if (instruction) {
+    activeChatInput?.remember(instruction);
+  }
 
   try {
     runner.renderer.hint(`Session ID: ${session.sessionId}`);
@@ -303,7 +320,7 @@ async function executeSession({
         }
       }
 
-      const next = await promptForNextMessage(runner);
+      const next = await promptForNextMessage(runner, activeChatInput);
       if (next == null) {
         break;
       }
@@ -315,34 +332,37 @@ async function executeSession({
     return null;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
+    activeChatInput?.close();
     await runner.close();
     console.log(`Session saved at: ${session.directory}`);
   }
 }
 
-// Reads the user's next message from the interactive prompt. Returns null when
-// the user wants to end the conversation (blank line, exit/quit, or EOF), or
+// Reads the user's next message from the interactive prompt. Empty input simply
+// re-prompts. Returns null for an explicit exit command, Ctrl+C, Ctrl+D, or EOF;
+// otherwise returns
 // { text, files } where files are resolved @file attachments.
-async function promptForNextMessage(runner) {
+async function promptForNextMessage(runner, chatInput) {
   for (;;) {
-    let answer;
-    try {
-      answer = await input({
+    const answer = chatInput
+      ? await chatInput.read()
+      : await promptForText({
         message: "you ›",
         theme: { prefix: "" },
       });
-    } catch {
+    if (answer == null) {
       // Ctrl+C / Ctrl+D inside the prompt ends the conversation cleanly.
       runner.renderer.println("");
       return null;
     }
-    const text = String(answer ?? "").trim();
-    if (!text) {
+    const classified = classifyChatInput(answer);
+    if (classified.kind === "empty") {
+      continue;
+    }
+    if (classified.kind === "exit") {
       return null;
     }
-    if (["exit", "quit", ":q", "/exit", "/quit"].includes(text.toLowerCase())) {
-      return null;
-    }
+    const { text } = classified;
     const files = await resolveMessageAttachments(runner, text);
     return { text, files };
   }
@@ -370,6 +390,7 @@ async function runAgent(taskParts, options) {
   const projectRoot = path.resolve(options.project ?? process.cwd());
   await assertDirectory(projectRoot);
   const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
+  const chatInput = interactive ? new ShellChatInput() : null;
 
   // In interactive mode an initial task is optional: the user can just start
   // typing at the prompt. In one-shot mode a task is required.
@@ -378,13 +399,21 @@ async function runAgent(taskParts, options) {
     if (interactive) {
       printChatBanner(projectRoot, options.mode);
     }
-    task = (await input({
-      message: interactive ? "you ›" : "Task",
-      theme: interactive ? { prefix: "" } : undefined,
-      validate: (value) => value.trim() ? true : "Please type a message.",
-    })).trim();
+    const initialMessage = interactive
+      ? await readChatMessage(() => chatInput.read())
+      : await promptForText({
+        message: "Task",
+        validate: (value) => value.trim() ? true : "Please type a message.",
+      });
+    if (initialMessage == null) {
+      chatInput?.close();
+      console.log("");
+      return null;
+    }
+    task = initialMessage.trim();
   } else if (interactive) {
     printChatBanner(projectRoot, options.mode);
+    chatInput.remember(task);
   }
 
   const paths = resolveRuntimePaths(options);
@@ -413,7 +442,7 @@ async function runAgent(taskParts, options) {
     }
   }
 
-  return await executeSession({ session, options, files });
+  return await executeSession({ session, options, files, chatInput });
 }
 
 function printChatBanner(projectRoot, mode) {
@@ -421,8 +450,8 @@ function printChatBanner(projectRoot, mode) {
   const DIM = "\x1b[2m";
   const RESET = "\x1b[0m";
   console.log("");
-  console.log(`${CYAN}WTAgent${RESET} ${DIM}· ChatGPT ${mode ?? "Pro"} · ${projectRoot}${RESET}`);
-  console.log(`${DIM}Type a message and press Enter. Blank line, "exit", or Ctrl+C to quit.${RESET}`);
+  console.log(`${CYAN}WTAgent${RESET} ${DIM}· GPT Web · ${projectRoot}${RESET}`);
+  console.log(`${DIM}Enter sends · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
   console.log("");
 }
 
@@ -546,7 +575,7 @@ async function runExport(sessionId, options) {
 const program = new Command()
   .name("wtagent")
   .description("Turn your web AI session into a local tool-using agent.")
-  .version("0.1.0-alpha.0")
+  .version("0.1.0-alpha.1")
   .option("--home <path>", "Application data directory")
   .option("--profile-dir <path>", "Dedicated Chrome profile directory")
   .option("--chrome-path <path>", "Chrome/Chromium executable")

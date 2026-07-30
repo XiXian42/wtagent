@@ -93,9 +93,10 @@ class AssistantCollection extends EmptyLocator {
 function createPage({
   title = "ChatGPT",
   assistantText = "",
+  assistant = null,
   visibleSelectors = [],
 } = {}) {
-  const assistant = new AssistantMessage(assistantText);
+  const message = assistant ?? new AssistantMessage(assistantText);
   const visible = new Set(visibleSelectors);
 
   return {
@@ -105,7 +106,7 @@ function createPage({
 
     locator(selector) {
       if (selector === '[data-message-author-role="assistant"]') {
-        return new AssistantCollection(assistant);
+        return new AssistantCollection(message);
       }
       return visible.has(selector)
         ? new VisibleLocator()
@@ -118,6 +119,40 @@ function createPage({
 
     async waitForTimeout() {},
   };
+}
+
+// Emits a sequence of `.markdown` snapshots, advancing one frame per read, to
+// simulate ChatGPT streaming the reply. The last frame sticks.
+class StreamingAssistantMessage extends EmptyLocator {
+  constructor(frames) {
+    super();
+    this.frames = frames;
+    this.index = 0;
+  }
+
+  locator(selector) {
+    if (selector === ".markdown") {
+      const self = this;
+      return {
+        async count() {
+          return 1;
+        },
+        last() {
+          return this;
+        },
+        async innerText() {
+          const frame = self.frames[Math.min(self.index, self.frames.length - 1)];
+          self.index += 1;
+          return frame;
+        },
+      };
+    }
+    return new EmptyLocator();
+  }
+
+  async getAttribute(name) {
+    return name === "data-message-id" ? "assistant-new" : null;
+  }
 }
 
 test("normal chat and tool text cannot trigger blocked-page detection", async () => {
@@ -153,6 +188,29 @@ test("visible challenge UI still triggers blocked-page detection", async () => {
     }),
     /Browser access challenge detected/,
   );
+});
+
+test("does not accept a protocol reply until its closing tag has streamed in", async () => {
+  const truncated = "```xml\n<agent_response>\n  <done>false</done>\n  <tool_call name=\"terminal.exec\">\n    <args><program>./qsort</program>";
+  const complete = `${truncated}</args>\n  </tool_call>\n</agent_response>\n\`\`\``;
+  // First reads return the still-streaming, unclosed envelope; later reads
+  // return the finished one. With stableWindowMs=0 the old code would have
+  // accepted the truncated frame immediately.
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistant: new StreamingAssistantMessage([
+      truncated, truncated, truncated, complete, complete,
+    ]),
+  });
+
+  const result = await adapter.waitForTurnComplete({
+    timeoutMs: 2_000,
+    stableWindowMs: 0,
+  });
+
+  // The accepted text must contain the complete envelope, not the truncated one.
+  assert.match(result, /<\/agent_response>/);
+  assert.match(result, /<\/tool_call>/);
 });
 
 function createConversationPage({

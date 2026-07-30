@@ -78,7 +78,7 @@ export class ChatGPTWebAdapter {
       minimized: this.minimized,
     });
     this.context = this.cdpChrome.context;
-    this.page = this.context.pages()[0] ?? await this.context.newPage();
+    this.page = this.cdpChrome.page;
     this.page.setDefaultTimeout(15_000);
     this.page.setDefaultNavigationTimeout(60_000);
     await this.page.goto(this.baseUrl, { waitUntil: "domcontentloaded" });
@@ -456,9 +456,20 @@ export class ChatGPTWebAdapter {
         }
 
         const stopVisible = await this.#isStopButtonVisible();
+        // If the reply looks like protocol XML, never accept it until BOTH the
+        // opening and closing tags are present. During streaming the text can
+        // briefly go quiet (or the stop button flip off) after "<agent_response"
+        // is painted but before "</agent_response>" arrives; accepting there
+        // hands the parser a truncated envelope. Non-protocol chatter (no
+        // "<agent_response") is unaffected and still completes on the stable
+        // window below.
+        const looksLikeProtocol = lastText.includes("<agent_response");
+        const envelopeReady = !looksLikeProtocol
+          || hasCompleteAgentEnvelope(lastText);
         if (
           lastText.trim()
           && stableSince > 0
+          && envelopeReady
           && (
             (
               !stopVisible

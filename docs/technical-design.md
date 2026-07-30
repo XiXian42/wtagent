@@ -1,4 +1,4 @@
-# WTAgent：ChatGPT Web 本地工具 Agent 技术方案
+# WTAgent：GPT Web 本地工具 Agent 技术方案
 
 ## 1. 结论
 
@@ -6,7 +6,7 @@
 
 - 用户在终端中选择项目目录并输入开发任务。
 - CLI 启动一个独立、可见、持久化 Profile 的 Chrome。
-- 用户首次在该 Chrome 中手动登录自己的 ChatGPT Pro。
+- 用户首次在该 Chrome 中手动登录自己的 ChatGPT Web 账号；Pro 不是前提，只是账号可用时的额外模型与额度。
 - ChatGPT Web 只负责推理；本地 Runtime 负责工具、权限、状态和恢复。
 - 双方通过普通聊天文本中的自定义 XML 交换工具调用和结果。
 - Runtime 循环执行“网页回复 → 解析工具 → 本地执行 → 回填结果”，直到任务完成。
@@ -626,8 +626,9 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 
 ### 9.3 浏览器恢复
 
-- Chrome 仍在：重新连接 Page 并校验会话 URL。
+- Chrome 仍在：根据专用 Profile、PID、CDP 端口和健康检查验证身份，复用浏览器并创建新的 Page。
 - Chrome 崩溃：用相同 Profile 重启并打开会话 URL。
+- 同一 Profile 同时只允许一个 WTAgent CLI Session；启动和接管过程使用 Profile 级互斥锁。
 - 登录失效或出现验证：进入 `AUTH_REQUIRED`/`PAUSED`，让用户接管。
 - 会话页面丢失：从本地记录打开原会话；无法恢复时创建新的本地 Session 和新的网页对话，不向旧 rollout 继续追加。
 
@@ -686,8 +687,8 @@ Session 界面展示：
 
 用户可随时：
 
-- `Ctrl+C` 第一次请求安全暂停；
-- 再次 `Ctrl+C` 强制终止当前 run；
+- `Ctrl+C` 或 `Ctrl+D` 退出 CLI，并关闭专用 Chrome；
+- 若关闭未完成，保留经过验证的 CDP 状态，下一次启动复用后再次执行关闭；
 - 输入补充指令；
 - 打开浏览器人工接管；
 - 恢复自动化。
