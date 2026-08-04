@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -37,7 +37,21 @@ jobs:
         run: npm run check
 
       - name: Test suite
+        if: runner.os != 'Windows'
         run: npm test
+
+      - name: Test suite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm test 2>&1 | Tee-Object -FilePath test-output.log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $tail = (Get-Content test-output.log -Tail 160) -join "`n"
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows test failure::$escaped"
+            exit $testExitCode
+          }
 
       - name: Package dry run
         run: npm pack --dry-run
