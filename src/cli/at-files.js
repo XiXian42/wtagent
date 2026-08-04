@@ -49,7 +49,9 @@ export async function extractAtMentions(text, projectRoot) {
 
     // Absolute paths are used as-is; relative paths resolve against the project
     // root. `~` is expanded to the user's home directory for convenience.
-    const expanded = expandHome(mention.requested);
+    // Backslashes are normalized to the platform separator so Windows-style
+    // paths (src\\main.js) work on POSIX hosts too.
+    const expanded = expandHome(mention.requested).replaceAll("\\", path.sep);
     const absPath = path.isAbsolute(expanded)
       ? path.resolve(expanded)
       : path.resolve(projectRoot, expanded);

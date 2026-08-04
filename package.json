@@ -32,7 +32,7 @@
     "test": "node --test",
     "test:unit": "node --test test/protocol.test.js test/policy.test.js test/tools.test.js test/prompt-builder.test.js test/session-export.test.js test/platform.test.js test/cli.test.js test/at-files.test.js",
     "test:integration": "node --test test/runtime.test.js",
-    "test:windows": "node --test test/windows-fixtures.test.js test/windows-package-smoke.test.js",
+    "test:windows": "node --test test/windows-command-launcher.test.js test/windows-diagnostics.test.js test/windows-search-path.test.js test/atomic-write.test.js test/process-utils.test.js test/cdp-state.test.js test/windows-fixtures.test.js test/windows-package-smoke.test.js",
     "check": "node scripts/check-syntax.js",
     "doctor": "node src/cli/main.js doctor",
     "login": "node src/cli/main.js login",

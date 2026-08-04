@@ -169,3 +169,60 @@ test("terminal description stays platform-neutral about external filters", () =>
   assert.match(terminal.description, /fs\.search\/fs\.read/);
   assert.match(terminal.description, /test-runner filters/);
 });
+
+test("path guard handles UNC server-share paths on win32", () => {
+  assert.equal(
+    isPathInside(
+      String.raw`\\server\share\repo`,
+      String.raw`\\server\share\repo\src\index.js`,
+      { platform: "win32" },
+    ),
+    true,
+  );
+  assert.equal(
+    isPathInside(
+      String.raw`\\server\share\repo`,
+      String.raw`\\server\share\other\index.js`,
+      { platform: "win32" },
+    ),
+    false,
+  );
+});
+
+test("path guard rejects all Windows reserved device names", () => {
+  const reserved = [
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+  ];
+  for (const name of reserved) {
+    assert.throws(
+      () => assertWindowsSafeName(`safe\\${name}.txt`, { platform: "win32" }),
+      /reserved Windows device name/i,
+      `${name} should be rejected`,
+    );
+    // Reserved names are case-insensitive.
+    assert.throws(
+      () => assertWindowsSafeName(`safe\\${name.toLowerCase()}.txt`, { platform: "win32" }),
+      /reserved Windows device name/i,
+      `${name.toLowerCase()} should be rejected`,
+    );
+    // Reserved names work with any extension.
+    assert.throws(
+      () => assertWindowsSafeName(`safe\\${name}.log`, { platform: "win32" }),
+      /reserved Windows device name/i,
+      `${name}.log should be rejected`,
+    );
+  }
+});
+
+test("path guard rejects Windows illegal characters in path components", () => {
+  const illegal = ["<", ">", ":", '"', "|", "?", "*"];
+  for (const char of illegal) {
+    assert.throws(
+      () => assertWindowsSafeName(`safe\\file${char}name.txt`, { platform: "win32" }),
+      /illegal on Windows/i,
+      `character ${JSON.stringify(char)} should be rejected`,
+    );
+  }
+});

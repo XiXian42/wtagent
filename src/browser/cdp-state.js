@@ -286,13 +286,17 @@ async function singletonOwnerPid(profileDir) {
   }
 }
 
-export async function processMatchesCdpState(state) {
-  const profileDir = path.resolve(state.profileDir);
+export async function processMatchesCdpState(state, {
+  listProcesses = readProcessTable,
+  platform = process.platform,
+} = {}) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  const profileDir = pathApi.resolve(state.profileDir);
   const port = Number(state.port);
   try {
-    const processes = await readProcessTable();
+    const processes = await listProcesses();
     return processes.some((entry) => {
-      const candidate = candidateFromProcess(entry, profileDir);
+      const candidate = candidateFromProcess(entry, profileDir, platform);
       return (
         candidate?.pid === Number(state.pid)
         && candidate.port === port

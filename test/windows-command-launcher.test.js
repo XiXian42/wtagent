@@ -257,3 +257,79 @@ test("ProcessManager never overwrites an exited state after tree termination", a
 
   assert.equal(manager.read(started.processId).status, "exited");
 });
+
+test("getWindowsSearchDirs strips surrounding quotes from PATH entries", () => {
+  const dirs = __internal.getWindowsSearchDirs("C:\\repo", {
+    PATH: '"C:\\Program Files\\nodejs";C:\\Windows\\System32;"C:\\tools"',
+  });
+  assert.deepEqual(dirs, [
+    "C:\\repo",
+    "C:\\Program Files\\nodejs",
+    "C:\\Windows\\System32",
+    "C:\\tools",
+  ]);
+});
+
+test("resolveLaunchPlan uses cmd bridge for .bat files on win32", () => {
+  const probe = createFsProbe(["C:\\repo\\build.bat"]);
+  const plan = resolveLaunchPlan({
+    program: "build.bat",
+    argv: ["--target", "release"],
+    cwd: "C:\\repo",
+    platform: "win32",
+    env: {
+      PATH: "C:\\repo",
+      PATHEXT: ".EXE;.BAT;.CMD",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+    },
+    ...probe,
+  });
+
+  assert.equal(plan.bridge, "cmd");
+  assert.equal(plan.command, "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(plan.resolvedProgram, "C:\\repo\\build.bat");
+  assert.equal(plan.logicalProgram, "build.bat");
+  assert.deepEqual(plan.logicalArgv, ["--target", "release"]);
+});
+
+test("resolveLaunchPlan double-escapes proxy .cmd shims detected by content", () => {
+  const probe = createFsProbe(["C:\\repo\\my-shim.cmd"]);
+  const plan = resolveLaunchPlan({
+    program: "my-shim.cmd",
+    argv: ["%PATH%", "a&b"],
+    cwd: "C:\\repo",
+    platform: "win32",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    readBatchPrefixImpl: () => "@echo off\r\nnode runner.js %*\r\n",
+    ...probe,
+  });
+
+  const singleEscaped = __internal.buildBatchCommand("C:\\repo\\my-shim.cmd", ["%PATH%", "a&b"], {
+    doubleEscapeMetaChars: false,
+  });
+  const doubleEscaped = __internal.buildBatchCommand("C:\\repo\\my-shim.cmd", ["%PATH%", "a&b"], {
+    doubleEscapeMetaChars: true,
+  });
+
+  assert.equal(plan.args[3], doubleEscaped);
+  assert.notEqual(plan.args[3], singleEscaped);
+});
+
+test("resolveLaunchPlan does not double-escape non-proxy batch files", () => {
+  const probe = createFsProbe(["C:\\repo\\plain.cmd"]);
+  const plan = resolveLaunchPlan({
+    program: "plain.cmd",
+    argv: ["hello"],
+    cwd: "C:\\repo",
+    platform: "win32",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    readBatchPrefixImpl: () => "@echo off\r\necho hello\r\n",
+    ...probe,
+  });
+
+  const singleEscaped = __internal.buildBatchCommand("C:\\repo\\plain.cmd", ["hello"], {
+    doubleEscapeMetaChars: false,
+  });
+
+  assert.equal(plan.args[3], singleEscaped);
+});

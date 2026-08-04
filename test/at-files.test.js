@@ -98,3 +98,38 @@ test("dedupes repeated mentions of the same file", async () => {
     assert.equal(result.files.length, 1);
   });
 });
+
+test("resolves Windows-style backslash relative paths", async () => {
+  await withProject(async (root) => {
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "src", "main.js"), "x");
+    const result = await extractAtMentions("edit @src\\main.js", root);
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].name, "main.js");
+  });
+});
+
+test("resolves quoted Windows paths with spaces and backslashes", async () => {
+  await withProject(async (root) => {
+    await fs.mkdir(path.join(root, "my docs"));
+    await fs.writeFile(path.join(root, "my docs", "notes.txt"), "x");
+    const result = await extractAtMentions('read @"my docs\\notes.txt"', root);
+    assert.equal(result.files.length, 1);
+    assert.equal(result.files[0].name, "notes.txt");
+  });
+});
+
+test("expands ~ to the user home directory on Windows-style paths", async () => {
+  await withProject(async (root) => {
+    const home = os.homedir();
+    const target = path.join(home, "wtagent-at-home-test.txt");
+    await fs.writeFile(target, "x");
+    try {
+      const result = await extractAtMentions("read @~\\wtagent-at-home-test.txt", root);
+      assert.equal(result.files.length, 1);
+      assert.equal(result.files[0].name, "wtagent-at-home-test.txt");
+    } finally {
+      await fs.rm(target, { force: true });
+    }
+  });
+});

@@ -8,6 +8,7 @@ import {
   acquireCdpProfileLock,
   discoverReusableCdpState,
   inspectCdpProfileState,
+  processMatchesCdpState,
   readCdpState,
   reapStaleProfileChrome,
   saveCdpState,
@@ -334,4 +335,84 @@ test("profile inspection reports degraded win32 state when CIM verification is u
 
   assert.equal(result.status, "degraded");
   assert.match(result.detail, /cannot verify saved CDP state against PowerShell CIM/i);
+});
+
+test("processMatchesCdpState returns true when a matching Chrome process is found", async () => {
+  const profileDir = "C:\\Users\\test\\AppData\\Roaming\\wtagent\\chrome-profile";
+  const state = {
+    pid: 1234,
+    port: 9333,
+    profileDir,
+  };
+
+  const result = await processMatchesCdpState(state, {
+    platform: "win32",
+    listProcesses: async () => [
+      {
+        pid: 1234,
+        command: `chrome.exe --remote-debugging-port=9333 --user-data-dir="${profileDir}"`,
+      },
+    ],
+  });
+
+  assert.equal(result, true);
+});
+
+test("processMatchesCdpState returns false when no matching process exists", async () => {
+  const profileDir = "C:\\Users\\test\\AppData\\Roaming\\wtagent\\chrome-profile";
+  const state = {
+    pid: 1234,
+    port: 9333,
+    profileDir,
+  };
+
+  const result = await processMatchesCdpState(state, {
+    platform: "win32",
+    listProcesses: async () => [
+      {
+        pid: 5678,
+        command: `chrome.exe --remote-debugging-port=9333 --user-data-dir="${profileDir}"`,
+      },
+    ],
+  });
+
+  assert.equal(result, false);
+});
+
+test("processMatchesCdpState returns false when the process table cannot be read", async () => {
+  const state = {
+    pid: 1234,
+    port: 9333,
+    profileDir: "C:\\profile",
+  };
+
+  const result = await processMatchesCdpState(state, {
+    platform: "win32",
+    listProcesses: async () => {
+      throw new Error("CIM unavailable");
+    },
+  });
+
+  assert.equal(result, false);
+});
+
+test("processMatchesCdpState matches profile paths case-insensitively on win32", async () => {
+  const profileDir = "C:\\Users\\test\\AppData\\Roaming\\wtagent\\chrome-profile";
+  const state = {
+    pid: 1234,
+    port: 9333,
+    profileDir,
+  };
+
+  const result = await processMatchesCdpState(state, {
+    platform: "win32",
+    listProcesses: async () => [
+      {
+        pid: 1234,
+        command: `chrome.exe --remote-debugging-port=9333 --user-data-dir="${profileDir.toUpperCase()}"`,
+      },
+    ],
+  });
+
+  assert.equal(result, true);
 });
