@@ -47,8 +47,17 @@ jobs:
           npm test 2>&1 | Tee-Object -FilePath test-output.log
           $testExitCode = $LASTEXITCODE
           if ($testExitCode -ne 0) {
-            $tail = (Get-Content test-output.log -Tail 160) -join "`n"
-            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            $matches = Select-String -Path test-output.log -Pattern '^(not ok|✖)|AssertionError|Error:' -Context 2,25
+            $detailLines = foreach ($match in $matches) {
+              $match.Context.PreContext
+              $match.Line
+              $match.Context.PostContext
+            }
+            if ($detailLines.Count -eq 0) {
+              $detailLines = Get-Content test-output.log -Tail 80
+            }
+            $details = ($detailLines | Select-Object -First 100) -join "`n"
+            $escaped = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Windows test failure::$escaped"
             exit $testExitCode
           }
