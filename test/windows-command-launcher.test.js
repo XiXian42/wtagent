@@ -110,6 +110,26 @@ test("cmd encoder escapes metacharacters as data", () => {
   assert.match(encoded, /tail\\\\\^"/);
 });
 
+test("custom percent-star batch shims receive proxy-safe escaping", () => {
+  const probe = createFsProbe(["C:\\repo\\custom.cmd"]);
+  const plan = resolveLaunchPlan({
+    program: "C:\\repo\\custom.cmd",
+    argv: ["%PATH%", "a&b"],
+    cwd: "C:\\repo",
+    platform: "win32",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    readBatchPrefixImpl: () => "@echo off\r\nnode helper.js %*\r\n",
+    ...probe,
+  });
+
+  assert.equal(
+    plan.args[3],
+    __internal.buildBatchCommand("C:\\repo\\custom.cmd", ["%PATH%", "a&b"], {
+      doubleEscapeMetaChars: true,
+    }),
+  );
+});
+
 test("command planner rejects NUL bytes before spawning", () => {
   assert.throws(
     () => resolveLaunchPlan({
@@ -201,4 +221,39 @@ test("ProcessManager shares the same launch planner for background processes", a
   assert.equal(final.stdout, "ready\n");
   assert.equal(final.program, "vite");
   assert.deepEqual(final.argv, []);
+});
+
+test("ProcessManager never overwrites an exited state after tree termination", async () => {
+  let child;
+  const spawnImpl = () => {
+    child = new EventEmitter();
+    child.pid = 9876;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    return child;
+  };
+  const manager = new ProcessManager({
+    platform: "win32",
+    spawnImpl,
+    resolveLaunchPlanImpl: () => ({
+      command: "node.exe",
+      args: [],
+      shell: false,
+    }),
+    killProcessTreeImpl: async () => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0, null);
+    },
+  });
+  const started = manager.start({
+    program: "node",
+    argv: [],
+    cwd: "C:\\repo",
+    inheritSensitiveEnv: false,
+  });
+
+  await manager.stop(started.processId);
+
+  assert.equal(manager.read(started.processId).status, "exited");
 });

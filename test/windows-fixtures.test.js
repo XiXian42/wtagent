@@ -2,13 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { runProgram } from "../src/tools/terminal-exec.js";
 import { ProcessManager } from "../src/tools/process-manager.js";
 
-const execFileAsync = promisify(execFile);
 const fixturesRoot = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "fixtures",
@@ -20,10 +17,6 @@ const scriptFixturesRoot = path.join(
   "scripts",
   "windows-fixtures",
 );
-
-function quoteForCmd(argument) {
-  return `"${String(argument).replace(/"/g, "\"\"")}"`;
-}
 
 test("windows fixture files are present for CI and local E2E", async () => {
   const expected = [
@@ -82,27 +75,26 @@ test("windows package smoke fixture exposes test and dev scripts", async () => {
   );
 });
 
-test("windows argv fixtures preserve arguments when executed through cmd", {
+test("windows argv fixtures preserve arguments through the launch adapter", {
   skip: process.platform !== "win32",
 }, async () => {
-  const commandProcessor = process.env.ComSpec ?? "cmd.exe";
-  const fixture = path.join(fixturesRoot, "echo-argv.cmd");
   const args = [
     "plain",
     "with spaces",
     "中文目录",
     "quote\"inside",
   ];
-  const command = `${quoteForCmd(fixture)} ${args.map(quoteForCmd).join(" ")}`;
-  const { stdout } = await execFileAsync(commandProcessor, [
-    "/d",
-    "/s",
-    "/c",
-    command,
-  ]);
-
-  const payload = JSON.parse(stdout);
-  assert.deepEqual(payload.argv, args);
+  for (const extension of ["cmd", "bat"]) {
+    const result = await runProgram({
+      program: path.join(fixturesRoot, `echo-argv.${extension}`),
+      argv: args,
+      cwd: fixturesRoot,
+      timeoutMs: 10_000,
+      maxOutputBytes: 16 * 1024,
+    });
+    assert.equal(result.ok, true, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).argv, args);
+  }
 });
 
 test("Windows launcher preserves hostile argv and cannot append a second command", {
@@ -120,7 +112,7 @@ test("Windows launcher preserves hostile argv and cannot append a second command
   await fs.copyFile(path.join(scriptFixturesRoot, "echo-argv.js"), helper);
   await fs.writeFile(
     shim,
-    `@echo off\r\n"${process.execPath}" "${helper}" %*\r\n`,
+    "@echo off\r\nnode \"%~dp0echo argv.js\" %*\r\n",
     "utf8",
   );
 

@@ -6,6 +6,7 @@ const WINDOWS_BATCH_EXTENSIONS = new Set([".cmd", ".bat"]);
 const DEFAULT_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"];
 const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
 const CMD_PROXY_SHIM = /(?:^|[\\/])(?:node_modules[\\/]\.bin[\\/][^\\/]+|npm|npx)\.cmd$/i;
+const MAX_BATCH_INSPECTION_BYTES = 64 * 1024;
 
 export function getEnvCaseInsensitive(env, name) {
   const direct = env[name];
@@ -129,8 +130,40 @@ function escapeCmdArgument(value, { doubleEscapeMetaChars = false } = {}) {
   return argument;
 }
 
-function buildBatchCommand(scriptPath, argv) {
-  const doubleEscapeMetaChars = CMD_PROXY_SHIM.test(scriptPath);
+function readBatchPrefix(scriptPath) {
+  const handle = fs.openSync(scriptPath, "r");
+  try {
+    const buffer = Buffer.alloc(MAX_BATCH_INSPECTION_BYTES);
+    const bytesRead = fs.readSync(
+      handle,
+      buffer,
+      0,
+      buffer.length,
+      0,
+    );
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function batchNeedsDoubleEscape(
+  scriptPath,
+  readBatchPrefixImpl = readBatchPrefix,
+) {
+  if (CMD_PROXY_SHIM.test(scriptPath)) {
+    return true;
+  }
+  try {
+    return readBatchPrefixImpl(scriptPath).includes("%*");
+  } catch {
+    return false;
+  }
+}
+
+function buildBatchCommand(scriptPath, argv, {
+  doubleEscapeMetaChars = CMD_PROXY_SHIM.test(scriptPath),
+} = {}) {
   const parts = [
     escapeCmdCommand(scriptPath),
     ...argv.map((value) => escapeCmdArgument(value, {
@@ -150,6 +183,7 @@ export function resolveLaunchPlan({
   platform = process.platform,
   existsSync = fs.existsSync,
   statSync = fs.statSync,
+  readBatchPrefixImpl = readBatchPrefix,
 } = {}) {
   const logicalProgram = String(program ?? "");
   const logicalArgv = Array.isArray(argv) ? argv.map((value) => String(value)) : [];
@@ -192,9 +226,21 @@ export function resolveLaunchPlan({
     || getEnvCaseInsensitive(env, "COMSPEC")
     || "cmd.exe";
 
+  const doubleEscapeMetaChars = batchNeedsDoubleEscape(
+    resolvedProgram,
+    readBatchPrefixImpl,
+  );
+
   return {
     command: comSpec,
-    args: ["/d", "/s", "/c", buildBatchCommand(resolvedProgram, logicalArgv)],
+    args: [
+      "/d",
+      "/s",
+      "/c",
+      buildBatchCommand(resolvedProgram, logicalArgv, {
+        doubleEscapeMetaChars,
+      }),
+    ],
     shell: false,
     logicalProgram,
     logicalArgv,
@@ -206,6 +252,7 @@ export function resolveLaunchPlan({
 }
 
 export const __internal = {
+  batchNeedsDoubleEscape,
   buildBatchCommand,
   escapeCmdArgument,
   escapeCmdCommand,
@@ -214,5 +261,6 @@ export const __internal = {
   getPathext,
   getWindowsSearchDirs,
   hasWindowsPathIndicators,
+  readBatchPrefix,
   resolveWindowsProgram,
 };

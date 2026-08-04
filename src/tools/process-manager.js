@@ -35,10 +35,12 @@ export class ProcessManager {
     spawnImpl = spawn,
     platform = process.platform,
     resolveLaunchPlanImpl = resolveLaunchPlan,
+    killProcessTreeImpl = killProcessTree,
   } = {}) {
     this.spawnImpl = spawnImpl;
     this.platform = platform;
     this.resolveLaunchPlanImpl = resolveLaunchPlanImpl;
+    this.killProcessTreeImpl = killProcessTreeImpl;
   }
 
   start({ program, argv, cwd, inheritSensitiveEnv }) {
@@ -127,8 +129,8 @@ export class ProcessManager {
       throw new Error(`Unknown process: ${id}`);
     }
     if (record.status === "running") {
-      await killProcessTree(record.child.pid);
       record.status = "stopping";
+      await this.killProcessTreeImpl(record.child.pid);
     }
     return this.snapshot(record, options);
   }

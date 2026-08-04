@@ -12,24 +12,25 @@ function platformAppDataDir(appName, {
   platform,
   homeDir,
 }) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
   if (platform === "darwin") {
-    return path.join(homeDir, "Library", "Application Support", appName);
+    return pathApi.join(homeDir, "Library", "Application Support", appName);
   }
 
   if (platform === "win32") {
     const base = getEnvCaseInsensitive(env, "APPDATA")
-      ?? path.join(homeDir, "AppData", "Roaming");
-    return path.join(base, appName);
+      ?? pathApi.join(homeDir, "AppData", "Roaming");
+    return pathApi.join(base, appName);
   }
 
   const base = getEnvCaseInsensitive(env, "XDG_DATA_HOME")
-    ?? path.join(homeDir, ".local", "share");
-  return path.join(base, appName);
+    ?? pathApi.join(homeDir, ".local", "share");
+  return pathApi.join(base, appName);
 }
 
-function looksLikeLegacyDataDir(directory, exists) {
+function looksLikeLegacyDataDir(directory, exists, pathApi) {
   return ["chrome-profile", "sessions", "tasks"]
-    .some((entry) => exists(path.join(directory, entry)));
+    .some((entry) => exists(pathApi.join(directory, entry)));
 }
 
 export function getAppDataDir(appName = APP_NAME, {
@@ -38,10 +39,11 @@ export function getAppDataDir(appName = APP_NAME, {
   homeDir = os.homedir(),
   exists = existsSync,
 } = {}) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
   const configured = getEnvCaseInsensitive(env, "WTAGENT_HOME")
     ?? getEnvCaseInsensitive(env, "WEBAGENT_HOME");
   if (configured) {
-    return path.resolve(configured);
+    return pathApi.resolve(configured);
   }
 
   const current = platformAppDataDir(appName, { env, platform, homeDir });
@@ -54,7 +56,7 @@ export function getAppDataDir(appName = APP_NAME, {
     platform,
     homeDir,
   });
-  return looksLikeLegacyDataDir(legacy, exists) ? legacy : current;
+  return looksLikeLegacyDataDir(legacy, exists, pathApi) ? legacy : current;
 }
 
 export function getChromeProfileDir(appDataDir = getAppDataDir()) {
