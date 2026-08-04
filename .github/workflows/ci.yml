@@ -76,6 +76,14 @@ jobs:
       - name: Packed global install smoke
         if: runner.os == 'Windows'
         shell: pwsh
-        run: node --test test/windows-package-smoke.test.js
+        run: |
+          node --test test/windows-package-smoke.test.js 2>&1 | Tee-Object -FilePath package-smoke-output.log
+          $smokeExitCode = $LASTEXITCODE
+          if ($smokeExitCode -ne 0) {
+            $details = (Get-Content package-smoke-output.log -Tail 120) -join "`n"
+            $escaped = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows package smoke failure::$escaped"
+            exit $smokeExitCode
+          }
         env:
           WTAGENT_PACKED_TGZ: ${{ env.WTAGENT_PACKED_TGZ }}
