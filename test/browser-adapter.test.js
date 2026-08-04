@@ -517,6 +517,16 @@ test("binds a resumed send to its new user and assistant DOM turns", async () =>
   assert.equal(await adapter.getLastAssistantMessageId(), "assistant-new");
 });
 
+test("rejects an oversized outbound message before touching the composer", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = {};
+
+  await assert.rejects(
+    adapter.sendMessage("中".repeat(100), { maxBytes: 24 }),
+    (error) => error.code === "OUTBOUND_MESSAGE_TOO_LARGE",
+  );
+});
+
 test("fails closed when the DOM exposes no post-send message identity", async () => {
   const unidentified = new AssistantMessage(
     "<agent_response><done>true</done><message>old</message></agent_response>",

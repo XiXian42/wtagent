@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isPathInside } from "../policy/path-guard.js";
+import { replaceFileAtomic } from "../shared/atomic-write.js";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -91,15 +92,7 @@ async function writeJsonAtomic(filePath, value) {
     await handle.close();
     handle = null;
 
-    try {
-      await fs.rename(temporary, filePath);
-    } catch (error) {
-      if (process.platform !== "win32") {
-        throw error;
-      }
-      await fs.rm(filePath, { force: true });
-      await fs.rename(temporary, filePath);
-    }
+    await replaceFileAtomic(temporary, filePath);
   } finally {
     await handle?.close().catch(() => {});
     await fs.rm(temporary, { force: true }).catch(() => {});

@@ -10,6 +10,13 @@ test("model turn timeout defaults to ten minutes", () => {
   assert.equal(resolveLimits().modelTurnTimeoutMs, 10 * 60_000);
 });
 
+test("tool transport limits use the bounded browser-safe defaults", () => {
+  assert.equal(DEFAULT_LIMITS.maxFileReadBytes, 16 * 1024);
+  assert.equal(DEFAULT_LIMITS.maxToolOutputBytes, 4 * 1024);
+  assert.equal(DEFAULT_LIMITS.maxLocalToolLogBytes, 4 * 1024 * 1024);
+  assert.equal(DEFAULT_LIMITS.maxBrowserToolResultBytes, 24 * 1024);
+});
+
 test("model turn timeout accepts a positive integer CLI value", () => {
   const limits = resolveLimits({
     modelTurnTimeoutMs: "720000",

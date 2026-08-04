@@ -1,5 +1,9 @@
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { ProtocolError } from "../shared/errors.js";
+import {
+  truncateUtf8HeadTail,
+  utf8ByteLength,
+} from "../shared/text-budget.js";
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -298,30 +302,102 @@ export function cdata(value) {
   return `<![CDATA[${safe}]]>`;
 }
 
-function optionalResultField(tag, value) {
-  if (value == null || value === "") {
+function optionalResultField(tag, field) {
+  if (field == null || (field.text === "" && !field.truncated)) {
     return "";
   }
-  return `\n  <${tag}>${cdata(value)}</${tag}>`;
+  const attributes = field.truncated
+    ? ` truncated="true" original_bytes="${field.originalBytes}" included_bytes="${field.includedBytes}"`
+    : "";
+  return `\n  <${tag}${attributes}>${cdata(field.text)}</${tag}>`;
 }
 
-export function serializeToolResult(result) {
-  const status = result.ok ? "ok" : "error";
+function normalizeResultFields(result) {
   const data = result.data == null
     ? ""
     : typeof result.data === "string"
       ? result.data
       : JSON.stringify(result.data);
+  const field = (value) => {
+    const text = String(value ?? "");
+    const bytes = utf8ByteLength(text);
+    return {
+      text,
+      truncated: false,
+      originalBytes: bytes,
+      includedBytes: bytes,
+    };
+  };
+  return {
+    message: field(result.message),
+    stdout: field(result.stdout),
+    stderr: field(result.stderr),
+    data: field(data),
+  };
+}
+
+function serializeResultFields(result, fields, { originalBytes = null } = {}) {
+  const status = result.ok ? "ok" : "error";
+  const wasTruncated = Object.values(fields).some((field) => field.truncated);
+  const truncationAttributes = wasTruncated
+    ? ` truncated="true" original_bytes="${originalBytes}"`
+    : "";
 
   return [
     `<tool_result name="${escapeXmlAttribute(result.name)}"`,
-    ` status="${status}">`,
-    `\n  <message>${cdata(result.message ?? "")}</message>`,
-    optionalResultField("stdout", result.stdout),
-    optionalResultField("stderr", result.stderr),
-    optionalResultField("data", data),
+    ` status="${status}"${truncationAttributes}>`,
+    `\n  <message>${cdata(fields.message.text)}</message>`,
+    optionalResultField("stdout", fields.stdout),
+    optionalResultField("stderr", fields.stderr),
+    optionalResultField("data", fields.data),
     "\n</tool_result>",
   ].join("");
+}
+
+export function serializeToolResult(result, { maxBytes = Infinity } = {}) {
+  const fields = normalizeResultFields(result);
+  let xml = serializeResultFields(result, fields);
+  if (!Number.isFinite(maxBytes) || utf8ByteLength(xml) <= maxBytes) {
+    return xml;
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 512) {
+    throw new RangeError("Tool result XML budget must be at least 512 bytes.");
+  }
+
+  const originalBytes = utf8ByteLength(xml);
+  let remaining = Math.max(0, maxBytes - 1024);
+  for (const [name, fieldLimit] of [
+    ["message", 2 * 1024],
+    ["stderr", 4 * 1024],
+    ["stdout", 4 * 1024],
+    ["data", Infinity],
+  ]) {
+    const field = fields[name];
+    const budget = Math.min(field.originalBytes, fieldLimit, remaining);
+    fields[name] = truncateUtf8HeadTail(field.text, budget);
+    remaining -= fields[name].includedBytes;
+  }
+
+  xml = serializeResultFields(result, fields, { originalBytes });
+  for (let pass = 0; pass < 8 && utf8ByteLength(xml) > maxBytes; pass += 1) {
+    const excess = utf8ByteLength(xml) - maxBytes;
+    const candidate = Object.entries(fields)
+      .filter(([, field]) => field.includedBytes > 0)
+      .sort((left, right) => right[1].includedBytes - left[1].includedBytes)[0];
+    if (!candidate) break;
+    const [name, field] = candidate;
+    const nextBudget = Math.max(0, field.includedBytes - excess - 64);
+    fields[name] = truncateUtf8HeadTail(
+      normalizeResultFields(result)[name].text,
+      nextBudget,
+    );
+    xml = serializeResultFields(result, fields, { originalBytes });
+  }
+
+  if (utf8ByteLength(xml) > maxBytes) {
+    throw new RangeError(`Unable to fit tool result within ${maxBytes} bytes.`);
+  }
+  return xml;
 }
 
 export function serializeProtocolError(error) {

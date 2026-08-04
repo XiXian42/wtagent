@@ -3,9 +3,19 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { z } from "zod";
 import { DEFAULT_LIMITS } from "../shared/limits.js";
-import { resolveToolPath } from "../policy/path-guard.js";
+import { utf8PrefixBuffer } from "../shared/text-budget.js";
+import { replaceFileAtomic } from "../shared/atomic-write.js";
+import {
+  resolveCanonicalWriteTarget,
+  resolveToolPath,
+} from "../policy/path-guard.js";
 import { ToolRegistry } from "./registry.js";
 import { runProgram } from "./terminal-exec.js";
+import { resolveLaunchPlan } from "../platform/command-launcher.js";
+import {
+  DEFAULT_SEARCH_EXCLUDED_DIRS,
+  fallbackSearch,
+} from "./search-fallback.js";
 
 const xmlBoolean = z.preprocess((value) => {
   if (value === "true") return true;
@@ -78,17 +88,29 @@ function matchOldText(content, oldText) {
   return null;
 }
 
-async function writeTextAtomic(targetPath, content) {
-  const temporary = `${targetPath}.wtagent-${process.pid}.tmp`;
+async function canonicalWriteTarget(targetPath, context) {
+  return await resolveCanonicalWriteTarget(
+    context.projectRoot,
+    targetPath,
+    { allowOutside: context.allowOutside },
+  );
+}
+
+async function writeTextAtomic(targetPath, content, context) {
+  const verifiedTarget = await canonicalWriteTarget(targetPath, context);
+  const temporary = `${verifiedTarget}.wtagent-${process.pid}.tmp`;
   await fs.writeFile(temporary, content, "utf8");
   try {
-    await fs.rename(temporary, targetPath);
-  } catch (error) {
-    if (process.platform !== "win32") {
-      throw error;
+    const recheckedTarget = await canonicalWriteTarget(
+      verifiedTarget,
+      context,
+    );
+    if (recheckedTarget !== verifiedTarget) {
+      throw new Error(
+        `Write target changed while preparing the update: ${verifiedTarget}`,
+      );
     }
-    await fs.rm(targetPath, { force: true });
-    await fs.rename(temporary, targetPath);
+    await replaceFileAtomic(temporary, verifiedTarget);
   } finally {
     await fs.rm(temporary, { force: true }).catch(() => null);
   }
@@ -96,7 +118,7 @@ async function writeTextAtomic(targetPath, content) {
 
 async function listTree(root, target, options) {
   const entries = [];
-  const excluded = new Set([".git", "node_modules", "dist", "build", "coverage"]);
+  const excluded = DEFAULT_SEARCH_EXCLUDED_DIRS;
 
   async function walk(directory, depth) {
     if (entries.length >= options.maxEntries) {
@@ -154,10 +176,39 @@ async function rgSearch({ query, searchPath, glob, regex, maxResults }) {
   }
   argv.push("--", query, searchPath);
 
+  const rgEnvironment = { ...process.env };
+  const pathKey = Object.keys(rgEnvironment)
+    .find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+  if (rgEnvironment[pathKey]) {
+    rgEnvironment[pathKey] = rgEnvironment[pathKey]
+      .split(path.delimiter)
+      .filter((entry) => {
+        const normalized = entry.replaceAll("\\", "/").toLowerCase();
+        return !(
+          normalized.includes("/.codex/")
+          || normalized.includes("/@openai/codex/")
+          || normalized.includes("/codex-path/")
+          || normalized.includes("/claude-code/")
+        );
+      })
+      .join(path.delimiter);
+  }
+
+  // Resolve `rg` through the same launch planner as terminal.exec so that
+  // Windows .cmd/.bat shims (e.g. an npm-installed ripgrep) work consistently.
+  const launchPlan = resolveLaunchPlan({
+    program: "rg",
+    argv,
+    cwd: process.cwd(),
+    env: rgEnvironment,
+  });
+
   return await new Promise((resolve, reject) => {
-    const child = spawn("rg", argv, {
-      shell: false,
+    const child = spawn(launchPlan.command, launchPlan.args, {
+      env: rgEnvironment,
+      shell: launchPlan.shell,
       windowsHide: true,
+      windowsVerbatimArguments: launchPlan.windowsVerbatimArguments === true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -177,39 +228,6 @@ async function rgSearch({ query, searchPath, glob, regex, maxResults }) {
       }
     });
   });
-}
-
-async function fallbackSearch({ query, searchPath, maxResults }) {
-  const results = [];
-  const excluded = new Set([".git", "node_modules", "dist", "build", "coverage"]);
-
-  async function visit(current) {
-    if (results.length >= maxResults) return;
-    const stat = await fs.lstat(current);
-    if (stat.isSymbolicLink()) return;
-    if (stat.isDirectory()) {
-      if (excluded.has(path.basename(current))) return;
-      const children = await fs.readdir(current);
-      for (const child of children) {
-        await visit(path.join(current, child));
-        if (results.length >= maxResults) return;
-      }
-      return;
-    }
-    if (!stat.isFile() || stat.size > 1024 * 1024) return;
-
-    const content = await fs.readFile(current, "utf8").catch(() => null);
-    if (content == null) return;
-    for (const [index, line] of content.split(/\r?\n/).entries()) {
-      if (line.includes(query)) {
-        results.push(`${current}:${index + 1}:${line}`);
-        if (results.length >= maxResults) return;
-      }
-    }
-  }
-
-  await visit(searchPath);
-  return results.join("\n");
 }
 
 export function createDefaultToolRegistry({
@@ -253,15 +271,16 @@ export function createDefaultToolRegistry({
 
   registry.register({
     name: "fs.read",
-    description: "Read a text file in the project, optionally limiting the start byte and length.",
+    description:
+      "Read up to 16384 bytes from one project text file. Continue large files with the returned nextOffset.",
     inputDescription:
-      "<args><path>src/main.js</path><offset>0</offset><max_bytes>131072</max_bytes></args>",
+      "<args><path>src/main.js</path><offset>0</offset><max_bytes>16384</max_bytes></args>",
     risk: "read",
     inputSchema: z.object({
       path: z.string().min(1),
       offset: z.coerce.number().int().min(0).default(0),
       max_bytes: z.coerce.number().int().min(1)
-        .max(1024 * 1024)
+        .max(limits.maxFileReadBytes)
         .default(limits.maxFileReadBytes),
     }),
     execute: async (args, context) => {
@@ -269,21 +288,38 @@ export function createDefaultToolRegistry({
       const handle = await fs.open(target, "r");
       try {
         const stat = await handle.stat();
-        const buffer = Buffer.alloc(args.max_bytes);
-        const { bytesRead } = await handle.read(
+        const available = Math.max(0, stat.size - args.offset);
+        const requestedBytes = Math.min(available, args.max_bytes + 4);
+        const buffer = Buffer.alloc(requestedBytes);
+        const { bytesRead: rawBytesRead } = await handle.read(
           buffer,
           0,
-          args.max_bytes,
+          requestedBytes,
           args.offset,
         );
+        const raw = buffer.subarray(0, rawBytesRead);
+        let leadingContinuationBytes = 0;
+        while (
+          leadingContinuationBytes < raw.length
+          && (raw[leadingContinuationBytes] & 0xc0) === 0x80
+        ) {
+          leadingContinuationBytes += 1;
+        }
+        const normalizedRaw = raw.subarray(leadingContinuationBytes);
+        const contentBuffer = normalizedRaw.length <= args.max_bytes
+          ? normalizedRaw
+          : utf8PrefixBuffer(normalizedRaw, args.max_bytes);
+        const bytesRead = contentBuffer.length;
+        const offset = args.offset + leadingContinuationBytes;
         return {
           ok: true,
           message: `Read ${displayPath(context.projectRoot, target)}.`,
           data: {
-            content: buffer.subarray(0, bytesRead).toString("utf8"),
+            content: contentBuffer.toString("utf8"),
+            offset,
             bytesRead,
-            nextOffset: args.offset + bytesRead,
-            truncated: args.offset + bytesRead < stat.size,
+            nextOffset: offset + bytesRead,
+            truncated: offset + bytesRead < stat.size,
             size: stat.size,
           },
         };
@@ -307,10 +343,11 @@ export function createDefaultToolRegistry({
     execute: async (args, context) => {
       const target = await resolveAllowedPath(args.path, context);
       await fs.mkdir(path.dirname(target), { recursive: true });
+      const verifiedTarget = await canonicalWriteTarget(target, context);
       if (args.mode === "append") {
-        await fs.appendFile(target, args.content, "utf8");
+        await fs.appendFile(verifiedTarget, args.content, "utf8");
       } else {
-        await writeTextAtomic(target, args.content);
+        await writeTextAtomic(verifiedTarget, args.content, context);
       }
       return {
         ok: true,
@@ -358,7 +395,7 @@ export function createDefaultToolRegistry({
           : next.replace(matchedOld, edit.new_text);
       }
 
-      await writeTextAtomic(target, next);
+      await writeTextAtomic(target, next, context);
       return {
         ok: true,
         message: `Edited ${displayPath(context.projectRoot, target)}.`,
@@ -369,7 +406,7 @@ export function createDefaultToolRegistry({
 
   registry.register({
     name: "fs.search",
-    description: "Search project files for text, preferring ripgrep.",
+    description: "Search project files for text, using a built-in engine and ripgrep when available.",
     inputDescription:
       "<args><query>search text</query><path>.</path><glob>*.js</glob><regex>false</regex><max_results>200</max_results></args>",
     risk: "read",
@@ -400,12 +437,11 @@ export function createDefaultToolRegistry({
           throw error;
         }
         engine = "javascript";
-        if (args.regex) {
-          throw new Error("Regex fallback requires ripgrep to be installed.");
-        }
         output = await fallbackSearch({
           query: args.query,
           searchPath: target,
+          glob: args.glob,
+          regex: args.regex,
           maxResults: args.max_results,
         });
       }
@@ -428,7 +464,15 @@ export function createDefaultToolRegistry({
 
   registry.register({
     name: "terminal.exec",
-    description: "Run a program that terminates. Use program + argv, not a shell string.",
+    description: [
+      "Run one terminating program using program + argv, not a shell command.",
+      "Combined stdout and stderr returned to you is limited to 4096 UTF-8 bytes.",
+      "Reduce output with the program's own arguments: prefer fs.search/fs.read for files;",
+      "use narrow paths, globs, subcommands, and test-runner filters to keep output small.",
+      "Do not print whole large files, trees,",
+      "generated files, dependency lists, or unbounded logs. If truncated, run a narrower command.",
+      "Pipes, redirections, command substitution, and shell operators are not supported.",
+    ].join(" "),
     inputDescription:
       "<args><program>npm</program><argv><item>run</item><item>build</item></argv><cwd>.</cwd><timeout_ms>120000</timeout_ms></args>",
     risk: "execute",
@@ -443,6 +487,7 @@ export function createDefaultToolRegistry({
         cwd,
         timeoutMs,
         maxOutputBytes: limits.maxToolOutputBytes,
+        maxLogBytes: limits.maxLocalToolLogBytes,
         inheritSensitiveEnv: args.inherit_sensitive_env,
         onOutput: context.onToolOutput,
       });
@@ -463,6 +508,11 @@ export function createDefaultToolRegistry({
           signal: result.signal,
           timedOut: result.timedOut,
           truncated: result.truncated,
+          stdoutBytes: result.stdoutBytes,
+          stderrBytes: result.stderrBytes,
+          includedOutputBytes: result.includedOutputBytes,
+          loggedOutputBytes: result.loggedOutputBytes,
+          logTruncated: result.logTruncated,
           durationMs: result.durationMs,
         },
         meta: result.completionUnknown
@@ -512,7 +562,9 @@ export function createDefaultToolRegistry({
       risk: "read",
       inputSchema: z.object({ process_id: z.string().min(1) }),
       execute: async (args) => {
-        const snapshot = processManager.read(args.process_id);
+        const snapshot = processManager.read(args.process_id, {
+          maxOutputBytes: limits.maxToolOutputBytes,
+        });
         return {
           ok: true,
           message: `Read process ${args.process_id}.`,
@@ -528,7 +580,9 @@ export function createDefaultToolRegistry({
       risk: "execute",
       inputSchema: z.object({ process_id: z.string().min(1) }),
       execute: async (args) => {
-        const snapshot = await processManager.stop(args.process_id);
+        const snapshot = await processManager.stop(args.process_id, {
+          maxOutputBytes: limits.maxToolOutputBytes,
+        });
         return {
           ok: true,
           message: `Stopping process ${args.process_id}.`,
@@ -546,7 +600,7 @@ export function createDefaultToolRegistry({
       execute: async () => ({
         ok: true,
         message: "Listed managed processes.",
-        data: { processes: processManager.list() },
+        data: { processes: processManager.list({ includeOutput: false }) },
       }),
     });
   }

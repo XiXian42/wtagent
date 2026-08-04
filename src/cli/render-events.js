@@ -235,7 +235,7 @@ export class Renderer {
     this.stopSpinner();
     this.println("");
     this.println(`${GREEN}${BOLD}⏺ assistant${RESET}`);
-    for (const line of String(message ?? "").split("\n")) {
+    for (const line of String(message ?? "").split(/\r?\n/)) {
       this.println(line);
     }
     this.println("");

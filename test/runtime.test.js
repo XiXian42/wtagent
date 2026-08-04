@@ -108,6 +108,59 @@ test("runs a full model-tool-model loop", async (t) => {
   assert.equal(functionItems[1].call_id, functionItems[0].call_id);
 });
 
+test("keeps the final browser tool-result message within 24 KiB", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "debug.large-output",
+    description: "Return oversized structured data for transport testing.",
+    inputDescription: "<args></args>",
+    risk: "read",
+    inputSchema: z.object({}),
+    execute: async () => ({
+      ok: true,
+      message: "Large output ready.",
+      data: { content: `BEGIN-${"中".repeat(50_000)}-END` },
+    }),
+  });
+  const adapter = new FakeWebModelAdapter([
+    `<agent_response>
+      <done>false</done>
+      <tool_call name="debug.large-output"><args/></tool_call>
+    </agent_response>`,
+    `<agent_response><done>true</done><message>Done.</message></agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Exercise a large tool result",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry,
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await runtime.run();
+
+  const resultMessage = adapter.sentMessages[1];
+  assert.ok(
+    Buffer.byteLength(resultMessage, "utf8")
+      <= DEFAULT_LIMITS.maxBrowserToolResultBytes,
+  );
+  assert.match(resultMessage, /<tool_result[^>]+truncated="true"/);
+  assert.match(resultMessage, /WTAgent omitted/);
+  assertOneTrailingReminder(resultMessage);
+});
+
 test("records @file attachments on the opening message and passes them to the adapter", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");

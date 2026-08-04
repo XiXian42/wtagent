@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getEnvCaseInsensitive } from "./command-launcher.js";
 
 const APP_NAME = "wtagent";
 const LEGACY_APP_NAME = "webagent";
@@ -16,12 +17,12 @@ function platformAppDataDir(appName, {
   }
 
   if (platform === "win32") {
-    const base = env.APPDATA
+    const base = getEnvCaseInsensitive(env, "APPDATA")
       ?? path.join(homeDir, "AppData", "Roaming");
     return path.join(base, appName);
   }
 
-  const base = env.XDG_DATA_HOME
+  const base = getEnvCaseInsensitive(env, "XDG_DATA_HOME")
     ?? path.join(homeDir, ".local", "share");
   return path.join(base, appName);
 }
@@ -37,7 +38,8 @@ export function getAppDataDir(appName = APP_NAME, {
   homeDir = os.homedir(),
   exists = existsSync,
 } = {}) {
-  const configured = env.WTAGENT_HOME ?? env.WEBAGENT_HOME;
+  const configured = getEnvCaseInsensitive(env, "WTAGENT_HOME")
+    ?? getEnvCaseInsensitive(env, "WEBAGENT_HOME");
   if (configured) {
     return path.resolve(configured);
   }

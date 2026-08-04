@@ -18,6 +18,7 @@ import {
   userMessage,
 } from "../session/canonical-transcript.js";
 import { DEFAULT_LIMITS } from "../shared/limits.js";
+import { utf8ByteLength } from "../shared/text-budget.js";
 import {
   PolicyDeniedError,
   ProtocolError,
@@ -131,9 +132,10 @@ export class AgentRuntime {
     return event;
   }
 
-  async sendMessage(text, { files = [] } = {}) {
+  async sendMessage(text, { files = [], maxBytes = null } = {}) {
+    const message = appendSystemReminder(text);
     try {
-      await this.adapter.sendMessage(appendSystemReminder(text), { files });
+      await this.adapter.sendMessage(message, { files, maxBytes });
     } finally {
       const conversationUrl = await this.adapter.getConversationUrl()
         .catch(() => null);
@@ -144,6 +146,24 @@ export class AgentRuntime {
         await this.session.update({ conversationUrl });
       }
     }
+  }
+
+  buildToolResultMessage(result, { suffix = "" } = {}) {
+    const limit = this.limits.maxBrowserToolResultBytes;
+    const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix));
+    const resultBudget = limit - nonResultBytes;
+    if (resultBudget < 512) {
+      throw new RangeError(
+        `Tool result metadata leaves fewer than 512 bytes within the ${limit}-byte browser limit.`,
+      );
+    }
+    return `${serializeToolResult(result, { maxBytes: resultBudget })}${suffix}`;
+  }
+
+  async sendToolResult(result, { suffix = "" } = {}) {
+    await this.sendMessage(this.buildToolResultMessage(result, { suffix }), {
+      maxBytes: this.limits.maxBrowserToolResultBytes,
+    });
   }
 
   async run({
@@ -255,11 +275,12 @@ export class AgentRuntime {
     }));
     const messageOptions = attachments.length > 0 ? { attachments } : {};
     if (resume && pendingToolResult) {
-      initialMessage = serializeToolResult(pendingToolResult);
+      let suffix = "";
       if (instruction?.trim()) {
-        initialMessage += `\n<resume_instruction>${cdata(instruction)}</resume_instruction>`;
+        suffix = `\n<resume_instruction>${cdata(instruction)}</resume_instruction>`;
         initialTranscript = [userMessage(instruction, messageOptions)];
       }
+      initialMessage = this.buildToolResultMessage(pendingToolResult, { suffix });
       initialKind = "pending_tool_result";
     } else if (resume && instruction?.trim()) {
       // The live ChatGPT conversation already contains the bootstrap protocol
@@ -292,7 +313,12 @@ export class AgentRuntime {
     for (const item of initialTranscript) {
       await this.session.appendTranscriptItem(item);
     }
-    await this.sendMessage(initialMessage, { files });
+    await this.sendMessage(initialMessage, {
+      files,
+      maxBytes: initialKind === "pending_tool_result"
+        ? this.limits.maxBrowserToolResultBytes
+        : null,
+    });
     let awaitingPendingAcknowledgement = Boolean(pendingToolResult);
     let replayGuard = pendingToolResult?.operationSignature
       ? {
@@ -462,7 +488,7 @@ export class AgentRuntime {
           callId: result.callId,
           output: toolResultOutput(result),
         }));
-        await this.sendMessage(serializeToolResult(result));
+        await this.sendToolResult(result);
         awaitingPendingAcknowledgement = true;
         await this.emit("tool.result_sent", {
           id: result.callId,
@@ -638,7 +664,7 @@ export class AgentRuntime {
         callId: result.callId,
         output: toolResultOutput(result),
       }));
-      await this.sendMessage(serializeToolResult(result));
+      await this.sendToolResult(result);
       awaitingPendingAcknowledgement = true;
       await this.emit("tool.result_sent", {
         id: result.callId,

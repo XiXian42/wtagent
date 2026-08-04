@@ -194,3 +194,24 @@ test("serializes a sequential tool result without exposing an internal call id",
   assert.match(xml, /status="error"/);
   assert.match(xml, /<!\[CDATA\[bad <token>\]\]>/);
 });
+
+test("serializes oversized tool data within a UTF-8 byte budget", () => {
+  const maxBytes = 12 * 1024;
+  const xml = serializeToolResult({
+    name: "fs.list",
+    ok: true,
+    message: "Listed entries.",
+    data: {
+      entries: Array.from(
+        { length: 2_000 },
+        (_, index) => `路径-${index}-${"中".repeat(20)}`,
+      ),
+    },
+  }, { maxBytes });
+
+  assert.ok(Buffer.byteLength(xml, "utf8") <= maxBytes);
+  assert.match(xml, /<tool_result[^>]+truncated="true"/);
+  assert.match(xml, /WTAgent omitted/);
+  assert.match(xml, /<\/tool_result>$/);
+  assert.doesNotMatch(xml, /�/);
+});

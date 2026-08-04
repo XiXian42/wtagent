@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
+import { resolveCanonicalWriteTarget } from "../src/policy/path-guard.js";
 
 async function evaluateCommand(root, program, argv = []) {
   const engine = new PolicyEngine();
@@ -129,4 +130,36 @@ test("finds git push after global options", async (t) => {
 
   assert.equal(decision.action, "confirm");
   assert.ok(decision.reasons.includes("pushing code to a remote"));
+});
+
+test("classifies Windows cmd shims by their logical executable", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-policy-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const decision = await evaluateCommand(
+    root,
+    String.raw`C:\Program Files\nodejs\npm.cmd`,
+    ["publish"],
+  );
+
+  assert.equal(decision.action, "confirm");
+  assert.ok(decision.reasons.includes("publishing a package"));
+});
+
+test("write guard rejects a parent replaced by an outside symlink", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-write-root-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-write-outside-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  t.after(() => fs.rm(outside, { recursive: true, force: true }));
+
+  const parent = path.join(root, "safe");
+  const target = path.join(parent, "result.txt");
+  await fs.mkdir(parent);
+  await fs.rm(parent, { recursive: true });
+  await fs.symlink(outside, parent, process.platform === "win32" ? "junction" : "dir");
+
+  await assert.rejects(
+    resolveCanonicalWriteTarget(root, target),
+    /moved outside project root/,
+  );
 });

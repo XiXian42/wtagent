@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { replaceFileAtomic } from "../shared/atomic-write.js";
 
 const execFileAsync = promisify(execFile);
 const CDP_STATE_FILE = ".wtagent-cdp.json";
@@ -37,7 +38,7 @@ async function writeJsonAtomic(filePath, value) {
       `${JSON.stringify(value, null, 2)}\n`,
       { mode: 0o600 },
     );
-    await fs.rename(temporary, filePath);
+    await replaceFileAtomic(temporary, filePath);
   } finally {
     await fs.rm(temporary, { force: true }).catch(() => {});
   }
@@ -114,7 +115,7 @@ function normalizeCandidate(candidate, profileDir) {
   }
   if (
     candidate.profileDir
-    && path.resolve(candidate.profileDir) !== profileDir
+    && !profileDirsMatch(candidate.profileDir, profileDir)
   ) {
     return null;
   }
@@ -126,6 +127,21 @@ function normalizeCandidate(candidate, profileDir) {
     profileDir,
     startedAt: candidate.startedAt ?? null,
   };
+}
+
+function normalizeProfilePath(value, platform = process.platform) {
+  const input = String(value ?? "");
+  const resolved = platform === "win32"
+    ? path.win32.resolve(input)
+    : path.resolve(input);
+  if (platform !== "win32") {
+    return resolved;
+  }
+  return path.win32.normalize(resolved).replaceAll("/", "\\").toLowerCase();
+}
+
+function profileDirsMatch(left, right, platform = process.platform) {
+  return normalizeProfilePath(left, platform) === normalizeProfilePath(right, platform);
 }
 
 async function probeCandidate(candidate, profileDir, {
@@ -202,7 +218,7 @@ async function readProcessTable() {
         "-Command",
         "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
       ],
-      { maxBuffer: 10 * 1024 * 1024 },
+      { maxBuffer: 10 * 1024 * 1024, windowsHide: true },
     );
     const parsed = JSON.parse(stdout || "[]");
     return (Array.isArray(parsed) ? parsed : [parsed]).map((entry) => ({
@@ -219,30 +235,41 @@ async function readProcessTable() {
   return stdout.split("\n").flatMap((line) => {
     const match = line.match(/^\s*(\d+)\s+(.+)$/);
     return match
-      ? [{ pid: Number(match[1]), command: match[2] }]
+      ? [{ pid: Number(match[1]), command: match[2].trim() }]
       : [];
   });
 }
 
-function commandUsesProfile(command, profileDir) {
-  return (
-    command.includes(`--user-data-dir=${profileDir}`)
-    || command.includes(`--user-data-dir="${profileDir}"`)
-    || command.includes(`--user-data-dir='${profileDir}'`)
-  );
+function commandUsesProfile(command, profileDir, platform = process.platform) {
+  const inline = command.match(/--user-data-dir=(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+  const separated = command.match(/--user-data-dir\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+  const raw = inline?.[1] ?? inline?.[2] ?? inline?.[3]
+    ?? separated?.[1] ?? separated?.[2] ?? separated?.[3]
+    ?? null;
+  return raw ? profileDirsMatch(raw, profileDir, platform) : false;
 }
 
-function candidateFromProcess(entry, profileDir) {
+function candidateFromProcess(entry, profileDir, platform = process.platform) {
   if (
     !entry.command
     || entry.command.includes("--type=")
-    || !commandUsesProfile(entry.command, profileDir)
+    || !commandUsesProfile(entry.command, profileDir, platform)
   ) {
     return null;
   }
   const port = entry.command.match(/--remote-debugging-port=(\d+)/)?.[1];
   return port
     ? { pid: entry.pid, port: Number(port), profileDir }
+    : null;
+}
+
+function profileHolderFromProcess(entry, profileDir, platform = process.platform) {
+  if (!entry.command || !commandUsesProfile(entry.command, profileDir, platform)) {
+    return null;
+  }
+  const pid = Number(entry.pid);
+  return Number.isSafeInteger(pid) && pid > 0
+    ? { pid, command: entry.command }
     : null;
 }
 
@@ -276,30 +303,61 @@ export async function processMatchesCdpState(state) {
   }
 }
 
+function processTableContainsState(
+  processes,
+  state,
+  profileDir,
+  platform = process.platform,
+) {
+  const port = Number(state.port);
+  const pid = Number(state.pid);
+  return processes.some((entry) => {
+    const candidate = candidateFromProcess(entry, profileDir, platform);
+    return candidate?.pid === pid && candidate.port === port;
+  });
+}
+
 export async function discoverReusableCdpState(profileDir, {
   isAlive = isProcessAlive,
   fetchVersion = fetchCdpVersion,
   listProcesses = readProcessTable,
+  platform = process.platform,
 } = {}) {
   const resolvedProfile = path.resolve(profileDir);
+  const requireVerifiedProcessTable = platform === "win32";
   const saved = await readCdpState(resolvedProfile);
-  const savedHealthy = await probeCandidate(saved, resolvedProfile, {
-    isAlive,
-    fetchVersion,
-  });
-  if (savedHealthy) {
-    return await saveCdpState(resolvedProfile, savedHealthy);
-  }
-
   let processes;
   try {
     processes = await listProcesses();
   } catch {
+    if (requireVerifiedProcessTable) {
+      return null;
+    }
+    processes = null;
+  }
+
+  const savedHealthy = await probeCandidate(saved, resolvedProfile, {
+    isAlive,
+    fetchVersion,
+  });
+  if (
+    savedHealthy
+    && (!requireVerifiedProcessTable || processTableContainsState(
+      processes ?? [],
+      savedHealthy,
+      resolvedProfile,
+      platform,
+    ))
+  ) {
+    return await saveCdpState(resolvedProfile, savedHealthy);
+  }
+
+  if (!processes) {
     return null;
   }
 
   const rawCandidates = processes
-    .map((entry) => candidateFromProcess(entry, resolvedProfile))
+    .map((entry) => candidateFromProcess(entry, resolvedProfile, platform))
     .filter(Boolean);
   const uniqueCandidates = [...new Map(
     rawCandidates.map((candidate) => [
@@ -348,6 +406,7 @@ export async function reapStaleProfileChrome(profileDir, {
   fetchVersion = fetchCdpVersion,
   listProcesses = readProcessTable,
   killTree = null,
+  platform = process.platform,
 } = {}) {
   const resolvedProfile = path.resolve(profileDir);
   let processes;
@@ -357,28 +416,35 @@ export async function reapStaleProfileChrome(profileDir, {
     return { killed: [] };
   }
 
+  const holders = processes
+    .map((entry) => profileHolderFromProcess(entry, resolvedProfile, platform))
+    .filter(Boolean);
   const candidates = processes
-    .map((entry) => candidateFromProcess(entry, resolvedProfile))
+    .map((entry) => candidateFromProcess(entry, resolvedProfile, platform))
     .filter(Boolean);
 
-  const killed = [];
+  // A healthy main browser owns every helper/renderer using this profile.
+  // Never reap individual children from a verified live instance.
+  let hasHealthyCdpOwner = false;
   for (const candidate of candidates) {
-    // "Stale" = the CDP endpoint does not answer a healthy version probe. A
-    // healthy instance is left alone (it is a reuse candidate elsewhere).
-    let healthy = false;
     try {
       await fetchVersion(`http://127.0.0.1:${candidate.port}`);
-      healthy = true;
+      hasHealthyCdpOwner = true;
+      break;
     } catch {
-      healthy = false;
+      // Continue until one verified owner is found.
     }
-    if (healthy) {
-      continue;
+  }
+  if (hasHealthyCdpOwner) {
+    return { killed: [] };
+  }
+
+  const killed = [];
+  for (const holder of holders) {
+    if (isAlive(holder.pid) && typeof killTree === "function") {
+      await killTree(holder.pid).catch(() => {});
     }
-    if (isAlive(candidate.pid) && typeof killTree === "function") {
-      await killTree(candidate.pid).catch(() => {});
-    }
-    killed.push(candidate.pid);
+    killed.push(holder.pid);
   }
 
   // Chrome's singleton profile guard is a symlink; a crashed instance can leave
@@ -393,6 +459,82 @@ export async function reapStaleProfileChrome(profileDir, {
   }
 
   return { killed };
+}
+
+export async function inspectCdpProfileState(profileDir, {
+  isAlive = isProcessAlive,
+  fetchVersion = fetchCdpVersion,
+  listProcesses = readProcessTable,
+  platform = process.platform,
+} = {}) {
+  const resolvedProfile = path.resolve(profileDir);
+  const diagnostics = [];
+
+  const lock = await readJson(lockPath(resolvedProfile));
+  if (lock?.pid) {
+    const alive = isAlive(Number(lock.pid));
+    diagnostics.push(
+      alive
+        ? `profile lock held by live pid=${lock.pid}`
+        : `stale profile lock references dead pid=${lock.pid}`,
+    );
+  } else {
+    diagnostics.push("no WTAgent profile lock");
+  }
+
+  const saved = await readJson(statePath(resolvedProfile));
+  if (!saved) {
+    diagnostics.push("no saved CDP state");
+    return {
+      status: "pass",
+      detail: diagnostics.join("; "),
+    };
+  }
+
+  const savedHealthy = await probeCandidate(saved, resolvedProfile, {
+    isAlive,
+    fetchVersion,
+  });
+  if (!savedHealthy) {
+    diagnostics.push(`saved CDP state for pid=${saved.pid} is stale or unhealthy`);
+    return {
+      status: "degraded",
+      detail: diagnostics.join("; "),
+    };
+  }
+
+  if (platform !== "win32") {
+    diagnostics.push(`saved CDP state is healthy for pid=${savedHealthy.pid}`);
+    return {
+      status: "pass",
+      detail: diagnostics.join("; "),
+    };
+  }
+
+  let processes;
+  try {
+    processes = await listProcesses();
+  } catch (error) {
+    diagnostics.push(`cannot verify saved CDP state against PowerShell CIM: ${error.message}`);
+    return {
+      status: "degraded",
+      detail: diagnostics.join("; "),
+    };
+  }
+
+  if (!processTableContainsState(processes, savedHealthy, resolvedProfile, platform)) {
+    diagnostics.push(`saved CDP state for pid=${savedHealthy.pid} could not be verified against the current process table`);
+    return {
+      status: "degraded",
+      detail: diagnostics.join("; "),
+    };
+  }
+
+  diagnostics.push(`saved CDP state is verified for pid=${savedHealthy.pid}`);
+  return {
+    status: "pass",
+    detail: diagnostics.join("; "),
+  };
 }
 
 export async function acquireCdpProfileLock(profileDir, {

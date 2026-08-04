@@ -13,6 +13,10 @@ import {
   getTasksDir,
 } from "../platform/paths.js";
 import { discoverChromeExecutable } from "../platform/chrome-discovery.js";
+import {
+  assertNativeRuntimeSupported,
+  collectDoctorReport,
+} from "../platform/windows-diagnostics.js";
 import { AgentRuntime } from "../runtime/agent-runtime.js";
 import { AgentSession } from "../session/agent-session.js";
 import { PolicyEngine } from "../policy/policy-engine.js";
@@ -49,6 +53,7 @@ async function assertDirectory(directory) {
 }
 
 async function runLogin(options) {
+  assertNativeRuntimeSupported();
   const { profileDir } = resolveRuntimePaths(options);
   for (;;) {
     console.log(`Opening native Chrome profile: ${profileDir}`);
@@ -149,16 +154,19 @@ async function runLogout(options) {
 
 async function runDoctor(options) {
   const paths = resolveRuntimePaths(options);
-  const chromePath = discoverChromeExecutable(options.chromePath);
-  await ensureDirectory(paths.appDataDir);
-  await ensureDirectory(paths.sessionsDir);
+  const report = await collectDoctorReport({
+    paths,
+    chromePath: options.chromePath,
+  });
 
-  console.log(`Node: ${process.version}`);
-  console.log(`Platform: ${process.platform} ${process.arch}`);
-  console.log(`Chrome: ${chromePath}`);
+  for (const item of report.items) {
+    const status = item.status.toUpperCase().padEnd(8);
+    console.log(`${status} ${item.label}: ${item.detail}`);
+  }
   console.log(`Data: ${paths.appDataDir}`);
   console.log(`Profile: ${paths.profileDir}`);
-  console.log("Doctor: OK");
+  console.log(report.exitCode === 0 ? "Doctor: OK" : "Doctor: FAILED");
+  process.exitCode = report.exitCode;
 }
 
 // Owns the browser adapter, process manager, and renderer for the lifetime of
@@ -308,7 +316,7 @@ async function executeSession({
       }
 
       // Managed dev servers keep running between turns; surface them once.
-      const running = runner.processManager.list().filter(
+      const running = runner.processManager.list({ includeOutput: false }).filter(
         (item) => item.status === "running",
       );
       if (running.length > 0) {
@@ -387,6 +395,7 @@ async function resolveMessageAttachments(runner, text) {
 }
 
 async function runAgent(taskParts, options) {
+  assertNativeRuntimeSupported();
   const projectRoot = path.resolve(options.project ?? process.cwd());
   await assertDirectory(projectRoot);
   const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
@@ -473,6 +482,7 @@ async function loadSession(paths, sessionId) {
 }
 
 async function runResume(sessionId, instructionParts, options) {
+  assertNativeRuntimeSupported();
   const paths = resolveRuntimePaths(options);
   await ensureDirectory(paths.sessionsDir);
   const session = await loadSession(paths, sessionId);

@@ -1,0 +1,9 @@
+{
+  "name": "wtagent-windows-smoke",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "test": "node -e \"process.stdout.write('fixture-test-ok')\"",
+    "dev": "node ../../../../scripts/windows-fixtures/package-smoke/server.js"
+  }
+}

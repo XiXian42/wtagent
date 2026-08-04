@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { getEnvCaseInsensitive } from "./command-launcher.js";
 
 function existingFile(candidate) {
   return candidate && fs.existsSync(candidate) ? candidate : null;
 }
 
 function findOnPath(names, platform) {
-  const finder = platform === "win32" ? "where" : "which";
+  const finder = platform === "win32" ? "where.exe" : "which";
   for (const name of names) {
     const result = spawnSync(finder, [name], {
       encoding: "utf8",
@@ -31,8 +32,8 @@ export function discoverChromeExecutable(explicitPath, {
   platform = process.platform,
 } = {}) {
   const configured = explicitPath
-    ?? env.WTAGENT_CHROME_PATH
-    ?? env.WEBAGENT_CHROME_PATH;
+    ?? getEnvCaseInsensitive(env, "WTAGENT_CHROME_PATH")
+    ?? getEnvCaseInsensitive(env, "WEBAGENT_CHROME_PATH");
   if (configured) {
     const resolved = path.resolve(configured);
     if (!fs.existsSync(resolved)) {
@@ -49,9 +50,9 @@ export function discoverChromeExecutable(explicitPath, {
     );
   } else if (platform === "win32") {
     const programFiles = [
-      env.PROGRAMFILES,
-      env["PROGRAMFILES(X86)"],
-      env.LOCALAPPDATA,
+      getEnvCaseInsensitive(env, "PROGRAMFILES"),
+      getEnvCaseInsensitive(env, "PROGRAMFILES(X86)"),
+      getEnvCaseInsensitive(env, "LOCALAPPDATA"),
     ].filter(Boolean);
     for (const base of programFiles) {
       candidates.push(

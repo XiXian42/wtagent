@@ -332,8 +332,18 @@ export class ChatGPTWebAdapter {
     return this.lastAssistantMessageId;
   }
 
-  async sendMessage(text, { files = [] } = {}) {
+  async sendMessage(text, { files = [], maxBytes = null } = {}) {
     this.#requirePage();
+    const messageBytes = Buffer.byteLength(String(text ?? ""), "utf8");
+    if (maxBytes != null && messageBytes > maxBytes) {
+      throw new BrowserAdapterError(
+        `Outbound message is ${messageBytes} bytes; the limit is ${maxBytes} bytes.`,
+        {
+          code: "OUTBOUND_MESSAGE_TOO_LARGE",
+          details: { messageBytes, maxBytes },
+        },
+      );
+    }
     const urlBeforeSend = this.page.url();
     const composer = await this.#waitForComposer(30_000);
     if (!composer) {

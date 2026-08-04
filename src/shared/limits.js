@@ -5,8 +5,10 @@ export const DEFAULT_LIMITS = Object.freeze({
   modelStableWindowMs: 1_500,
   loginTimeoutMs: 15 * 60_000,
   toolTimeoutMs: 2 * 60_000,
-  maxToolOutputBytes: 64 * 1024,
-  maxFileReadBytes: 128 * 1024,
+  maxToolOutputBytes: 4 * 1024,
+  maxLocalToolLogBytes: 4 * 1024 * 1024,
+  maxFileReadBytes: 16 * 1024,
+  maxBrowserToolResultBytes: 24 * 1024,
   maxDirectoryEntries: 500,
   maxSearchResults: 200,
 });
@@ -28,4 +30,3 @@ export function resolveLimits({ modelTurnTimeoutMs } = {}) {
     modelTurnTimeoutMs: parsed,
   });
 }
-

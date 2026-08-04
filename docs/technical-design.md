@@ -11,11 +11,20 @@
 - 双方通过普通聊天文本中的自定义 XML 交换工具调用和结果。
 - Runtime 循环执行“网页回复 → 解析工具 → 本地执行 → 回填结果”，直到任务完成。
 
+原生 Windows 支持约束：
+
+- 发布目标是 Windows 10 1809+ / Windows 11 x64；ARM64 先作为预览
+- 支持从 PowerShell、CMD 或 Windows Terminal 启动
+- 仅支持 Chrome / Chromium，不把 Edge 计入首版兼容矩阵
+- Git、`rg`、Codex、Claude Code 都不是运行依赖
+- WSL 不在首版范围内，需要从原生 Windows 终端直接运行
+- Windows 上仍保持同一个结构化执行协议：`program + argv + cwd`
+
 建议的首版技术组合：
 
 | 领域 | 选择 |
 | --- | --- |
-| 运行时 | Node.js 22+，JavaScript ESM |
+| 运行时 | Node.js 20.17+，JavaScript ESM |
 | CLI | `commander` + `@inquirer/prompts`，终端渲染可选 `ink` |
 | 浏览器控制 | `playwright-core`，使用用户已安装的 Chrome，非 headless |
 | XML | `saxes` 或 `fast-xml-parser`；工具参数按注册 Schema 二次校验 |
@@ -49,6 +58,12 @@
 - V1 使用自定义 XML，不使用网页原生 Function Call 作为本地工具信号。
 - V1 支持 macOS、Windows、Linux。
 - V1 是 CLI，不做桌面 GUI 和远程控制台。
+
+其中 Windows 的产品边界需要额外强调：
+
+- `.cmd` / `.bat` 兼容属于运行时适配层职责，不能暴露为新的 shell-string 工具
+- `wtagent doctor` 需要明确区分“必需失败”“可选缺失”“能力降级”和“不支持的 WSL”
+- 打包发布必须经过原生 Windows 全局安装 smoke、路径带空格/中文、以及 Chrome 专用 Profile 验证
 
 ### 2.3 一个必须正视的技术事实
 
@@ -519,10 +534,17 @@ V1 不需要把 `cd` 暴露给模型；每个命令都有显式 `cwd`，且必�
 
 - `cwd` 解析后必须位于项目根目录。
 - stdout/stderr 分开捕获并流式展示。
-- 达到上限后保留头尾并标记截断。
+- stdout 与 stderr 回填给网页模型的合计上限为 4 KiB；达到上限后按 UTF-8 字节安全地保留约 1 KiB 头部和 3 KiB 尾部，并标记原始与省略字节数。
+- 工具说明要求模型优先使用 `fs.search`、分页 `fs.read`、窄路径、子命令和测试过滤参数缩小输出；不假设系统已安装 Git、`rg` 或 Unix 文本工具。`terminal.exec` 不提供管道、重定向或其他 Shell 运算符。
+- 单次调用流式写入本地 `tool-output.jsonl` 的原始命令日志最多保留 4 MiB，超过后停止记录剩余日志，但不因此终止命令。
 - 超时先优雅终止，再强制终止进程树。
 - Windows 必须处理子进程树终止。
 - 返回 exit code、signal、duration 和截断信息。
+
+文件读取与网页传输另有两层硬限制：
+
+- `fs.read` 单次最多读取 16 KiB，通过返回的 `nextOffset` 继续读取；分段边界不得切断 UTF-8 字符。
+- 最终发送到浏览器的单条工具结果，包括 XML、续跑信息和 `<system_reminder>`，不得超过 24 KiB。Runtime 在字段级截断后生成完整 XML，Browser Adapter 在写入 composer 前再次按 UTF-8 字节数校验；禁止直接截断已经序列化的 XML。
 
 ### 7.4 长运行进程
 
@@ -820,7 +842,7 @@ macOS、Windows、Linux 都运行：
 | ChatGPT DOM 变化 | Provider Adapter 隔离、集中 Locator、Fixture 和诊断截图 |
 | 网页模型不遵守 XML | 简单协议、单工具/轮、确定性解析、有限重发 |
 | 重复执行工具 | assistant 指纹、call ledger、两阶段事件记录 |
-| 大输出塞满聊天 | 本地保存、截断回填、按需读取 |
+| 大输出塞满聊天 | 文件按 16 KiB 分段读取；命令结果回填 4 KiB；浏览器工具消息硬限制 24 KiB；本地命令日志限制 4 MiB |
 | dev server 阻塞 | 独立 Process Manager |
 | 跨平台 Shell 差异 | `program + argv + cwd`，复杂 Shell 单独审批 |
 | 路径逃逸 | realpath、符号链接检查、项目根策略 |
