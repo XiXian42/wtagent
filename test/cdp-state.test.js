@@ -49,7 +49,10 @@ test("discovers and refreshes a healthy saved CDP browser", async (t) => {
     profileDir,
   });
 
-  const state = await discoverReusableCdpState(profileDir);
+  const state = await discoverReusableCdpState(profileDir, {
+    listProcesses: async () => [],
+    platform: "linux",
+  });
 
   assert.equal(state.pid, process.pid);
   assert.equal(state.port, port);

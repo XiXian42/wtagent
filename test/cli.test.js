@@ -59,9 +59,10 @@ test("a task is accepted directly without a run subcommand", async () => {
       "site",
     ]),
     (error) => {
-      assert.match(
-        error.stderr,
-        new RegExp(`Project directory does not exist: ${missingProject}`),
+      assert.ok(
+        error.stderr.includes(
+          `Project directory does not exist: ${missingProject}`,
+        ),
       );
       assert.doesNotMatch(error.stderr, /unknown command/i);
       return true;
