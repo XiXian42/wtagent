@@ -35,14 +35,14 @@ WTAgent 把 GPT 网页聊天连接到本地工具，提供类似 Codex 的 CLI A
 需要 Node.js 20.17+ 和 Chrome/Chromium。
 
 ```bash
-npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
+npm install -g wtagent --registry=https://registry.npmjs.org/
 wtagent login
 ```
 
 Windows PowerShell：
 
 ```powershell
-npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
+npm install -g wtagent --registry=https://registry.npmjs.org/
 wtagent doctor
 wtagent login
 ```
@@ -100,14 +100,14 @@ Boundaries:
 Requires Node.js 20.17+ and Chrome/Chromium.
 
 ```bash
-npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
+npm install -g wtagent --registry=https://registry.npmjs.org/
 wtagent login
 ```
 
 Windows PowerShell:
 
 ```powershell
-npm install -g wtagent@alpha --registry=https://registry.npmjs.org/
+npm install -g wtagent --registry=https://registry.npmjs.org/
 wtagent doctor
 wtagent login
 ```
