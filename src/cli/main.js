@@ -585,7 +585,7 @@ async function runExport(sessionId, options) {
 const program = new Command()
   .name("wtagent")
   .description("Turn your web AI session into a local tool-using agent.")
-  .version("0.1.0-alpha.2")
+  .version("0.1.0-alpha.3")
   .option("--home <path>", "Application data directory")
   .option("--profile-dir <path>", "Dedicated Chrome profile directory")
   .option("--chrome-path <path>", "Chrome/Chromium executable")
