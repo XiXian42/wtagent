@@ -20,7 +20,6 @@ import {
 import { DEFAULT_LIMITS } from "../shared/limits.js";
 import { utf8ByteLength } from "../shared/text-budget.js";
 import {
-  PolicyDeniedError,
   ProtocolError,
   ToolValidationError,
 } from "../shared/errors.js";
@@ -104,6 +103,15 @@ function deniedResult(toolCall, reasons) {
     name: toolCall.name,
     ok: false,
     message: `User denied this tool call: ${reasons.join("; ")}`,
+  };
+}
+
+function policyRejectedResult(toolCall, message) {
+  return {
+    callId: toolCall.id,
+    name: toolCall.name,
+    ok: false,
+    message: `Tool request rejected before execution: ${message}`,
   };
 }
 
@@ -583,12 +591,22 @@ export class AgentRuntime {
       }
 
       if (!result) {
-        const decision = await this.policy.evaluate(preparedCall, {
-          projectRoot,
-        });
-        const grants = decision.grants;
+        let decision;
+        try {
+          decision = await this.policy.evaluate(preparedCall, {
+            projectRoot,
+          });
+        } catch (error) {
+          result = policyRejectedResult(preparedCall, error.message);
+          await this.emit("tool.invalid", {
+            id: preparedCall.id,
+            name: preparedCall.name,
+            message: result.message,
+          });
+        }
+        const grants = decision?.grants;
 
-        if (decision.action === "confirm") {
+        if (!result && decision.action === "confirm") {
           await this.emit("approval.required", {
             id: preparedCall.id,
             name: preparedCall.name,
@@ -602,8 +620,16 @@ export class AgentRuntime {
           if (!approved) {
             result = deniedResult(preparedCall, decision.reasons);
           }
-        } else if (decision.action === "deny") {
-          throw new PolicyDeniedError(decision.reasons.join("; "));
+        } else if (!result && decision.action === "deny") {
+          result = policyRejectedResult(
+            preparedCall,
+            decision.reasons.join("; "),
+          );
+          await this.emit("tool.invalid", {
+            id: preparedCall.id,
+            name: preparedCall.name,
+            message: result.message,
+          });
         }
 
         if (sideEffect) {

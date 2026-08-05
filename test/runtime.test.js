@@ -367,6 +367,74 @@ test("returns invalid tool calls to the model instead of executing them", async 
   assert.equal(session.state.pendingToolResult, null);
 });
 
+test("returns policy path errors to the model instead of ending the CLI", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  let executionCount = 0;
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "terminal.test",
+    risk: "execute",
+    inputSchema: z.object({ cwd: z.string() }),
+    execute: async () => {
+      executionCount += 1;
+      return { ok: true, message: "executed" };
+    },
+  });
+  let policyCalls = 0;
+  const policy = {
+    evaluate: async () => {
+      policyCalls += 1;
+      if (policyCalls === 1) {
+        throw new Error(
+          "Path ends with a space or period, which is not allowed on Windows: bad.",
+        );
+      }
+      return { action: "allow", reasons: [], grants: {} };
+    },
+  };
+  const adapter = new FakeWebModelAdapter([
+    `<agent_response>
+      <done>false</done>
+      <message>compile</message>
+      <tool_call name="terminal.test"><args><cwd>bad.</cwd></args></tool_call>
+    </agent_response>`,
+    `<agent_response>
+      <done>false</done>
+      <message>retry with a valid path</message>
+      <tool_call name="terminal.test"><args><cwd>.</cwd></args></tool_call>
+    </agent_response>`,
+    `<agent_response><done>true</done><message>Recovered.</message></agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Compile a C program",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry,
+    policy,
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Recovered.");
+  assert.equal(executionCount, 1);
+  assert.match(
+    adapter.sentMessages[1],
+    /Tool request rejected before execution: Path ends with a space or period/,
+  );
+  assert.equal(session.state.pendingToolResult, null);
+});
+
 test("resumes the saved conversation with a follow-up instruction", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
