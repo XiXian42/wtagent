@@ -229,9 +229,9 @@ export class ChatGPTWebAdapter {
     return result;
   }
 
-  // DOM port for the language-independent selector in mode-selection.js. Every
-  // option is identified by a stable attribute slug (data-testid / data-* / id)
-  // rather than its localized label, and its disabled state is read from ARIA.
+  // DOM port for mode-selection.js. Stable attribute slugs are preferred;
+  // exact visible labels are a fallback for current menus that omit those
+  // attributes. Disabled state is still read from DOM state, never from text.
   #modeSelectionPort() {
     const page = this.page;
     return {
@@ -287,9 +287,9 @@ export class ChatGPTWebAdapter {
     );
   }
 
-  // Enumerates the open menu's options into the language-independent shape
-  // { index, slug, label, disabled }. `slug` is the first stable attribute
-  // found; `disabled` is read from ARIA / data-state, never from text.
+  // Enumerates the open menu's options into { index, slug, label, disabled }.
+  // `slug` is the first stable attribute found and may be empty in current
+  // ChatGPT menus; `disabled` is read from ARIA / data-state, never from text.
   async #readModeOptions() {
     const locator = this.#modeOptionLocators();
     const count = await locator.count().catch(() => 0);
@@ -764,7 +764,7 @@ export class ChatGPTWebAdapter {
     return fullText;
   }
 
-  async #findModelSwitcher(timeoutMs = 15_000) {
+  async #findModelSwitcher(timeoutMs = 45_000) {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {

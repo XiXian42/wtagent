@@ -20,9 +20,8 @@ function menu({ proDisabled = false, includePro = true } = {}) {
   return options.map((option, index) => ({ ...option, index }));
 }
 
-test("slug matching ignores display text and is language independent", () => {
+test("slug matching is language independent", () => {
   assert.equal(slugMatchesToken("model-switcher-pro", "pro"), true);
-  // Localized label is irrelevant; only the slug matters.
   assert.equal(slugMatchesToken("provider-picker", "pro"), false, "short token must match a whole segment");
   assert.equal(slugMatchesToken("o3-extra-high", normalizeToken("Extra high")), true);
 });
@@ -31,6 +30,29 @@ test("selects Pro when it is enabled", () => {
   const choice = chooseModeOption(menu(), "Pro");
   assert.equal(choice.status, "select");
   assert.equal(choice.targetIndex, 2);
+});
+
+test("selects Pro by exact label when the current menu exposes no stable ids", () => {
+  const options = [
+    { index: 0, slug: "", label: "Instant\n5.5", disabled: false },
+    { index: 1, slug: "", label: "Extra High", disabled: false },
+    { index: 2, slug: "", label: "Pro", disabled: false },
+    { index: 3, slug: "radix-dynamic", label: "GPT-5.6 Sol", disabled: false },
+  ];
+
+  const choice = chooseModeOption(options, "Pro");
+
+  assert.equal(choice.status, "select");
+  assert.equal(choice.targetIndex, 2);
+});
+
+test("label fallback is exact and does not match unrelated text", () => {
+  const options = [
+    { index: 0, slug: "", label: "Professional tools", disabled: false },
+    { index: 1, slug: "provider-picker", label: "Provider", disabled: false },
+  ];
+
+  assert.equal(chooseModeOption(options, "Pro").status, "unavailable");
 });
 
 test("falls back to the previous option when Pro is limited", () => {

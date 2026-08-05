@@ -1,9 +1,9 @@
 // Language-independent model/mode selection logic for the ChatGPT web picker.
 //
-// The picker's visible labels are localized (e.g. "Pro", and reasoning tiers
-// like "Extra high"), so we must NOT match options by their display text.
-// Instead every option is identified by a stable attribute "slug" derived from
-// data-testid / data-* / id, which does not change with the UI language.
+// Prefer language-independent option slugs derived from data-testid / data-* /
+// id. Current ChatGPT menus sometimes omit every such attribute, including on
+// the Pro item, so an exact normalized label match is kept as a conservative
+// fallback. We never use fuzzy label matching.
 //
 // This module is pure and DOM-free so it can be unit-tested without a browser.
 // The adapter supplies a small "port" of async DOM operations to
@@ -38,6 +38,12 @@ export function slugMatchesToken(slug, token) {
   return false;
 }
 
+function labelMatchesToken(label, token) {
+  return String(label ?? "")
+    .split(/\r?\n/)
+    .some((line) => normalizeToken(line) === token);
+}
+
 // Given the enumerated menu options and the requested mode, decide what to do.
 // options: [{ index, slug, label, disabled }] in DOM order.
 // Returns { status, targetIndex, selectedLabel, reason }.
@@ -49,7 +55,14 @@ export function slugMatchesToken(slug, token) {
 //                                   option is not selectable either.
 export function chooseModeOption(options, requested) {
   const token = normalizeToken(requested);
-  const proIndex = options.findIndex((option) => slugMatchesToken(option.slug, token));
+  let proIndex = options.findIndex(
+    (option) => slugMatchesToken(option.slug, token),
+  );
+  if (proIndex === -1) {
+    proIndex = options.findIndex(
+      (option) => labelMatchesToken(option.label, token),
+    );
+  }
 
   if (proIndex === -1) {
     return {
