@@ -1,5 +1,4 @@
 export const DEFAULT_LIMITS = Object.freeze({
-  maxTurns: 36,
   maxProtocolErrors: 3,
   modelTurnTimeoutMs: 10 * 60_000,
   modelStableWindowMs: 1_500,

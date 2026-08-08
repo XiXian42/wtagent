@@ -54,6 +54,8 @@ cd my-project
 wtagent
 ```
 
+启动后先选择 ChatGPT 模式：`Pro` 会为新对话选择 Pro，`Current` 会保留网页当前设置且不执行模型切换。非交互调用默认使用 `Current`；需要 Pro 时可显式传入 `--mode Pro`。
+
 也可以直接附带任务：
 
 ```bash
@@ -118,6 +120,8 @@ After signing in, start WTAgent inside a project:
 cd my-project
 wtagent
 ```
+
+At startup, choose a ChatGPT mode: `Pro` selects Pro for the new conversation, while `Current` keeps the current web setting without changing it. Non-interactive runs default to `Current`; pass `--mode Pro` to opt in explicitly.
 
 Or provide the first task directly:
 

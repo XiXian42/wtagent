@@ -108,6 +108,99 @@ test("runs a full model-tool-model loop", async (t) => {
   assert.equal(functionItems[1].call_id, functionItems[0].call_id);
 });
 
+test("continues beyond the former 36-step run limit", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  let executions = 0;
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "debug.step",
+    description: "Advance a deterministic test step.",
+    inputDescription: "<args><index>integer</index></args>",
+    risk: "read",
+    inputSchema: z.object({ index: z.coerce.number().int() }),
+    execute: async ({ index }) => {
+      executions += 1;
+      return { ok: true, message: `step ${index}` };
+    },
+  });
+
+  const responses = Array.from({ length: 37 }, (_, index) => `
+    <agent_response>
+      <done>false</done>
+      <tool_call name="debug.step"><args><index>${index + 1}</index></args></tool_call>
+    </agent_response>
+  `);
+  responses.push(
+    "<agent_response><done>true</done><message>Finished after 37 tools.</message></agent_response>",
+  );
+
+  const adapter = new FakeWebModelAdapter(responses);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Run more than 36 steps",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry,
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Finished after 37 tools.");
+  assert.equal(executions, 37);
+  assert.equal(session.state.turn, 38);
+});
+
+test("current mode skips ChatGPT mode selection entirely", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Used current mode.</message></agent_response>",
+  ]);
+  adapter.selectMode = async () => {
+    throw new Error("mode selection must not run");
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Use the current ChatGPT setting",
+    projectRoot,
+    mode: null,
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Used current mode.");
+  assert.equal(
+    events.some((event) => event.type === "conversation.mode_selected"),
+    false,
+  );
+  const started = events.find((event) => event.type === "conversation.started");
+  assert.equal(started.payload.mode, null);
+});
+
 test("keeps the final browser tool-result message within 24 KiB", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");

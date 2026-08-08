@@ -32,6 +32,18 @@ test("selects Pro when it is enabled", () => {
   assert.equal(choice.targetIndex, 2);
 });
 
+test("recognizes Pro when the menu marks it as selected", () => {
+  const options = menu().map((option) => ({
+    ...option,
+    selected: option.label === "专业版",
+  }));
+
+  const choice = chooseModeOption(options, "Pro");
+
+  assert.equal(choice.status, "already");
+  assert.equal(choice.targetIndex, null);
+});
+
 test("selects Pro by exact label when the current menu exposes no stable ids", () => {
   const options = [
     { index: 0, slug: "", label: "Instant\n5.5", disabled: false },
@@ -121,6 +133,22 @@ test("skips work when already on the requested mode", async () => {
   const result = await runModeSelection(port, "Pro");
   assert.equal(result.status, "already");
   assert.equal(port.calls.openMenu, 0);
+});
+
+test("verifies the selected label after clicking instead of only menu closure", async () => {
+  const selectedLabels = [];
+  const port = fakePort({
+    waitClosed: async () => false,
+    waitSelected: async (label) => {
+      selectedLabels.push(label);
+      return true;
+    },
+  });
+
+  const result = await runModeSelection(port, "Pro");
+
+  assert.equal(result.status, "select");
+  assert.deepEqual(selectedLabels, ["Pro"]);
 });
 
 test("reports missing switcher instead of throwing", async () => {

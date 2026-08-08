@@ -38,16 +38,17 @@ export function slugMatchesToken(slug, token) {
   return false;
 }
 
-function labelMatchesToken(label, token) {
+export function labelMatchesToken(label, token) {
   return String(label ?? "")
     .split(/\r?\n/)
     .some((line) => normalizeToken(line) === token);
 }
 
 // Given the enumerated menu options and the requested mode, decide what to do.
-// options: [{ index, slug, label, disabled }] in DOM order.
+// options: [{ index, slug, label, disabled, selected }] in DOM order.
 // Returns { status, targetIndex, selectedLabel, reason }.
 //   status "select"              -> requested mode is available; click it.
+//   status "already"             -> requested mode is already selected.
 //   status "fallback"            -> requested mode is limited/disabled; click
 //                                   the option immediately before it.
 //   status "unavailable"         -> requested mode is not present in the menu.
@@ -74,6 +75,14 @@ export function chooseModeOption(options, requested) {
   }
 
   const pro = options[proIndex];
+  if (pro.selected) {
+    return {
+      status: "already",
+      targetIndex: null,
+      selectedLabel: pro.label || requested,
+      reason: `Already using ${requested}.`,
+    };
+  }
   if (!pro.disabled) {
     return {
       status: "select",
@@ -112,9 +121,10 @@ export function chooseModeOption(options, requested) {
 // port: {
 //   alreadyOnMode(requested) -> bool,
 //   hasSwitcher()            -> bool,
-//   openMenu()               -> void,
-//   readOptions()            -> [{index, slug, label, disabled}],
+//   openMenu(requested)      -> void,
+//   readOptions()            -> [{index, slug, label, disabled, selected}],
 //   clickOption(index)       -> bool (click landed),
+//   waitSelected(requested)  -> bool (picker reflects the requested mode),
 //   waitClosed()             -> bool (menu closed after click),
 //   closeMenu()              -> void,
 //   writeDiagnostics(label)  -> void,
@@ -146,7 +156,7 @@ export async function runModeSelection(port, requested, { maxAttempts = 2 } = {}
 
   let lastReason = "";
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    await port.openMenu();
+    await port.openMenu(requested);
     const options = await port.readOptions();
 
     // The Radix menu populates asynchronously; an empty read is a race, retry.
@@ -158,13 +168,25 @@ export async function runModeSelection(port, requested, { maxAttempts = 2 } = {}
 
     const choice = chooseModeOption(options, requested);
 
+    if (choice.status === "already") {
+      await port.closeMenu();
+      return { ...choice, requested, attempts: attempt };
+    }
+
     if (choice.status === "select" || choice.status === "fallback") {
       const clicked = await port.clickOption(choice.targetIndex);
-      const closed = clicked && await port.waitClosed();
-      if (closed) {
+      const expectedMode = choice.status === "fallback"
+        ? choice.selectedLabel
+        : requested;
+      const selected = clicked && (
+        typeof port.waitSelected === "function"
+          ? await port.waitSelected(expectedMode)
+          : await port.waitClosed()
+      );
+      if (selected) {
         return { ...choice, requested, attempts: attempt };
       }
-      lastReason = "The option click did not register.";
+      lastReason = "The option click did not change the selected mode.";
       await port.closeMenu();
       continue;
     }

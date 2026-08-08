@@ -1,4 +1,4 @@
-import { input } from "@inquirer/prompts";
+import { input, select } from "@inquirer/prompts";
 import { createInterface } from "node:readline/promises";
 
 const CLEAN_EXIT_ERRORS = new Set([
@@ -112,11 +112,11 @@ export class ShellChatInput {
   }
 }
 
-export async function promptForText(config, {
-  prompt = input,
+async function promptWithCleanExit(config, {
+  prompt,
   inputStream = process.stdin,
   outputStream = process.stdout,
-} = {}) {
+}) {
   if (inputStream.readableEnded) {
     return null;
   }
@@ -149,4 +149,18 @@ export async function promptForText(config, {
     inputStream.removeListener("end", onEof);
     inputStream.removeListener("close", onEof);
   }
+}
+
+export async function promptForText(config, options = {}) {
+  return await promptWithCleanExit(config, {
+    ...options,
+    prompt: options.prompt ?? input,
+  });
+}
+
+export async function promptForSelect(config, options = {}) {
+  return await promptWithCleanExit(config, {
+    ...options,
+    prompt: options.prompt ?? select,
+  });
 }

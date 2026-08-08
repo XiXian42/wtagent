@@ -5,6 +5,8 @@ import { discoverChromeExecutable } from "../platform/chrome-discovery.js";
 import { ensureDirectory } from "../platform/paths.js";
 import { BrowserAdapterError } from "../shared/errors.js";
 import {
+  chooseModeOption,
+  labelMatchesToken,
   runModeSelection,
   slugMatchesToken,
   normalizeToken,
@@ -236,6 +238,15 @@ export class ChatGPTWebAdapter {
     const page = this.page;
     return {
       alreadyOnMode: async (requested) => {
+        const token = normalizeToken(requested);
+        const switcher = await this.#findModelSwitcher();
+        const switcherLabel = switcher
+          ? await switcher.innerText().catch(() => "")
+          : "";
+        if (labelMatchesToken(switcherLabel, token)) {
+          return true;
+        }
+
         const messages = this.#assistantMessages();
         if (await messages.count() === 0) {
           return false;
@@ -243,17 +254,24 @@ export class ChatGPTWebAdapter {
         const slug = await messages.last()
           .getAttribute("data-message-model-slug")
           .catch(() => null);
-        return Boolean(slug) && slugMatchesToken(slug, normalizeToken(requested));
+        return Boolean(slug) && slugMatchesToken(slug, token);
       },
       hasSwitcher: async () => Boolean(await this.#findModelSwitcher()),
-      openMenu: async () => {
+      openMenu: async (requested) => {
         const switcher = await this.#findModelSwitcher();
         if (switcher) {
-          await switcher.click().catch(() => null);
+          const opened = await switcher.click({ timeout: 5_000 })
+            .then(() => true)
+            .catch(() => false);
+          if (!opened) {
+            await switcher.click({ force: true, timeout: 5_000 })
+              .catch(() => null);
+          }
           // Wait for the Radix menu portal to attach before reading options.
-          await page.locator('[role="menu"] [role="menuitem"], [role="menu"] [role="menuitemradio"]')
+          await page.locator('[role="menu"]:visible [role="menuitem"]:visible, [role="menu"]:visible [role="menuitemradio"]:visible')
             .first().waitFor({ state: "visible", timeout: 5_000 })
             .catch(() => null);
+          await this.#revealNestedModeOption(requested);
         }
       },
       readOptions: async () => this.#readModeOptions(),
@@ -273,6 +291,32 @@ export class ChatGPTWebAdapter {
           .catch(() => false);
         return ok;
       },
+      waitSelected: async (requested) => {
+        const token = normalizeToken(requested);
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const switcher = await this.#findModelSwitcher(500);
+          const label = switcher
+            ? await switcher.innerText().catch(() => "")
+            : "";
+          if (labelMatchesToken(label, token)) {
+            return true;
+          }
+
+          const selectedOption = (await this.#readModeOptions()).find(
+            (option) => option.selected
+              && (
+                slugMatchesToken(option.slug, token)
+                || labelMatchesToken(option.label, token)
+              ),
+          );
+          if (selectedOption) {
+            return true;
+          }
+          await page.waitForTimeout(100);
+        }
+        return false;
+      },
       closeMenu: async () => {
         await page.keyboard.press("Escape").catch(() => null);
         await page.waitForTimeout(150);
@@ -283,8 +327,36 @@ export class ChatGPTWebAdapter {
 
   #modeOptionLocators() {
     return this.page.locator(
-      '[role="menu"] [role="menuitemradio"], [role="menu"] [role="menuitem"]',
+      '[role="menu"]:visible [role="menuitemradio"]:visible, '
+        + '[role="menu"]:visible [role="menuitem"]:visible',
     );
+  }
+
+  async #revealNestedModeOption(requested) {
+    const present = (options) => {
+      const choice = chooseModeOption(options, requested);
+      return choice.status !== "unavailable";
+    };
+
+    let options = await this.#readModeOptions();
+    if (present(options)) {
+      return;
+    }
+
+    const submenuTriggers = this.page.locator(
+      '[role="menu"]:visible [role="menuitem"][aria-haspopup="menu"]:visible',
+    );
+    const count = await submenuTriggers.count().catch(() => 0);
+    for (let index = 0; index < count; index += 1) {
+      const trigger = submenuTriggers.nth(index);
+      await trigger.dispatchEvent("pointermove", { pointerType: "mouse" })
+        .catch(() => null);
+      await this.page.waitForTimeout(250);
+      options = await this.#readModeOptions();
+      if (present(options)) {
+        return;
+      }
+    }
   }
 
   // Enumerates the open menu's options into { index, slug, label, disabled }.
@@ -296,13 +368,14 @@ export class ChatGPTWebAdapter {
     const options = [];
     for (let index = 0; index < count; index += 1) {
       const item = locator.nth(index);
-      const [testId, dataValue, dataTestValue, id, ariaDisabled, dataDisabled, dataState, label] =
+      const [testId, dataValue, dataTestValue, id, ariaDisabled, ariaChecked, dataDisabled, dataState, label] =
         await Promise.all([
           item.getAttribute("data-testid").catch(() => null),
           item.getAttribute("data-value").catch(() => null),
           item.getAttribute("data-test-value").catch(() => null),
           item.getAttribute("id").catch(() => null),
           item.getAttribute("aria-disabled").catch(() => null),
+          item.getAttribute("aria-checked").catch(() => null),
           item.getAttribute("data-disabled").catch(() => null),
           item.getAttribute("data-state").catch(() => null),
           item.innerText().catch(() => ""),
@@ -313,11 +386,13 @@ export class ChatGPTWebAdapter {
         || dataDisabled === ""
         || dataState === "disabled"
         || !await item.isEnabled().catch(() => true);
+      const selected = ariaChecked === "true" || dataState === "checked";
       options.push({
         index,
         slug,
         label: (label ?? "").trim(),
         disabled,
+        selected,
       });
     }
     return options;

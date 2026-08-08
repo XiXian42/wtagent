@@ -19,7 +19,7 @@ test("package exposes only the wtagent executable", async () => {
   );
 
   assert.equal(manifest.name, "wtagent");
-  assert.equal(manifest.version, "0.1.0-alpha.3");
+  assert.equal(manifest.version, "0.1.0-alpha.4");
   assert.deepEqual(manifest.bin, {
     wtagent: "src/cli/main.js",
   });
@@ -37,7 +37,7 @@ test("CLI help and version use the WTAgent package identity", async () => {
   assert.match(help, /\[task\.\.\.\]/);
   assert.match(help, /-C, --project <path>/);
   assert.doesNotMatch(help, /^\s+run(?:\s|$)/m);
-  assert.equal(version.trim(), "0.1.0-alpha.3");
+  assert.equal(version.trim(), "0.1.0-alpha.4");
 });
 
 test("a task is accepted directly without a run subcommand", async () => {

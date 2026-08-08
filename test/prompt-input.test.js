@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import {
   classifyChatInput,
+  promptForSelect,
   promptForText,
   readChatMessage,
   ShellChatInput,
@@ -66,6 +67,15 @@ test("unexpected prompt failures still surface", async () => {
     ),
     /boom/,
   );
+});
+
+test("select prompts share the same clean-exit handling", async () => {
+  const result = await promptForSelect(
+    { message: "ChatGPT mode", choices: [] },
+    { prompt: async () => "current" },
+  );
+
+  assert.equal(result, "current");
 });
 
 test("blank chat input re-prompts instead of exiting", () => {

@@ -239,7 +239,7 @@ export class AgentRuntime {
     let activeMode = resume
       ? (this.session.state.activeMode ?? null)
       : null;
-    if (!resume) {
+    if (!resume && mode) {
       const modeResult = await this.adapter.selectMode(mode);
       if (modeResult) {
         await this.emit("conversation.mode_selected", {
@@ -339,7 +339,7 @@ export class AgentRuntime {
     let protocolErrors = 0;
     const baseTurn = resume ? Number(this.session.state.turn || 0) : 0;
 
-    for (let step = 1; step <= this.limits.maxTurns; step += 1) {
+    for (let step = 1; ; step += 1) {
       const turnNumber = baseTurn + step;
       await this.session.update({ turn: turnNumber, phase: "waiting_model" });
       const raw = await this.adapter.waitForTurnComplete({
@@ -699,12 +699,5 @@ export class AgentRuntime {
       });
     }
 
-    const message = `Maximum turn limit reached (${this.limits.maxTurns}).`;
-    await this.session.update({
-      phase: "interrupted",
-      lastError: message,
-    });
-    await this.emit("run.interrupted", { message });
-    throw new Error(message);
   }
 }

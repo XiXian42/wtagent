@@ -28,10 +28,16 @@ import { extractAtMentions } from "./at-files.js";
 import {
   classifyChatInput,
   promptForText,
+  promptForSelect,
   readChatMessage,
   ShellChatInput,
 } from "./prompt-input.js";
 import { createRenderer } from "./render-events.js";
+import {
+  CHATGPT_MODE_CHOICES,
+  modeFromPromptChoice,
+  normalizeConfiguredMode,
+} from "./mode-choice.js";
 
 function resolveRuntimePaths(options) {
   const appDataDir = path.resolve(options.home ?? getAppDataDir());
@@ -401,13 +407,34 @@ async function runAgent(taskParts, options) {
   const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
   const chatInput = interactive ? new ShellChatInput() : null;
 
+  if (interactive) {
+    printChatBanner(projectRoot);
+  }
+
+  let requestedMode;
+  if (options.mode != null) {
+    requestedMode = normalizeConfiguredMode(options.mode);
+  } else if (interactive) {
+    const modeChoice = await promptForSelect({
+      message: "ChatGPT mode",
+      choices: CHATGPT_MODE_CHOICES,
+    });
+    if (modeChoice == null) {
+      chatInput?.close();
+      console.log("");
+      return null;
+    }
+    requestedMode = modeFromPromptChoice(modeChoice);
+  } else {
+    // Non-interactive callers cannot answer a picker. Preserve the current web
+    // setting unless they explicitly opt into `--mode Pro`.
+    requestedMode = null;
+  }
+
   // In interactive mode an initial task is optional: the user can just start
   // typing at the prompt. In one-shot mode a task is required.
   let task = taskParts.join(" ").trim();
   if (!task) {
-    if (interactive) {
-      printChatBanner(projectRoot, options.mode);
-    }
     const initialMessage = interactive
       ? await readChatMessage(() => chatInput.read())
       : await promptForText({
@@ -421,7 +448,6 @@ async function runAgent(taskParts, options) {
     }
     task = initialMessage.trim();
   } else if (interactive) {
-    printChatBanner(projectRoot, options.mode);
     chatInput.remember(task);
   }
 
@@ -431,7 +457,7 @@ async function runAgent(taskParts, options) {
     sessionsDir: paths.sessionsDir,
     task,
     projectRoot,
-    mode: options.mode,
+    mode: requestedMode,
   });
 
   // Resolve @file attachments in the opening task, if any. The task itself is
@@ -454,7 +480,7 @@ async function runAgent(taskParts, options) {
   return await executeSession({ session, options, files, chatInput });
 }
 
-function printChatBanner(projectRoot, mode) {
+function printChatBanner(projectRoot) {
   const CYAN = "\x1b[36m";
   const DIM = "\x1b[2m";
   const RESET = "\x1b[0m";
@@ -585,12 +611,15 @@ async function runExport(sessionId, options) {
 const program = new Command()
   .name("wtagent")
   .description("Turn your web AI session into a local tool-using agent.")
-  .version("0.1.0-alpha.3")
+  .version("0.1.0-alpha.4")
   .option("--home <path>", "Application data directory")
   .option("--profile-dir <path>", "Dedicated Chrome profile directory")
   .option("--chrome-path <path>", "Chrome/Chromium executable")
   .option("-C, --project <path>", "Project directory", process.cwd())
-  .option("--mode <name>", "ChatGPT mode to select", "Pro")
+  .option(
+    "--mode <name>",
+    'ChatGPT mode: "Pro" selects Pro; "Current" keeps the web setting',
+  )
   .option(
     "--once",
     "Run a single request and exit instead of a conversation",

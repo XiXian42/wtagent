@@ -23,7 +23,6 @@ test("model turn timeout accepts a positive integer CLI value", () => {
   });
 
   assert.equal(limits.modelTurnTimeoutMs, 720_000);
-  assert.equal(limits.maxTurns, DEFAULT_LIMITS.maxTurns);
   assert.notEqual(limits, DEFAULT_LIMITS);
 });
 
