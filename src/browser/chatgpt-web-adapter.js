@@ -813,23 +813,33 @@ export class ChatGPTWebAdapter {
   }
 
   async #assistantText(message) {
-    // ChatGPT may render the model's XML inside one of several code blocks,
-    // alongside rich cards (weather, charts, etc.) or other markdown. Search
-    // every code block for the envelope first; if none contains it, fall back
-    // to the full message text so the protocol layer can extract the envelope
-    // from wherever it landed.
-    const codeBlocks = message.locator("pre code");
-    const codeBlockCount = await codeBlocks.count();
-    for (let index = 0; index < codeBlockCount; index += 1) {
-      const code = await codeBlocks.nth(index).innerText().catch(() => "");
-      if (code.includes("<agent_response")) {
-        return code;
-      }
-    }
-
+    // Read the whole assistant turn first. A long XML response can contain
+    // Markdown fences inside CDATA; ChatGPT then splits the rendered response
+    // into many <pre><code> nodes and the first node contains the opening tag
+    // but not the closing tag. The parent innerText keeps the complete envelope
+    // and avoids one CDP round trip per nested code block on every poll.
     const fullText = await message.innerText().catch(() => "");
     if (fullText.includes("<agent_response")) {
       return fullText;
+    }
+
+    // Rare fallback for alternate renderers where the parent text omits code
+    // contents: prefer a complete code-block envelope, but retain a partial
+    // one so streaming progress remains visible until its closing tag arrives.
+    const codeBlocks = message.locator("pre code");
+    const codeBlockCount = await codeBlocks.count();
+    let partialEnvelope = "";
+    for (let index = 0; index < codeBlockCount; index += 1) {
+      const code = await codeBlocks.nth(index).innerText().catch(() => "");
+      if (hasCompleteAgentEnvelope(code)) {
+        return code;
+      }
+      if (!partialEnvelope && code.includes("<agent_response")) {
+        partialEnvelope = code;
+      }
+    }
+    if (partialEnvelope) {
+      return partialEnvelope;
     }
 
     const markdown = message.locator(".markdown");

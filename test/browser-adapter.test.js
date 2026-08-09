@@ -78,6 +78,10 @@ class AssistantMessage extends EmptyLocator {
     this.turn = turn;
   }
 
+  async innerText() {
+    return this.text;
+  }
+
   locator(selector) {
     if (selector === ".markdown") {
       return new VisibleLocator(this.text);
@@ -125,6 +129,22 @@ class MessageCollection extends EmptyLocator {
 
   last() {
     return this.messages.at(-1) ?? new EmptyLocator();
+  }
+}
+
+class RichAssistantMessage extends AssistantMessage {
+  constructor(text, codeBlocks, options = {}) {
+    super(text, options);
+    this.codeBlocks = codeBlocks;
+  }
+
+  locator(selector) {
+    if (selector === "pre code") {
+      return new MessageCollection(
+        this.codeBlocks.map((text) => new VisibleLocator(text)),
+      );
+    }
+    return super.locator(selector);
   }
 }
 
@@ -249,6 +269,39 @@ test("does not accept a protocol reply until its closing tag has streamed in", a
   // The accepted text must contain the complete envelope, not the truncated one.
   assert.match(result, /<\/agent_response>/);
   assert.match(result, /<\/tool_call>/);
+});
+
+test("accepts a complete long envelope split by nested Markdown code blocks", async () => {
+  const fragmentedCodeBlock = [
+    "<agent_response>",
+    "  <done>true</done>",
+    "  <message><![CDATA[The analysis includes:",
+    "```js",
+    "const accepted = true;",
+  ].join("\n");
+  const completeMessage = [
+    "XML",
+    fragmentedCodeBlock,
+    "```",
+    "and continues after many rendered code blocks.",
+    "]]></message>",
+    "</agent_response>",
+  ].join("\n");
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistant: new RichAssistantMessage(
+      completeMessage,
+      [fragmentedCodeBlock, "const accepted = true;"],
+    ),
+  });
+
+  const result = await adapter.waitForTurnComplete({
+    timeoutMs: 1_000,
+    stableWindowMs: 0,
+  });
+
+  assert.match(result, /<\/agent_response>/);
+  assert.match(result, /continues after many rendered code blocks/);
 });
 
 function createConversationPage({
