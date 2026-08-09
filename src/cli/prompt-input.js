@@ -1,5 +1,16 @@
 import { input, select } from "@inquirer/prompts";
 import { createInterface } from "node:readline/promises";
+import { Transform } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
+
+const BRACKETED_PASTE_START = "\u001b[200~";
+const BRACKETED_PASTE_END = "\u001b[201~";
+const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
+const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
+// readline treats CR/LF as submit. U+2028 is a non-submitting, semantic line
+// separator that can live in readline's editable buffer and history; decode it
+// back to LF before the value leaves this module.
+const PASTED_LINE_SEPARATOR = "\u2028";
 
 const CLEAN_EXIT_ERRORS = new Set([
   "AbortPromptError",
@@ -12,6 +23,110 @@ const EXIT_COMMANDS = new Set([
   "/exit",
   "/quit",
 ]);
+
+function longestMarkerPrefixAtEnd(text, marker) {
+  const limit = Math.min(text.length, marker.length - 1);
+  for (let length = limit; length > 0; length -= 1) {
+    if (text.endsWith(marker.slice(0, length))) {
+      return length;
+    }
+  }
+  return 0;
+}
+
+function encodePastedLines(text) {
+  return text.replace(/\r\n|\r|\n/g, PASTED_LINE_SEPARATOR);
+}
+
+function decodePastedLines(text) {
+  return String(text ?? "").replaceAll(PASTED_LINE_SEPARATOR, "\n");
+}
+
+function looksLikeUnbracketedMultilinePaste(text) {
+  const normalized = text.replace(/\r\n|\r/g, "\n");
+  const firstNewline = normalized.indexOf("\n");
+  if (firstNewline < 0) {
+    return false;
+  }
+  // A newline followed by more text, or two or more newlines in one raw data
+  // event, cannot be a single Enter key. Treat it as an unmarked paste. A
+  // normal test/pipe write such as "message\n" remains a submit.
+  return firstNewline < normalized.length - 1
+    || normalized.indexOf("\n", firstNewline + 1) >= 0;
+}
+
+class PasteAwareInput extends Transform {
+  constructor(source) {
+    super();
+    this.decoder = new StringDecoder("utf8");
+    this.pending = "";
+    this.inBracketedPaste = false;
+    this.isTTY = source.isTTY;
+    this.columns = source.columns;
+    this.setRawMode = typeof source.setRawMode === "function"
+      ? (enabled) => source.setRawMode(enabled)
+      : undefined;
+  }
+
+  _transform(chunk, _encoding, callback) {
+    try {
+      this.#consume(this.decoder.write(chunk), false);
+      callback();
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  _flush(callback) {
+    try {
+      this.#consume(this.decoder.end(), true);
+      callback();
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  #consume(text, flush) {
+    this.pending += text;
+    let output = "";
+
+    for (;;) {
+      const marker = this.inBracketedPaste
+        ? BRACKETED_PASTE_END
+        : BRACKETED_PASTE_START;
+      const markerIndex = this.pending.indexOf(marker);
+      if (markerIndex >= 0) {
+        const before = this.pending.slice(0, markerIndex);
+        output += this.inBracketedPaste
+          ? encodePastedLines(before)
+          : this.#outsidePaste(before);
+        this.pending = this.pending.slice(markerIndex + marker.length);
+        this.inBracketedPaste = !this.inBracketedPaste;
+        continue;
+      }
+
+      const retained = flush
+        ? 0
+        : longestMarkerPrefixAtEnd(this.pending, marker);
+      const ready = this.pending.slice(0, this.pending.length - retained);
+      output += this.inBracketedPaste
+        ? encodePastedLines(ready)
+        : this.#outsidePaste(ready);
+      this.pending = this.pending.slice(this.pending.length - retained);
+      break;
+    }
+
+    if (output) {
+      this.push(output);
+    }
+  }
+
+  #outsidePaste(text) {
+    return looksLikeUnbracketedMultilinePaste(text)
+      ? encodePastedLines(text)
+      : text;
+  }
+}
 
 export function classifyChatInput(value) {
   const text = String(value ?? "").trim();
@@ -69,14 +184,18 @@ export class ShellChatInput {
       return null;
     }
 
+    const pasteInput = new PasteAwareInput(this.inputStream);
+    this.inputStream.pipe(pasteInput);
+    this.outputStream.write(ENABLE_BRACKETED_PASTE);
+
     const readline = createInterface({
-      input: this.inputStream,
+      input: pasteInput,
       output: this.outputStream,
       terminal: true,
       historySize: this.historySize,
       removeHistoryDuplicates: true,
     });
-    readline.history = [...this.history];
+    readline.history = this.history.map(encodePastedLines);
 
     const controller = new AbortController();
     let closed = false;
@@ -92,8 +211,10 @@ export class ShellChatInput {
       const answer = await readline.question(prompt, {
         signal: controller.signal,
       });
-      this.history = readline.history.slice(0, this.historySize);
-      return answer;
+      this.history = readline.history
+        .slice(0, this.historySize)
+        .map(decodePastedLines);
+      return decodePastedLines(answer);
     } catch (error) {
       if (closed || error?.name === "AbortError") {
         return null;
@@ -103,6 +224,9 @@ export class ShellChatInput {
       readline.removeListener("close", onClose);
       readline.removeListener("SIGINT", onInterrupt);
       readline.close();
+      this.outputStream.write(DISABLE_BRACKETED_PASTE);
+      this.inputStream.unpipe(pasteInput);
+      pasteInput.destroy();
     }
   }
 

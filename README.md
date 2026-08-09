@@ -63,7 +63,7 @@ wtagent "检查这个项目并修复测试"
 wtagent -C ./my-project "创建一个网站"
 ```
 
-之后直接在终端中继续对话。WTAgent 会把任务交给 GPT Web，并在本地执行文件操作和结构化本地命令。使用 `↑` / `↓` 浏览本次 CLI 会话的历史输入。
+之后直接在终端中继续对话。WTAgent 会把任务交给 GPT Web，并在本地执行文件操作和结构化本地命令。可以一次粘贴多行内容，粘贴后按 Enter 作为一条消息发送；使用 `↑` / `↓` 浏览本次 CLI 会话的历史输入。
 
 按 `Ctrl+C` 或 `Ctrl+D` 可退出并关闭专用 Chrome。若上一次异常退出留下了 Chrome，WTAgent 会在验证其 CDP 身份后复用并接管它。
 
@@ -130,7 +130,7 @@ wtagent "inspect this project and fix the tests"
 wtagent -C ./my-project "build a website"
 ```
 
-Continue chatting in the terminal. WTAgent sends tasks to GPT Web and executes file operations and structured local commands. Use `↑` / `↓` to browse input history from the current CLI session.
+Continue chatting in the terminal. WTAgent sends tasks to GPT Web and executes file operations and structured local commands. You can paste multiple lines and then press Enter to send them as one message. Use `↑` / `↓` to browse input history from the current CLI session.
 
 Press `Ctrl+C` or `Ctrl+D` to exit and close the dedicated Chrome. If an abnormal exit leaves Chrome running, WTAgent verifies and adopts that CDP instance on the next start.
 

@@ -486,7 +486,7 @@ function printChatBanner(projectRoot) {
   const RESET = "\x1b[0m";
   console.log("");
   console.log(`${CYAN}WTAgent${RESET} ${DIM}· GPT Web · ${projectRoot}${RESET}`);
-  console.log(`${DIM}Enter sends · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
+  console.log(`${DIM}Enter sends · multiline paste · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
   console.log("");
 }
 
@@ -611,7 +611,7 @@ async function runExport(sessionId, options) {
 const program = new Command()
   .name("wtagent")
   .description("Turn your web AI session into a local tool-using agent.")
-  .version("0.1.0-alpha.5")
+  .version("0.1.0-alpha.6")
   .option("--home <path>", "Application data directory")
   .option("--profile-dir <path>", "Dedicated Chrome profile directory")
   .option("--chrome-path <path>", "Chrome/Chromium executable")

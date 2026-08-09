@@ -134,6 +134,50 @@ test("shell chat input supports up and down history navigation", async () => {
   assert.equal(await selected, "second");
 });
 
+test("shell chat input keeps a bracketed multiline paste as one message", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  let settled = false;
+  const pending = chatInput.read().then((value) => {
+    settled = true;
+    return value;
+  });
+  inputStream.write(
+    "\u001b[200~first line\r\nsecond line\nthird line\u001b[201~",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "paste must not submit before a separate Enter");
+
+  inputStream.write("\n");
+  assert.equal(await pending, "first line\nsecond line\nthird line");
+});
+
+test("shell chat input recognizes an unbracketed multiline paste in one chunk", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("first line\nsecond line\nthird line");
+  inputStream.write("\n");
+
+  assert.equal(await pending, "first line\nsecond line\nthird line");
+});
+
+test("shell chat history preserves multiline pasted messages", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+  chatInput.remember("first line\nsecond line");
+
+  const pending = chatInput.read();
+  inputStream.write("\u001b[A\n");
+
+  assert.equal(await pending, "first line\nsecond line");
+});
+
 test("shell chat input exits cleanly on Ctrl+D", async () => {
   const inputStream = createTtyStream();
   const outputStream = createTtyStream();
