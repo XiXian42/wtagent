@@ -1,144 +1,94 @@
 # WTAgent
 
-Turn GPT Web into a local CLI agent.
+Use GPT Web as a local CLI agent.
 
-把 GPT 网页聊天变成一个本地 CLI Agent。
+把 GPT 网页聊天变成可读写本地文件、运行本地命令的 CLI Agent。
 
 [中文](#中文) · [English](#english)
 
 ## 中文
 
-WTAgent 把 GPT 网页聊天连接到本地工具，提供类似 Codex 的 CLI Agent 体验。当前首个适配器支持 ChatGPT Web。
+WTAgent 把 GPT Web 连接到你的本地项目，提供类似 Codex 的命令行体验：GPT 在网页中思考，WTAgent 在本机读写文件、编译代码并运行测试。
 
-网页 GPT 负责思考，WTAgent 在本机：
+当前支持 ChatGPT Web。无需 OpenAI API Key，也不要求 ChatGPT Pro；使用的是你自己的网页账号、可用模型和额度。
 
-- 读取和修改本地文件
-- 调用结构化本地命令，运行构建、测试和开发服务
+### 开始使用
 
-不需要 OpenAI API Key，也不要求 ChatGPT Pro。WTAgent 使用独立的 Chrome Profile 保存你的网页登录状态，并使用该账号在网页上实际可用的模型和额度；如果账号拥有 Pro，它会成为额外优势。
-
-支持矩阵：
-
-- macOS
-- Linux
-- Windows 10 1809+ / Windows 11 x64
-- Windows ARM64 目前为预览支持
-
-边界：
-
-- 需要 Chrome 或 Chromium；首版不支持 Edge
-- Git 和 `rg` 是可选项，不是运行前提
-- WSL 不在首版支持范围内；请直接在原生 PowerShell / CMD / Windows Terminal 中运行
-
-### 快速开始
-
-需要 Node.js 20.17+ 和 Chrome/Chromium。
+需要 Node.js 20.17+ 和 Chrome/Chromium；支持 macOS、Linux 和原生 Windows，暂不支持 WSL。
 
 ```bash
-npm install -g wtagent --registry=https://registry.npmjs.org/
-wtagent login
+npm install -g wtagent
 ```
 
-Windows PowerShell：
-
-```powershell
-npm install -g wtagent --registry=https://registry.npmjs.org/
-wtagent doctor
-wtagent login
-```
-
-登录完成后，进入项目目录：
+进入要工作的目录并启动：
 
 ```bash
-cd my-project
+mkdir wtagent-demo
+cd wtagent-demo
 wtagent
 ```
 
-启动后先选择 ChatGPT 模式：`Pro` 会为新对话选择 Pro，`Current` 会保留网页当前设置且不执行模型切换。非交互调用默认使用 `Current`；需要 Pro 时可显式传入 `--mode Pro`。
+启动后选择 `Pro` 或 `Current`，然后直接输入任务。如果尚未登录 ChatGPT，WTAgent 会打开专用 Chrome 并提示你登录；登录成功后任务会自动继续。
 
-也可以直接附带任务：
+例如，启动后直接在终端输入：
 
-```bash
-wtagent "检查这个项目并修复测试"
-wtagent -C ./my-project "创建一个网站"
+```text
+$ wtagent
+you › 创建 qsort.c，实现整数快速排序。使用系统可用的 C 编译器开启警告编译，并运行测试，覆盖普通输入、重复值和空输入。
+you › 再增加一组包含负数的测试
 ```
 
-之后直接在终端中继续对话。WTAgent 会把任务交给 GPT Web，并在本地执行文件操作和结构化本地命令。可以一次粘贴多行内容，粘贴后按 Enter 作为一条消息发送；使用 `↑` / `↓` 浏览本次 CLI 会话的历史输入。
+WTAgent 会在当前目录创建代码、调用本地编译器并运行测试。任务完成后可以继续在同一个终端中对话。
 
-按 `Ctrl+C` 或 `Ctrl+D` 可退出并关闭专用 Chrome。若上一次异常退出留下了 Chrome，WTAgent 会在验证其 CDP 身份后复用并接管它。
+也可以在启动时直接附带任务：
 
-常见说明：
+```bash
+wtagent "创建 qsort.c，编译并测试"
+```
 
-- `wtagent doctor` 会检查 Node、Chrome、目录权限和运行环境
-- 首次登录只会写入 WTAgent 的专用 Chrome Profile，不会接管你的日常浏览器 Profile
-- 如果系统没有 Git 或 `rg`，WTAgent 仍应保留核心文件读写与搜索能力
+支持多行粘贴和 `↑` / `↓` 输入历史。使用 `Ctrl+C` 或 `Ctrl+D` 退出。
 
 ## English
 
-WTAgent connects GPT Web chat to local tools, providing a Codex-like CLI agent experience. The first adapter currently supports ChatGPT Web.
+WTAgent connects GPT Web to your local project and provides a Codex-like CLI experience: GPT reasons in the browser while WTAgent reads and writes files, compiles code, and runs tests on your machine.
 
-GPT Web handles reasoning. WTAgent runs locally to:
+The current adapter supports ChatGPT Web. No OpenAI API key or ChatGPT Pro subscription is required; WTAgent uses your own web account, available models, and quota.
 
-- Read and edit local files
-- Run structured local commands, builds, tests, and development servers
+### Get started
 
-No OpenAI API key or ChatGPT Pro subscription is required. WTAgent stores your web login in a dedicated Chrome profile and uses the models and quota actually available to that account. Pro is an optional bonus when the account has it.
-
-Support matrix:
-
-- macOS
-- Linux
-- Windows 10 1809+ / Windows 11 x64
-- Windows ARM64 is currently preview only
-
-Boundaries:
-
-- Requires Chrome or Chromium; Edge is out of scope for the first Windows release
-- Git and `rg` are optional accelerators, not runtime requirements
-- WSL is not supported in v1; run WTAgent from native PowerShell, CMD, or Windows Terminal
-
-### Quick start
-
-Requires Node.js 20.17+ and Chrome/Chromium.
+Requires Node.js 20.17+ and Chrome/Chromium. macOS, Linux, and native Windows are supported; WSL is not currently supported.
 
 ```bash
-npm install -g wtagent --registry=https://registry.npmjs.org/
-wtagent login
+npm install -g wtagent
 ```
 
-Windows PowerShell:
-
-```powershell
-npm install -g wtagent --registry=https://registry.npmjs.org/
-wtagent doctor
-wtagent login
-```
-
-After signing in, start WTAgent inside a project:
+Open a working directory and start WTAgent:
 
 ```bash
-cd my-project
+mkdir wtagent-demo
+cd wtagent-demo
 wtagent
 ```
 
-At startup, choose a ChatGPT mode: `Pro` selects Pro for the new conversation, while `Current` keeps the current web setting without changing it. Non-interactive runs default to `Current`; pass `--mode Pro` to opt in explicitly.
+Choose `Pro` or `Current`, then type a task. If ChatGPT is not signed in, WTAgent opens its dedicated Chrome profile and asks you to sign in. The task continues automatically after login.
 
-Or provide the first task directly:
+For example, start it and type directly in the terminal:
 
-```bash
-wtagent "inspect this project and fix the tests"
-wtagent -C ./my-project "build a website"
+```text
+$ wtagent
+you › Create qsort.c with an integer quicksort. Compile it with warnings using an available C compiler, then test normal input, duplicate values, and empty input.
+you › Add another test containing negative numbers.
 ```
 
-Continue chatting in the terminal. WTAgent sends tasks to GPT Web and executes file operations and structured local commands. You can paste multiple lines and then press Enter to send them as one message. Use `↑` / `↓` to browse input history from the current CLI session.
+WTAgent creates the code in the current directory, invokes the local compiler, and runs the tests. Keep chatting in the same terminal after the task finishes.
 
-Press `Ctrl+C` or `Ctrl+D` to exit and close the dedicated Chrome. If an abnormal exit leaves Chrome running, WTAgent verifies and adopts that CDP instance on the next start.
+You can also provide the first task directly:
 
-Notes:
+```bash
+wtagent "create qsort.c, compile it, and test it"
+```
 
-- `wtagent doctor` checks Node, Chrome, writable data paths, and runtime support
-- WTAgent always uses its own Chrome profile and does not reuse your daily browsing profile
-- Core file and search capabilities must continue to work even when Git or `rg` is missing
+Multiline paste and `↑` / `↓` input history are supported. Press `Ctrl+C` or `Ctrl+D` to exit.
 
 ## License
 

@@ -56,3 +56,22 @@ test("keeps non-lifecycle events visible on later turns", () => {
     /Mode: could not select Pro; continuing on current mode\./,
   );
 });
+
+test("renders bounded empty-response recovery and preserved-session guidance", () => {
+  const stream = captureStream();
+  const renderer = new Renderer({ stream });
+
+  renderer.handle({
+    type: "model.empty_response",
+    payload: { retry: 2, maxRetries: 3 },
+  });
+  renderer.handle({
+    type: "run.recovery_required",
+    payload: {
+      message: "ChatGPT returned empty responses after 3 continuation attempts.",
+    },
+  });
+
+  assert.match(stream.output(), /asking it to continue \(2\/3\)/);
+  assert.match(stream.output(), /session and Chrome window remain open/i);
+});

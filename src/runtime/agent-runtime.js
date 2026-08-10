@@ -20,9 +20,15 @@ import {
 import { DEFAULT_LIMITS } from "../shared/limits.js";
 import { utf8ByteLength } from "../shared/text-budget.js";
 import {
+  BrowserAdapterError,
   ProtocolError,
   ToolValidationError,
 } from "../shared/errors.js";
+
+const EMPTY_ASSISTANT_CONTINUE_MESSAGE =
+  "The previous assistant response was empty. Continue the immediately preceding task "
+  + "from the existing conversation context. Do not repeat any local tool operation "
+  + "whose result is already present. Reply using the required <agent_response> XML protocol.";
 
 function canonicalize(value) {
   if (Array.isArray(value)) {
@@ -178,6 +184,7 @@ export class AgentRuntime {
     resume = false,
     instruction = null,
     files = [],
+    inPlaceRecovery = false,
   } = {}) {
     const {
       task,
@@ -282,7 +289,7 @@ export class AgentRuntime {
       path: file.path ?? null,
     }));
     const messageOptions = attachments.length > 0 ? { attachments } : {};
-    if (resume && pendingToolResult) {
+    if (resume && pendingToolResult && !inPlaceRecovery) {
       let suffix = "";
       if (instruction?.trim()) {
         suffix = `\n<resume_instruction>${cdata(instruction)}</resume_instruction>`;
@@ -298,6 +305,12 @@ export class AgentRuntime {
       initialMessage = instruction.trim();
       initialTranscript = [userMessage(instruction.trim(), messageOptions)];
       initialKind = "follow_up";
+    } else if (resume && inPlaceRecovery) {
+      // The original request/tool result is already visible in this live web
+      // conversation. Ask ChatGPT to continue without duplicating transport
+      // payloads, attachments, or canonical transcript entries.
+      initialMessage = EMPTY_ASSISTANT_CONTINUE_MESSAGE;
+      initialKind = "empty_response_recovery";
     } else if (resume) {
       const prompt = buildResumePrompt({
         instruction,
@@ -342,18 +355,71 @@ export class AgentRuntime {
     for (let step = 1; ; step += 1) {
       const turnNumber = baseTurn + step;
       await this.session.update({ turn: turnNumber, phase: "waiting_model" });
-      const raw = await this.adapter.waitForTurnComplete({
-        timeoutMs: this.limits.modelTurnTimeoutMs,
-        stableWindowMs: this.limits.modelStableWindowMs,
-        onDelta: async (delta) => {
-          await this.onEvent?.({
-            type: "model.streaming",
-            sessionId: this.session.sessionId,
-            timestamp: new Date().toISOString(),
-            payload: { delta },
+      let raw;
+      let emptyAssistantRetries = 0;
+      for (;;) {
+        try {
+          raw = await this.adapter.waitForTurnComplete({
+            timeoutMs: this.limits.modelTurnTimeoutMs,
+            stableWindowMs: this.limits.modelStableWindowMs,
+            emptyResponseWindowMs: this.limits.emptyAssistantWindowMs,
+            onDelta: async (delta) => {
+              await this.onEvent?.({
+                type: "model.streaming",
+                sessionId: this.session.sessionId,
+                timestamp: new Date().toISOString(),
+                payload: { delta },
+              });
+            },
           });
-        },
-      });
+          break;
+        } catch (error) {
+          if (error?.code !== "EMPTY_ASSISTANT_RESPONSE") {
+            throw error;
+          }
+
+          const emptyAssistantMessageId = await this.adapter
+            .getLastAssistantMessageId?.() ?? null;
+          await this.session.update({
+            conversationUrl: await this.adapter.getConversationUrl(),
+            lastAssistantMessageId: emptyAssistantMessageId
+              ?? this.session.state.lastAssistantMessageId,
+          });
+
+          if (
+            emptyAssistantRetries
+            >= this.limits.maxEmptyAssistantRetries
+          ) {
+            await this.emit("model.empty_response_exhausted", {
+              retries: emptyAssistantRetries,
+              assistantMessageId: emptyAssistantMessageId,
+            });
+            throw new BrowserAdapterError(
+              `ChatGPT returned empty responses after ${emptyAssistantRetries} continuation attempts.`,
+              {
+                code: "EMPTY_ASSISTANT_RETRIES_EXHAUSTED",
+                cause: error,
+                details: { retries: emptyAssistantRetries },
+              },
+            );
+          }
+
+          emptyAssistantRetries += 1;
+          await this.emit("model.empty_response", {
+            retry: emptyAssistantRetries,
+            maxRetries: this.limits.maxEmptyAssistantRetries,
+            assistantMessageId: emptyAssistantMessageId,
+          });
+          // Do not resend the original request or tool result: both are already
+          // present in ChatGPT's conversation. This transport-only continuation
+          // also cannot re-execute a local tool by itself.
+          await this.sendMessage(EMPTY_ASSISTANT_CONTINUE_MESSAGE);
+          await this.emit("model.message_sent", {
+            kind: "empty_response_recovery",
+            retry: emptyAssistantRetries,
+          });
+        }
+      }
       const assistantMessageId = await this.adapter
         .getLastAssistantMessageId?.() ?? null;
       if (awaitingPendingAcknowledgement) {

@@ -529,6 +529,7 @@ export class ChatGPTWebAdapter {
     timeoutMs,
     stableWindowMs,
     staleStopWindowMs = 15_000,
+    emptyResponseWindowMs = 10_000,
     onDelta,
   }) {
     this.#requirePage();
@@ -536,6 +537,8 @@ export class ChatGPTWebAdapter {
     let lastText = "";
     let stableSince = 0;
     let sawAssistant = false;
+    let emptySince = 0;
+    let emptyCandidate = null;
 
     while (Date.now() < deadline) {
       await this.#throwIfBlockedPage();
@@ -587,6 +590,39 @@ export class ChatGPTWebAdapter {
         }
 
         const stopVisible = await this.#isStopButtonVisible();
+        if (!text.trim() && !stopVisible) {
+          // ChatGPT can create a real assistant turn and finish it without
+          // rendering any content. Once that exact empty node remains stopped
+          // for a short grace period, fail early instead of waiting for the
+          // full model timeout. A different node restarts the grace period.
+          const candidateIdentity = candidateId
+            ?? (candidateTurn == null ? null : `turn:${candidateTurn}`);
+          if (candidateIdentity !== emptyCandidate) {
+            emptyCandidate = candidateIdentity;
+            emptySince = Date.now();
+          }
+          if (
+            emptySince > 0
+            && Date.now() - emptySince >= emptyResponseWindowMs
+          ) {
+            this.lastAssistantMessageId = candidateId;
+            throw new BrowserAdapterError(
+              "ChatGPT completed an assistant turn without any content.",
+              {
+                code: "EMPTY_ASSISTANT_RESPONSE",
+                details: {
+                  assistantMessageId: candidateId,
+                  assistantTurn: candidateTurn,
+                },
+              },
+            );
+          }
+        } else {
+          // Generation is still active, or text has begun rendering. Only an
+          // empty and stopped reply should consume the empty-response window.
+          emptyCandidate = null;
+          emptySince = 0;
+        }
         // If the reply looks like protocol XML, never accept it until BOTH the
         // opening and closing tags are present. During streaming the text can
         // briefly go quiet (or the stop button flip off) after "<agent_response"

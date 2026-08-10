@@ -1,7 +1,9 @@
 export const DEFAULT_LIMITS = Object.freeze({
   maxProtocolErrors: 3,
+  maxEmptyAssistantRetries: 3,
   modelTurnTimeoutMs: 10 * 60_000,
   modelStableWindowMs: 1_500,
+  emptyAssistantWindowMs: 10_000,
   loginTimeoutMs: 15 * 60_000,
   toolTimeoutMs: 2 * 60_000,
   maxToolOutputBytes: 4 * 1024,

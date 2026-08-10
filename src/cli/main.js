@@ -229,10 +229,20 @@ class ConversationRunner {
   // Runs one turn. The first turn (resume=false) boots the session; later turns
   // resume the same conversation with a new user instruction. `files` are
   // resolved @file attachments for this turn's message.
-  async runTurn({ resume, instruction, files = [] }) {
+  async runTurn({
+    resume,
+    instruction,
+    files = [],
+    inPlaceRecovery = false,
+  }) {
     const runtime = this.#buildRuntime();
     try {
-      const result = await runtime.run({ resume, instruction, files });
+      const result = await runtime.run({
+        resume,
+        instruction,
+        files,
+        inPlaceRecovery,
+      });
       return result;
     } catch (error) {
       if (this.interrupted) {
@@ -244,6 +254,18 @@ class ConversationRunner {
           message: "Interrupted by user.",
         });
         return null;
+      }
+      if (error?.code === "EMPTY_ASSISTANT_RETRIES_EXHAUSTED") {
+        await this.session.update({
+          phase: "awaiting_user",
+          lastError: error.message,
+        });
+        const event = await this.session.appendEvent("run.recovery_required", {
+          message: error.message,
+          retries: error.details?.retries ?? null,
+        });
+        this.renderer.handle(event);
+        return { recoveryRequired: true, error };
       }
       if (this.session.state.phase !== "idle") {
         await this.session.update({
@@ -307,19 +329,46 @@ async function executeSession({
     let turnResume = resume;
     let turnInstruction = instruction;
     let turnFiles = files;
+    let turnInPlaceRecovery = false;
 
     for (;;) {
       const result = await runner.runTurn({
         resume: turnResume,
         instruction: turnInstruction,
         files: turnFiles,
+        inPlaceRecovery: turnInPlaceRecovery,
       });
       if (runner.interrupted) {
         break;
       }
+      if (result?.recoveryRequired) {
+        if (!interactive) {
+          throw result.error;
+        }
+        runner.renderer.hint(
+          "Type /retry to ask ChatGPT to continue again, enter a new instruction, or quit.",
+        );
+        const next = await promptForNextMessage(runner, activeChatInput);
+        if (next == null) {
+          break;
+        }
+        const retryOnly = next.text.trim().toLowerCase() === "/retry";
+        if (!retryOnly) {
+          await session.appendInstruction(next.text, { files: next.files });
+        }
+        turnResume = true;
+        turnInstruction = retryOnly ? null : next.text;
+        turnFiles = retryOnly ? [] : next.files;
+        // This Chrome tab still contains the original message/tool result, so
+        // the next run must not resend a persisted pending result.
+        turnInPlaceRecovery = true;
+        continue;
+      }
       if (!interactive) {
         return result;
       }
+
+      turnInPlaceRecovery = false;
 
       // Managed dev servers keep running between turns; surface them once.
       const running = runner.processManager.list({ includeOutput: false }).filter(

@@ -11,6 +11,7 @@ import { ToolRegistry } from "../src/tools/registry.js";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
 import { TaskSession } from "../src/session/task-session.js";
 import { DEFAULT_LIMITS } from "../src/shared/limits.js";
+import { BrowserAdapterError } from "../src/shared/errors.js";
 
 function assertOneTrailingReminder(message) {
   assert.equal(
@@ -106,6 +107,161 @@ test("runs a full model-tool-model loop", async (t) => {
   assert.match(functionItems[0].call_id, /^call_[a-f0-9]{16}$/);
   assert.notEqual(functionItems[0].call_id, "call_1");
   assert.equal(functionItems[1].call_id, functionItems[0].call_id);
+});
+
+function emptyAssistantResponse() {
+  return new BrowserAdapterError(
+    "ChatGPT completed an assistant turn without any content.",
+    { code: "EMPTY_ASSISTANT_RESPONSE" },
+  );
+}
+
+test("asks ChatGPT to continue after empty replies without resending the task", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    emptyAssistantResponse(),
+    emptyAssistantResponse(),
+    emptyAssistantResponse(),
+    "<agent_response><done>true</done><message>Recovered.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "UNIQUE_ORIGINAL_TASK",
+    projectRoot,
+    mode: null,
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Recovered.");
+  assert.equal(adapter.sentMessages.length, 4);
+  assert.match(adapter.sentMessages[0], /UNIQUE_ORIGINAL_TASK/);
+  for (const continuation of adapter.sentMessages.slice(1)) {
+    assert.match(continuation, /previous assistant response was empty/i);
+    assert.match(continuation, /Do not repeat any local tool operation/i);
+    assert.doesNotMatch(continuation, /UNIQUE_ORIGINAL_TASK/);
+    assert.doesNotMatch(continuation, /<tool_result/);
+    assertOneTrailingReminder(continuation);
+  }
+  assert.deepEqual(
+    events
+      .filter((event) => event.type === "model.empty_response")
+      .map((event) => event.payload.retry),
+    [1, 2, 3],
+  );
+});
+
+test("stops after three empty-response continuations and preserves a pending tool result", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    `<agent_response>
+      <done>false</done>
+      <tool_call name="fs.write">
+        <args><path>once.txt</path><content>once</content></args>
+      </tool_call>
+    </agent_response>`,
+    emptyAssistantResponse(),
+    emptyAssistantResponse(),
+    emptyAssistantResponse(),
+    emptyAssistantResponse(),
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Write once and finish",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await assert.rejects(
+    runtime.run(),
+    (error) => {
+      assert.equal(error.code, "EMPTY_ASSISTANT_RETRIES_EXHAUSTED");
+      assert.equal(error.details.retries, 3);
+      return true;
+    },
+  );
+
+  assert.equal(await fs.readFile(path.join(projectRoot, "once.txt"), "utf8"), "once");
+  assert.match(adapter.sentMessages[1], /<tool_result name="fs\.write"/);
+  for (const continuation of adapter.sentMessages.slice(2)) {
+    assert.doesNotMatch(continuation, /<tool_result name=/);
+  }
+  assert.equal(
+    adapter.sentMessages.filter((message) => /previous assistant response was empty/i.test(message)).length,
+    3,
+  );
+  assert.equal(session.state.pendingToolResult?.name, "fs.write");
+});
+
+test("in-place recovery continues without resending a persisted pending result", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Recover in the same browser tab",
+    projectRoot,
+    mode: null,
+  });
+  await session.update({
+    conversationUrl: "https://chatgpt.com/c/recover-in-place",
+    pendingToolResult: {
+      callId: "call_pending",
+      name: "fs.write",
+      ok: true,
+      message: "Already delivered in the web conversation.",
+    },
+  });
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Continued.</message></agent_response>",
+  ]);
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run({
+    resume: true,
+    inPlaceRecovery: true,
+  });
+
+  assert.equal(result.message, "Continued.");
+  assert.equal(adapter.sentMessages.length, 1);
+  assert.match(adapter.sentMessages[0], /previous assistant response was empty/i);
+  assert.doesNotMatch(adapter.sentMessages[0], /<tool_result/);
+  assert.equal(session.state.pendingToolResult, null);
 });
 
 test("continues beyond the former 36-step run limit", async (t) => {

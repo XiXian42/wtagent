@@ -10,6 +10,11 @@ test("model turn timeout defaults to ten minutes", () => {
   assert.equal(resolveLimits().modelTurnTimeoutMs, 10 * 60_000);
 });
 
+test("empty assistant responses use a ten-second window and three retries", () => {
+  assert.equal(DEFAULT_LIMITS.emptyAssistantWindowMs, 10_000);
+  assert.equal(DEFAULT_LIMITS.maxEmptyAssistantRetries, 3);
+});
+
 test("tool transport limits use the bounded browser-safe defaults", () => {
   assert.equal(DEFAULT_LIMITS.maxFileReadBytes, 16 * 1024);
   assert.equal(DEFAULT_LIMITS.maxToolOutputBytes, 4 * 1024);

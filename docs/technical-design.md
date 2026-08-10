@@ -652,6 +652,7 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 - Chrome 崩溃：用相同 Profile 重启并打开会话 URL。
 - 同一 CLI 进程中的 follow-up 保持在当前会话 Page，不重复导航；跨进程恢复需要等待本地记录的最近 assistant message ID 出现在 DOM 后才能发送。
 - 每次发送记录已有消息 ID 和新 user turn，只接受位于该 user turn 之后的新 assistant turn；无法建立可靠消息身份时超时并保存诊断，禁止退化为基于数量或文本变化猜测。
+- 新 assistant 节点在停止生成后持续 10 秒仍为空时，Runtime 只发送“继续上一轮”的短提示，不重发原任务、附件或工具结果；自动恢复最多 3 次。仍为空时保留 Chrome、Session 和待确认工具结果并回到 CLI，允许用户输入 `/retry` 或新的指令。
 - 同一 Profile 同时只允许一个 WTAgent CLI Session；启动和接管过程使用 Profile 级互斥锁。
 - 登录失效或出现验证：进入 `AUTH_REQUIRED`/`PAUSED`，让用户接管。
 - 会话页面丢失：从本地记录打开原会话；无法恢复时创建新的本地 Session 和新的网页对话，不向旧 rollout 继续追加。

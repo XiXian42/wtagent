@@ -300,6 +300,12 @@ export class Renderer {
       case "model.message_complete":
         this.stopSpinner();
         break;
+      case "model.empty_response":
+        this.stopSpinner();
+        this.note(
+          `empty ChatGPT response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
+        );
+        break;
       case "model.progress":
         this.stopSpinner();
         if (payload.message) {
@@ -362,6 +368,12 @@ export class Renderer {
       case "run.interrupted":
         this.stopSpinner();
         this.println(`${YELLOW}Run interrupted: ${truncate(payload.message, 160)}${RESET}`);
+        break;
+      case "run.recovery_required":
+        this.stopSpinner();
+        this.println(
+          `${YELLOW}${truncate(payload.message, 180)} The session and Chrome window remain open.${RESET}`,
+        );
         break;
       case "tool.result_sent":
         // A tool result was just sent to the model; we are waiting on the next

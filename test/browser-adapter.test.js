@@ -603,3 +603,49 @@ test("fails closed when the DOM exposes no post-send message identity", async ()
     /turn did not complete/,
   );
 });
+
+test("detects a new stopped assistant turn whose body stays empty", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistant: new AssistantMessage("", {
+      id: "assistant-empty",
+      turn: 4,
+    }),
+  });
+  adapter.sentUserTurn = 3;
+
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 100,
+      stableWindowMs: 0,
+      emptyResponseWindowMs: 0,
+    }),
+    (error) => {
+      assert.equal(error.code, "EMPTY_ASSISTANT_RESPONSE");
+      assert.equal(error.details.assistantMessageId, "assistant-empty");
+      return true;
+    },
+  );
+  assert.equal(await adapter.getLastAssistantMessageId(), "assistant-empty");
+});
+
+test("does not classify an empty assistant node as finished while Stop is visible", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistant: new AssistantMessage("", {
+      id: "assistant-generating",
+      turn: 4,
+    }),
+    visibleSelectors: ['[data-testid="stop-button"]'],
+  });
+  adapter.sentUserTurn = 3;
+
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 5,
+      stableWindowMs: 0,
+      emptyResponseWindowMs: 0,
+    }),
+    (error) => error.code === "TURN_TIMEOUT",
+  );
+});

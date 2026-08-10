@@ -78,6 +78,9 @@ export class FakeWebModelAdapter {
     const response = this.responses.shift();
     this.responseNumber += 1;
     this.lastAssistantMessageId = `assistant-${this.responseNumber}`;
+    if (response instanceof Error) {
+      throw response;
+    }
     await onDelta?.(response);
     return response;
   }
