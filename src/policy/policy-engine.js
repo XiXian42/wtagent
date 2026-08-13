@@ -247,7 +247,23 @@ function commandReasons(name, args) {
 }
 
 export class PolicyEngine {
+  constructor({ store = null } = {}) {
+    this.store = store;
+  }
+
   async evaluate(toolCall, context) {
+    await this.store?.ensureLoaded();
+    if (this.store?.isAlwaysAllowed(toolCall.name)) {
+      // The user explicitly opted to skip confirmation for this tool (or for
+      // everything). Outside-project paths are granted too — that is the point
+      // of always allowing a tool.
+      return {
+        action: "allow",
+        reasons: [],
+        grants: { allowOutside: true },
+      };
+    }
+
     const reasons = commandReasons(toolCall.name, toolCall.args);
     let allowOutside = false;
 

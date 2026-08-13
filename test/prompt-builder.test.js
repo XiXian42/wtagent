@@ -85,6 +85,10 @@ test("bootstrap prompt marks scaffolding and puts the user task outside it", () 
   assert.match(web, /<agent_protocol>[\s\S]*<\/agent_protocol>/);
   assert.match(developer, /## Available tools/);
   assert.equal(user, "Implement the feature.");
+  // The prompt tells the model the project may contain unrelated content and
+  // to exclude it while searching.
+  assert.match(developer, /may contain content unrelated to the current task/);
+  assert.match(developer, /fs\.search supports an exclude argument/);
   // The user task lives outside the marker so exporters keep it.
   const afterMarker = web.slice(web.indexOf("</agent_protocol>"));
   assert.match(afterMarker, /Implement the feature\./);

@@ -15,8 +15,9 @@ export class FakeWebModelAdapter {
     this.windowStateCalls = [];
   }
 
-  async launch() {
+  async launch(preferredUrl = null) {
     this.launched = true;
+    this.lastLaunchUrl = preferredUrl;
   }
 
   async close() {

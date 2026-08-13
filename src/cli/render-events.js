@@ -303,7 +303,17 @@ export class Renderer {
       case "model.empty_response":
         this.stopSpinner();
         this.note(
-          `empty ChatGPT response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
+          payload.deadRequest
+            ? `no reply from ChatGPT; asking it to continue (${payload.retry}/${payload.maxRetries})`
+            : `empty ChatGPT response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
+        );
+        break;
+      case "model.limit_reached":
+        this.stopSpinner();
+        this.note(
+          "ChatGPT usage limit reached. Try a different thinking level on resume "
+            + "(wtagent resume <session-id> --mode Pro or --mode Current), wait "
+            + "for the limit to reset, or change plans.",
         );
         break;
       case "model.progress":

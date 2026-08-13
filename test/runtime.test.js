@@ -1433,3 +1433,393 @@ test("marks a non-cooperative side-effect timeout as recoverable and unknown", a
     "late",
   );
 });
+
+function deadAssistantRequest() {
+  return new BrowserAdapterError(
+    "ChatGPT never started generating a reply.",
+    { code: "DEAD_ASSISTANT_REQUEST" },
+  );
+}
+
+test("asks ChatGPT to continue after a silently dead request", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    deadAssistantRequest(),
+    deadAssistantRequest(),
+    deadAssistantRequest(),
+    "<agent_response><done>true</done><message>Recovered.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "UNIQUE_ORIGINAL_TASK",
+    projectRoot,
+    mode: null,
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Recovered.");
+  assert.equal(adapter.sentMessages.length, 4);
+  assert.match(adapter.sentMessages[0], /UNIQUE_ORIGINAL_TASK/);
+  for (const continuation of adapter.sentMessages.slice(1)) {
+    assert.match(continuation, /previous request received no reply/i);
+    assert.match(continuation, /Do not repeat any local tool operation/i);
+    assert.doesNotMatch(continuation, /UNIQUE_ORIGINAL_TASK/);
+    assert.doesNotMatch(continuation, /<tool_result/);
+    assertOneTrailingReminder(continuation);
+  }
+  const emptyEvents = events.filter(
+    (event) => event.type === "model.empty_response",
+  );
+  assert.deepEqual(
+    emptyEvents.map((event) => event.payload.retry),
+    [1, 2, 3],
+  );
+  assert.ok(emptyEvents.every((event) => event.payload.deadRequest === true));
+});
+
+class ConnectionDroppingAdapter extends FakeWebModelAdapter {
+  constructor(responses, { dropFirstSends = 1 } = {}) {
+    super(responses);
+    this.dropFirstSends = dropFirstSends;
+    this.sendCalls = 0;
+    this.reconnectCalls = 0;
+    this.restoreCalls = [];
+  }
+
+  async sendMessage(text, options = {}) {
+    this.sendCalls += 1;
+    if (this.sendCalls <= this.dropFirstSends) {
+      throw new Error("Target page, context or browser has been closed");
+    }
+    return await super.sendMessage(text, options);
+  }
+
+  async reconnect() {
+    this.reconnectCalls += 1;
+  }
+
+  async startConversation(url, options = {}) {
+    this.restoreCalls.push(url);
+    return await super.startConversation(url, options);
+  }
+}
+
+test("reconnects and resends when the browser connection dies during send", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new ConnectionDroppingAdapter([
+    "<agent_response><done>true</done><message>Done after reconnect.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Recover from a dead connection",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Done after reconnect.");
+  assert.equal(adapter.sendCalls, 2);
+  assert.equal(adapter.reconnectCalls, 1);
+  assert.ok(
+    adapter.restoreCalls.some((url) => url?.includes("chatgpt.com")),
+    "the conversation was restored after reconnecting",
+  );
+});
+
+test("reconnects and resumes waiting when the connection dies mid-turn", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  let waitCalls = 0;
+  let reconnectCalls = 0;
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Recovered after reconnect.</message></agent_response>",
+  ]);
+  const originalWait = adapter.waitForTurnComplete.bind(adapter);
+  adapter.waitForTurnComplete = async (options) => {
+    waitCalls += 1;
+    if (waitCalls === 1) {
+      throw new Error("Connection closed");
+    }
+    return await originalWait(options);
+  };
+  adapter.reconnect = async () => {
+    reconnectCalls += 1;
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Resume waiting after a dead connection",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Recovered after reconnect.");
+  assert.equal(waitCalls, 2);
+  assert.equal(reconnectCalls, 1);
+});
+
+test("gives up after one reconnect attempt instead of looping forever", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  let reconnectCalls = 0;
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Never reached.</message></agent_response>",
+  ]);
+  adapter.waitForTurnComplete = async () => {
+    throw new Error("Connection closed");
+  };
+  adapter.reconnect = async () => {
+    reconnectCalls += 1;
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Dead connection loop",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await assert.rejects(runtime.run(), /Connection closed/);
+  assert.equal(reconnectCalls, 1);
+});
+
+test("stops immediately when ChatGPT reports a usage limit instead of retrying the format", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "你已达到限额。请稍后重试。",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Usage limit task",
+    projectRoot,
+    mode: null,
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  await assert.rejects(
+    runtime.run(),
+    (error) => {
+      assert.equal(error.code, "USAGE_LIMIT_REACHED");
+      return true;
+    },
+  );
+  // Only the bootstrap message was sent: no format-retry nudge.
+  assert.equal(adapter.sentMessages.length, 1);
+  assert.ok(events.some((event) => event.type === "model.limit_reached"));
+});
+
+test("emits the limit event when the adapter detects a usage-limit card", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.waitForTurnComplete = async () => {
+    throw new BrowserAdapterError(
+      "ChatGPT reported a usage limit (你已达到限额。请稍后重试。).",
+      { code: "USAGE_LIMIT_REACHED" },
+    );
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Adapter-detected limit",
+    projectRoot,
+    mode: null,
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  await assert.rejects(
+    runtime.run(),
+    (error) => {
+      assert.equal(error.code, "USAGE_LIMIT_REACHED");
+      return true;
+    },
+  );
+  assert.ok(events.some((event) => event.type === "model.limit_reached"));
+});
+
+test("resume applies an explicit mode and keeps the current mode otherwise", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>First.</message></agent_response>",
+    "<agent_response><done>true</done><message>Second.</message></agent_response>",
+    "<agent_response><done>true</done><message>Third.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Mode selection",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  // Fresh run with no session mode: no selection.
+  await runtime.run();
+  assert.equal(adapter.mode, null);
+
+  // Resume with an explicit mode override selects it.
+  await runtime.run({ resume: true, mode: "Pro" });
+  assert.equal(adapter.mode, "Pro");
+
+  // A plain resume does not re-select anything.
+  await runtime.run({ resume: true });
+  assert.equal(adapter.mode, "Pro");
+});
+
+test("retries a send that ChatGPT never rendered", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Done after resend.</message></agent_response>",
+  ]);
+  let sendCalls = 0;
+  const originalSend = adapter.sendMessage.bind(adapter);
+  adapter.sendMessage = async (text, options = {}) => {
+    sendCalls += 1;
+    if (sendCalls === 1) {
+      throw new BrowserAdapterError(
+        "ChatGPT did not render the sent message; the send may have failed.",
+        { code: "SEND_NOT_DETECTED" },
+      );
+    }
+    return await originalSend(text, options);
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Resend after a silent send failure",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Done after resend.");
+  assert.equal(sendCalls, 2);
+});
+
+test("resume launches with the conversation URL so an existing tab can be reused", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>First run.</message></agent_response>",
+    "<agent_response><done>true</done><message>Resumed.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Tab reuse",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  await runtime.run();
+  assert.equal(adapter.lastLaunchUrl, null);
+
+  await runtime.run({ resume: true, instruction: "Continue" });
+  assert.equal(adapter.lastLaunchUrl, "https://chatgpt.com/c/fake");
+});

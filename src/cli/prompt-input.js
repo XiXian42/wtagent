@@ -11,6 +11,14 @@ const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 // separator that can live in readline's editable buffer and history; decode it
 // back to LF before the value leaves this module.
 const PASTED_LINE_SEPARATOR = "\u2028";
+// Shift+Enter from terminals with kitty keyboard protocol support arrives as
+// the CSI-u sequence for "Enter with shift". Map it to the same non-submitting
+// line separator used for pasted newlines so it inserts a newline instead of
+// submitting. Terminals without the protocol keep sending plain CR for
+// Shift+Enter, which readline treats as submit — an unavoidable terminal limit.
+const SHIFT_ENTER_SEQUENCE = "\u001b[13;2u";
+const ENABLE_KITTY_KEYBOARD = "\u001b[>1u";
+const DISABLE_KITTY_KEYBOARD = "\u001b[<1u";
 
 const CLEAN_EXIT_ERRORS = new Set([
   "AbortPromptError",
@@ -105,9 +113,15 @@ class PasteAwareInput extends Transform {
         continue;
       }
 
-      const retained = flush
+      // A Shift+Enter sequence can also arrive split across chunks; keep any
+      // partial prefix pending so it is not pushed through as literal text.
+      const markerRetained = flush
         ? 0
         : longestMarkerPrefixAtEnd(this.pending, marker);
+      const shiftEnterRetained = flush
+        ? 0
+        : longestMarkerPrefixAtEnd(this.pending, SHIFT_ENTER_SEQUENCE);
+      const retained = Math.max(markerRetained, shiftEnterRetained);
       const ready = this.pending.slice(0, this.pending.length - retained);
       output += this.inBracketedPaste
         ? encodePastedLines(ready)
@@ -122,9 +136,16 @@ class PasteAwareInput extends Transform {
   }
 
   #outsidePaste(text) {
-    return looksLikeUnbracketedMultilinePaste(text)
-      ? encodePastedLines(text)
-      : text;
+    // Shift+Enter (CSI-u "Enter with shift") is a newline, not a submit. Map
+    // it to the same non-submitting line separator readline keeps in its
+    // editable buffer, then decode it back to LF with the rest on output.
+    const withNewlines = text.replaceAll(
+      SHIFT_ENTER_SEQUENCE,
+      PASTED_LINE_SEPARATOR,
+    );
+    return looksLikeUnbracketedMultilinePaste(withNewlines)
+      ? encodePastedLines(withNewlines)
+      : withNewlines;
   }
 }
 
@@ -187,6 +208,10 @@ export class ShellChatInput {
     const pasteInput = new PasteAwareInput(this.inputStream);
     this.inputStream.pipe(pasteInput);
     this.outputStream.write(ENABLE_BRACKETED_PASTE);
+    // Ask the terminal to disambiguate modified Enter via kitty keyboard
+    // protocol (level 1). Terminals that ignore it keep sending plain CR for
+    // Shift+Enter, which is submitted like Enter.
+    this.outputStream.write(ENABLE_KITTY_KEYBOARD);
 
     const readline = createInterface({
       input: pasteInput,
@@ -225,6 +250,7 @@ export class ShellChatInput {
       readline.removeListener("SIGINT", onInterrupt);
       readline.close();
       this.outputStream.write(DISABLE_BRACKETED_PASTE);
+      this.outputStream.write(DISABLE_KITTY_KEYBOARD);
       this.inputStream.unpipe(pasteInput);
       pasteInput.destroy();
     }

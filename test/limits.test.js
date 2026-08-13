@@ -5,9 +5,9 @@ import {
   resolveLimits,
 } from "../src/shared/limits.js";
 
-test("model turn timeout defaults to ten minutes", () => {
-  assert.equal(DEFAULT_LIMITS.modelTurnTimeoutMs, 10 * 60_000);
-  assert.equal(resolveLimits().modelTurnTimeoutMs, 10 * 60_000);
+test("model turn timeout defaults to twenty minutes", () => {
+  assert.equal(DEFAULT_LIMITS.modelTurnTimeoutMs, 20 * 60_000);
+  assert.equal(resolveLimits().modelTurnTimeoutMs, 20 * 60_000);
 });
 
 test("empty assistant responses use a ten-second window and three retries", () => {

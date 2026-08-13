@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { emitKeypressEvents } from "node:readline";
 import { launchAndConnectCdpChrome } from "./cdp-browser.js";
 import { discoverChromeExecutable } from "../platform/chrome-discovery.js";
 import { ensureDirectory } from "../platform/paths.js";
 import { BrowserAdapterError } from "../shared/errors.js";
+import { isUsageLimitNotice } from "../shared/usage-limit.js";
 import {
   chooseModeOption,
   labelMatchesToken,
@@ -13,6 +15,22 @@ import {
 } from "./mode-selection.js";
 
 const CHATGPT_URL = "https://chatgpt.com/";
+
+// Playwright error messages for a dead transport. The Chrome process itself is
+// usually still alive (e.g. the connection died while the Mac slept); these
+// errors mean "reconnect", not "the browser is gone".
+const CONNECTION_LOST_PATTERNS = [
+  "target page, context or browser has been closed",
+  "browser has been closed",
+  "page has been closed",
+  "connection closed",
+  "connection is closed",
+];
+
+export function isConnectionLostError(error) {
+  const message = String(error?.message ?? "").toLowerCase();
+  return CONNECTION_LOST_PATTERNS.some((pattern) => message.includes(pattern));
+}
 
 async function firstVisible(locators) {
   for (const locator of locators) {
@@ -67,12 +85,17 @@ export class ChatGPTWebAdapter {
     baseUrl = CHATGPT_URL,
     debug = false,
     minimized = false,
+    stdinStream = process.stdin,
+    cancelOnEsc = false,
   }) {
     this.profileDir = path.resolve(profileDir);
     this.chromePath = chromePath;
     this.baseUrl = baseUrl;
     this.debug = debug;
     this.minimized = minimized;
+    this.stdinStream = stdinStream;
+    this.cancelOnEsc = cancelOnEsc;
+    this.escCancelRequested = false;
     this.context = null;
     this.cdpChrome = null;
     this.page = null;
@@ -83,7 +106,9 @@ export class ChatGPTWebAdapter {
     this.lastModeSelection = null;
   }
 
-  async launch() {
+  // `preferredUrl` lets a reused Chrome pick an existing tab that already
+  // shows the conversation (instead of opening a new tab per run).
+  async launch(preferredUrl = null) {
     if (this.context) {
       return;
     }
@@ -94,6 +119,7 @@ export class ChatGPTWebAdapter {
       executablePath,
       profileDir: this.profileDir,
       minimized: this.minimized,
+      preferredUrl,
     });
     this.context = this.cdpChrome.context;
     this.page = this.cdpChrome.page;
@@ -107,6 +133,18 @@ export class ChatGPTWebAdapter {
     this.cdpChrome = null;
     this.context = null;
     this.page = null;
+  }
+
+  // Re-establishes the CDP connection to a still-alive Chrome after the
+  // Playwright transport died mid-run (e.g. the Mac slept). launch() reuses
+  // the saved CDP state, so Chrome is neither relaunched nor killed; an
+  // existing tab on the preferred conversation is reused when available.
+  async reconnect(preferredUrl = null) {
+    await this.cdpChrome?.disconnect?.().catch(() => null);
+    this.cdpChrome = null;
+    this.context = null;
+    this.page = null;
+    await this.launch(preferredUrl);
   }
 
   // Bring the window forward (used before asking the user to log in or solve a
@@ -201,6 +239,7 @@ export class ChatGPTWebAdapter {
     if (conversationUrl) {
       await this.#waitForConversationHistory({
         expectedAssistantMessageId,
+        expectedUrl: target,
       });
       return;
     }
@@ -482,7 +521,18 @@ export class ChatGPTWebAdapter {
       ).catch(() => null);
     }
 
-    await this.#waitForSentUserMessage(userBaseline);
+    const sentMessage = await this.#waitForSentUserMessage(userBaseline);
+    if (!sentMessage) {
+      // ChatGPT never rendered the message: the send did not register (a
+      // disabled send button, a missed Enter, or a transient UI state). Fail
+      // loudly instead of pretending the message went out — otherwise the
+      // runtime waits for a reply that ChatGPT never received.
+      await this.#writeDiagnostics("send-not-detected");
+      throw new BrowserAdapterError(
+        "ChatGPT did not render the sent message; the send may have failed.",
+        { code: "SEND_NOT_DETECTED" },
+      );
+    }
     return { attachment };
   }
 
@@ -530,138 +580,200 @@ export class ChatGPTWebAdapter {
     stableWindowMs,
     staleStopWindowMs = 15_000,
     emptyResponseWindowMs = 10_000,
+    deadRequestGraceMs = 60_000,
     onDelta,
   }) {
     this.#requirePage();
     const deadline = Date.now() + timeoutMs;
+    const startedAt = Date.now();
     let lastText = "";
     let stableSince = 0;
     let sawAssistant = false;
     let emptySince = 0;
     let emptyCandidate = null;
+    let sawGenerationSignal = false;
+    let lastGenerationSignalAt = 0;
+    const detachEscCancel = this.#attachEscCancel();
+    try {
+      while (Date.now() < deadline) {
+        await this.#throwIfBlockedPage();
 
-    while (Date.now() < deadline) {
-      await this.#throwIfBlockedPage();
+        if (this.escCancelRequested) {
+          // ESC = stop generating and hand control back to the user. Clicking
+          // ChatGPT's stop button halts the in-flight reply; any partial text
+          // stays in the conversation and counts as pre-existing for the next
+          // send.
+          await this.#clickStopButton();
+          throw new BrowserAdapterError(
+            "Turn cancelled by user.",
+            { code: "TURN_CANCELLED" },
+          );
+        }
 
-      const messages = this.#assistantMessages();
-      const count = await messages.count();
-      const lastMessage = count > 0 ? messages.last() : null;
-      const candidateText = lastMessage
-        ? await this.#assistantText(lastMessage)
-        : "";
-      const candidateId = lastMessage
-        ? await lastMessage.getAttribute("data-message-id").catch(() => null)
-        : null;
-      const candidateTurn = lastMessage
-        ? await this.#messageTurn(lastMessage)
-        : null;
-      let hasNewAssistant;
-      if (this.sentUserTurn != null && candidateTurn != null) {
-        // Strongest boundary: the answer must be a conversation turn after
-        // the exact user message that sendMessage() observed in the DOM.
-        hasNewAssistant = candidateTurn > this.sentUserTurn;
-      } else if (candidateId) {
-        // Stable ChatGPT message IDs are the next-best boundary. Never accept
-        // an ID that existed before this send, even if its text or DOM position
-        // changed during hydration.
-        hasNewAssistant = !this.assistantIdsBeforeSend.has(candidateId);
-      } else if (
-        candidateTurn != null
-        && this.assistantMaxTurnBeforeSend != null
-      ) {
-        hasNewAssistant = candidateTurn > this.assistantMaxTurnBeforeSend;
-      } else {
-        // Without a stable message ID or turn boundary we cannot prove this
-        // reply belongs to the current send. Timing/count heuristics caused the
-        // stale-answer bug, so fail closed and let the bounded wait time out.
-        hasNewAssistant = false;
-      }
-
-      if (hasNewAssistant) {
-        sawAssistant = true;
-        const text = candidateText;
-        if (text !== lastText) {
-          const delta = deltaFrom(lastText, text);
-          lastText = text;
-          stableSince = Date.now();
-          if (delta) {
-            await onDelta?.(delta);
-          }
+        const messages = this.#assistantMessages();
+        const count = await messages.count();
+        const lastMessage = count > 0 ? messages.last() : null;
+        const candidateText = lastMessage
+          ? await this.#assistantText(lastMessage)
+          : "";
+        const candidateId = lastMessage
+          ? await lastMessage.getAttribute("data-message-id").catch(() => null)
+          : null;
+        const candidateTurn = lastMessage
+          ? await this.#messageTurn(lastMessage)
+          : null;
+        let hasNewAssistant;
+        if (this.sentUserTurn != null && candidateTurn != null) {
+          // Strongest boundary: the answer must be a conversation turn after
+          // the exact user message that sendMessage() observed in the DOM.
+          hasNewAssistant = candidateTurn > this.sentUserTurn;
+        } else if (candidateId) {
+          // Stable ChatGPT message IDs are the next-best boundary. Never accept
+          // an ID that existed before this send, even if its text or DOM position
+          // changed during hydration.
+          hasNewAssistant = !this.assistantIdsBeforeSend.has(candidateId);
+        } else if (
+          candidateTurn != null
+          && this.assistantMaxTurnBeforeSend != null
+        ) {
+          hasNewAssistant = candidateTurn > this.assistantMaxTurnBeforeSend;
+        } else {
+          // Without a stable message ID or turn boundary we cannot prove this
+          // reply belongs to the current send. Timing/count heuristics caused the
+          // stale-answer bug, so fail closed and let the bounded wait time out.
+          hasNewAssistant = false;
         }
 
         const stopVisible = await this.#isStopButtonVisible();
-        if (!text.trim() && !stopVisible) {
-          // ChatGPT can create a real assistant turn and finish it without
-          // rendering any content. Once that exact empty node remains stopped
-          // for a short grace period, fail early instead of waiting for the
-          // full model timeout. A different node restarts the grace period.
-          const candidateIdentity = candidateId
-            ?? (candidateTurn == null ? null : `turn:${candidateTurn}`);
-          if (candidateIdentity !== emptyCandidate) {
-            emptyCandidate = candidateIdentity;
-            emptySince = Date.now();
+        if (hasNewAssistant || stopVisible) {
+          // A reply node or a visible stop button proves ChatGPT started
+          // generating; only a request with neither signal can be dead.
+          sawGenerationSignal = true;
+          lastGenerationSignalAt = Date.now();
+        }
+
+        if (hasNewAssistant) {
+          sawAssistant = true;
+          const text = candidateText;
+          if (text !== lastText) {
+            const delta = deltaFrom(lastText, text);
+            lastText = text;
+            stableSince = Date.now();
+            if (delta) {
+              await onDelta?.(delta);
+            }
           }
+
+          if (!text.trim() && !stopVisible) {
+            // ChatGPT can create a real assistant turn and finish it without
+            // rendering any content. Once that exact empty node remains stopped
+            // for a short grace period, fail early instead of waiting for the
+            // full model timeout. A different node restarts the grace period.
+            const candidateIdentity = candidateId
+              ?? (candidateTurn == null ? null : `turn:${candidateTurn}`);
+            if (candidateIdentity !== emptyCandidate) {
+              emptyCandidate = candidateIdentity;
+              emptySince = Date.now();
+            }
+            if (
+              emptySince > 0
+              && Date.now() - emptySince >= emptyResponseWindowMs
+            ) {
+              this.lastAssistantMessageId = candidateId;
+              throw new BrowserAdapterError(
+                "ChatGPT completed an assistant turn without any content.",
+                {
+                  code: "EMPTY_ASSISTANT_RESPONSE",
+                  details: {
+                    assistantMessageId: candidateId,
+                    assistantTurn: candidateTurn,
+                  },
+                },
+              );
+            }
+          } else {
+            // Generation is still active, or text has begun rendering. Only an
+            // empty and stopped reply should consume the empty-response window.
+            emptyCandidate = null;
+            emptySince = 0;
+          }
+          // If the reply looks like protocol XML, never accept it until BOTH the
+          // opening and closing tags are present. During streaming the text can
+          // briefly go quiet (or the stop button flip off) after "<agent_response"
+          // is painted but before "</agent_response>" arrives; accepting there
+          // hands the parser a truncated envelope. Non-protocol chatter (no
+          // "<agent_response") is unaffected and still completes on the stable
+          // window below.
+          const looksLikeProtocol = lastText.includes("<agent_response");
+          const envelopeReady = !looksLikeProtocol
+            || hasCompleteAgentEnvelope(lastText);
           if (
-            emptySince > 0
-            && Date.now() - emptySince >= emptyResponseWindowMs
+            lastText.trim()
+            && stableSince > 0
+            && envelopeReady
+            && (
+              (
+                !stopVisible
+                && Date.now() - stableSince >= stableWindowMs
+              )
+              || (
+                stopVisible
+                && hasCompleteAgentEnvelope(lastText)
+                && Date.now() - stableSince >= staleStopWindowMs
+              )
+            )
           ) {
             this.lastAssistantMessageId = candidateId;
-            throw new BrowserAdapterError(
-              "ChatGPT completed an assistant turn without any content.",
-              {
-                code: "EMPTY_ASSISTANT_RESPONSE",
-                details: {
-                  assistantMessageId: candidateId,
-                  assistantTurn: candidateTurn,
-                },
-              },
-            );
+            const limitMarker = await this.#findUsageLimitMarker(lastMessage);
+            if (limitMarker) {
+              throw new BrowserAdapterError(
+                `ChatGPT reported a usage limit (${limitMarker}).`,
+                { code: "USAGE_LIMIT_REACHED" },
+              );
+            }
+            return lastText.trim();
           }
-        } else {
-          // Generation is still active, or text has begun rendering. Only an
-          // empty and stopped reply should consume the empty-response window.
-          emptyCandidate = null;
-          emptySince = 0;
         }
-        // If the reply looks like protocol XML, never accept it until BOTH the
-        // opening and closing tags are present. During streaming the text can
-        // briefly go quiet (or the stop button flip off) after "<agent_response"
-        // is painted but before "</agent_response>" arrives; accepting there
-        // hands the parser a truncated envelope. Non-protocol chatter (no
-        // "<agent_response") is unaffected and still completes on the stable
-        // window below.
-        const looksLikeProtocol = lastText.includes("<agent_response");
-        const envelopeReady = !looksLikeProtocol
-          || hasCompleteAgentEnvelope(lastText);
+
+        // Dead-request detection: the user message was sent but ChatGPT stopped
+        // producing signals — either it never started (no node, no stop button)
+        // or a started generation went quiet for several grace periods (stream
+        // dropped, server-side abort, usage limit). A node or visible stop
+        // button means generation is alive and resets the clock. Recover with a
+        // continuation nudge instead of waiting out the full model timeout.
+        const generationActive = hasNewAssistant || stopVisible;
+        const quietSince = sawGenerationSignal
+          ? lastGenerationSignalAt
+          : startedAt;
+        const quietGraceMs = sawGenerationSignal
+          ? deadRequestGraceMs * 3
+          : deadRequestGraceMs;
         if (
-          lastText.trim()
-          && stableSince > 0
-          && envelopeReady
-          && (
-            (
-              !stopVisible
-              && Date.now() - stableSince >= stableWindowMs
-            )
-            || (
-              stopVisible
-              && hasCompleteAgentEnvelope(lastText)
-              && Date.now() - stableSince >= staleStopWindowMs
-            )
-          )
+          !generationActive
+          && this.sentUserTurn != null
+          && Date.now() - quietSince >= quietGraceMs
         ) {
-          this.lastAssistantMessageId = candidateId;
-          return lastText.trim();
+          await this.#writeDiagnostics("dead-request");
+          throw new BrowserAdapterError(
+            "ChatGPT stopped responding without completing a reply.",
+            {
+              code: "DEAD_ASSISTANT_REQUEST",
+              details: { sentUserTurn: this.sentUserTurn },
+            },
+          );
         }
+
+        await this.page.waitForTimeout(sawAssistant ? 250 : 500);
       }
 
-      await this.page.waitForTimeout(sawAssistant ? 250 : 500);
+      await this.#writeDiagnostics("turn-timeout");
+      throw new BrowserAdapterError(
+        `ChatGPT turn did not complete within ${Math.round(timeoutMs / 1000)} seconds.`,
+        { code: "TURN_TIMEOUT" },
+      );
+    } finally {
+      detachEscCancel?.();
     }
-
-    await this.#writeDiagnostics("turn-timeout");
-    throw new BrowserAdapterError(
-      `ChatGPT turn did not complete within ${Math.round(timeoutMs / 1000)} seconds.`,
-      { code: "TURN_TIMEOUT" },
-    );
   }
 
   async #findComposer() {
@@ -771,6 +883,29 @@ export class ChatGPTWebAdapter {
     return { count, ids, maxTurn };
   }
 
+  // ChatGPT's thread list is virtualized: only the visible window is mounted.
+  // Scrolls the thread container to the bottom so the latest replies mount.
+  // Best-effort — any failure is swallowed.
+  async #scrollConversationToBottom() {
+    await this.page.evaluate?.(() => {
+      const message = document.querySelector("[data-message-author-role]");
+      if (!message) {
+        return;
+      }
+      let element = message.parentElement;
+      for (
+        let depth = 0;
+        element && depth < 12;
+        depth += 1, element = element.parentElement
+      ) {
+        if (element.scrollHeight > element.clientHeight + 50) {
+          element.scrollTop = element.scrollHeight;
+          return;
+        }
+      }
+    }).catch(() => null);
+  }
+
   async #waitForSentUserMessage(baseline, attempts = 50) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const messages = this.#userMessages();
@@ -798,10 +933,12 @@ export class ChatGPTWebAdapter {
 
   async #waitForConversationHistory({
     expectedAssistantMessageId = null,
+    expectedUrl = null,
     attempts = 60,
   } = {}) {
     let previousSignature = null;
     let stableChecks = 0;
+    let scrolledToBottom = 0;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const assistant = await this.#captureMessageIdentities(
@@ -814,25 +951,41 @@ export class ChatGPTWebAdapter {
         return;
       }
 
-      if (!expectedAssistantMessageId) {
-        const totalMessages = await this.#conversationMessages()
-          .count()
-          .catch(() => 0);
-        const signature = [
-          totalMessages,
-          assistant.count,
-          assistant.maxTurn ?? "",
-          [...assistant.ids].join(","),
-        ].join(":");
-        if (totalMessages > 0 && signature === previousSignature) {
-          stableChecks += 1;
-          if (stableChecks >= 3) {
+      // The expected resume marker is the latest reply, near the bottom of a
+      // virtualized thread: scroll down a few times to force the tail to mount.
+      if (expectedAssistantMessageId && scrolledToBottom < 3) {
+        await this.#scrollConversationToBottom();
+        scrolledToBottom += 1;
+      }
+
+      const totalMessages = await this.#conversationMessages()
+        .count()
+        .catch(() => 0);
+      const signature = [
+        totalMessages,
+        assistant.count,
+        assistant.maxTurn ?? "",
+        [...assistant.ids].join(","),
+      ].join(":");
+      if (totalMessages > 0 && signature === previousSignature) {
+        stableChecks += 1;
+        if (stableChecks >= 3) {
+          // With an expected id we normally return as soon as it appears;
+          // reaching stability instead means the id is not mounted or has been
+          // deleted (ChatGPT removes transient error/limit cards, and the last
+          // recorded reply can be one). Accept when the URL still proves this
+          // is the expected conversation.
+          if (
+            !expectedAssistantMessageId
+            || !expectedUrl
+            || sameConversationUrl(this.page.url(), expectedUrl)
+          ) {
             return;
           }
-        } else {
-          stableChecks = 0;
-          previousSignature = signature;
         }
+      } else {
+        stableChecks = 0;
+        previousSignature = signature;
       }
 
       await this.page.waitForTimeout(250);
@@ -924,14 +1077,76 @@ export class ChatGPTWebAdapter {
     return null;
   }
 
-  async #isStopButtonVisible() {
-    const stop = await firstVisible([
+  #stopButtonLocators() {
+    return [
       this.page.locator('[data-testid="stop-button"]'),
       this.page.getByRole("button", {
         name: /stop generating|stop|停止生成|停止/i,
       }),
+    ];
+  }
+
+  async #isStopButtonVisible() {
+    return Boolean(await firstVisible(this.#stopButtonLocators()));
+  }
+
+  // A plan/usage limit renders as an error card: error-tinted token classes
+  // (text-token-text-error / bg-token-surface-error) plus a regenerate button
+  // (data-testid="regenerate-thread-error-button"). Protocol replies are plain
+  // markdown and never contain those, so their presence confirms the matching
+  // text is a real notice rather than a reply that mentions "limit" in its
+  // content. Text stays the primary signal (a notice always says something
+  // recognizable in the UI language); the DOM features guard against false
+  // positives and future language additions.
+  async #findUsageLimitMarker(message) {
+    const text = await message.innerText().catch(() => "");
+    if (!isUsageLimitNotice(text)) {
+      return null;
+    }
+    const control = await firstVisible([
+      message.locator('button[data-testid="regenerate-thread-error-button"]'),
+      message.locator('[class*="text-token-text-error"]'),
+      message.locator('[class*="bg-token-surface-error"]'),
+      message.getByRole("button", {
+        name: /retry|重试|try again|upgrade|升级/i,
+      }),
     ]);
-    return Boolean(stop);
+    return control ? text.trim().slice(0, 120) : null;
+  }
+
+  async #clickStopButton() {
+    const stop = await firstVisible(this.#stopButtonLocators());
+    if (stop) {
+      await stop.click({ timeout: 3_000 }).catch(() => null);
+    }
+  }
+
+  // While a turn is being processed, raw-mode stdin lets ESC cancel the wait
+  // (like ChatGPT). Raw mode swallows Ctrl+C, so forward it as a real SIGINT
+  // so the CLI's existing interrupt path still runs. The returned detach
+  // restores the previous terminal mode, keeping approval prompts (which also
+  // read stdin) working. Keys other than ESC/Ctrl+C are consumed and dropped.
+  #attachEscCancel() {
+    if (!this.cancelOnEsc || !this.stdinStream?.isTTY) {
+      return null;
+    }
+    const stream = this.stdinStream;
+    emitKeypressEvents(stream);
+    const previousRaw = stream.isRaw;
+    stream.setRawMode(true);
+    this.escCancelRequested = false;
+    const onKeypress = (_chunk, key) => {
+      if (key?.name === "escape") {
+        this.escCancelRequested = true;
+      } else if (key?.ctrl && key?.name === "c") {
+        process.kill(process.pid, "SIGINT");
+      }
+    };
+    stream.on("keypress", onKeypress);
+    return () => {
+      stream.removeListener("keypress", onKeypress);
+      stream.setRawMode(previousRaw);
+    };
   }
 
   async #dismissTransientOverlays() {

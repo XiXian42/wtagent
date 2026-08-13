@@ -1,11 +1,13 @@
 import { wrapSystemPrompt } from "./markers.js";
 
 function formatTool(tool) {
+  // Flat, so multi-line descriptions (arrays) keep their line breaks instead
+  // of being comma-joined by Array#join.
   return [
     `### ${tool.name}`,
     tool.description,
     tool.inputDescription,
-  ].filter(Boolean).join("\n");
+  ].filter(Boolean).flat().join("\n");
 }
 
 function cdata(value) {
@@ -91,7 +93,8 @@ Complete the user's task. If it is a question or a conversational request, answe
 
 ## Project
 Virtual project root: ${projectRoot}
-Treat this as the root understood by the local tools. Prefer paths relative to it for all tool arguments.`;
+Treat this as the root understood by the local tools. Prefer paths relative to it for all tool arguments.
+The project directory may contain content unrelated to the current task: dependency caches, build output, vendored code, large fixtures, docs of other products, or files from previous experiments. When searching or reading, scope with path/glob and exclude such content (fs.search supports an exclude argument) so results stay focused on the code that matters.`;
 }
 
 // Returns the pieces needed by both transports:

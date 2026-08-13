@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ChatGPTWebAdapter } from "../src/browser/chatgpt-web-adapter.js";
+import { PassThrough } from "node:stream";
+import { ChatGPTWebAdapter, isConnectionLostError } from "../src/browser/chatgpt-web-adapter.js";
 
 class EmptyLocator {
   async count() {
@@ -32,6 +33,10 @@ class EmptyLocator {
   }
 
   locator() {
+    return this;
+  }
+
+  getByRole() {
     return this;
   }
 }
@@ -647,5 +652,434 @@ test("does not classify an empty assistant node as finished while Stop is visibl
       emptyResponseWindowMs: 0,
     }),
     (error) => error.code === "TURN_TIMEOUT",
+  );
+});
+
+test("fails fast when ChatGPT never starts generating after the message was sent", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.sentUserTurn = 10;
+  adapter.assistantIdsBeforeSend = new Set();
+  adapter.assistantMaxTurnBeforeSend = null;
+  adapter.page = {
+    async title() {
+      return "ChatGPT";
+    },
+    locator() {
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {},
+  };
+
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 5_000,
+      stableWindowMs: 0,
+      deadRequestGraceMs: 0,
+    }),
+    (error) => {
+      assert.equal(error.code, "DEAD_ASSISTANT_REQUEST");
+      return true;
+    },
+  );
+});
+
+test("a visible stop button proves generation started and disables dead-request detection", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.sentUserTurn = 10;
+  adapter.assistantIdsBeforeSend = new Set(["assistant-old"]);
+  adapter.assistantMaxTurnBeforeSend = null;
+  adapter.page = {
+    async title() {
+      return "ChatGPT";
+    },
+    locator(selector) {
+      if (selector === '[data-message-author-role="assistant"]') {
+        return new AssistantCollection(
+          new AssistantMessage("", { id: "assistant-old", turn: 1 }),
+        );
+      }
+      if (selector === '[data-testid="stop-button"]') {
+        return new VisibleLocator();
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {},
+  };
+
+  // Generation is alive (stop button visible), so the wait must not be cut
+  // short by dead-request detection — it ends in a plain TURN_TIMEOUT.
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 50,
+      stableWindowMs: 0,
+      deadRequestGraceMs: 0,
+    }),
+    (error) => error.code === "TURN_TIMEOUT",
+  );
+});
+
+
+test("ESC during processing cancels the turn, clicks stop, and restores the terminal", async () => {
+  const stdinStream = new PassThrough();
+  stdinStream.isTTY = true;
+  stdinStream.isRaw = false;
+  stdinStream.setRawMode = (enabled) => {
+    stdinStream.isRaw = Boolean(enabled);
+  };
+
+  let stopClicks = 0;
+  const stopButton = new VisibleLocator();
+  stopButton.click = async () => {
+    stopClicks += 1;
+  };
+
+  const adapter = new ChatGPTWebAdapter({
+    profileDir: ".",
+    cancelOnEsc: true,
+    stdinStream,
+  });
+  adapter.sentUserTurn = 10;
+  adapter.assistantIdsBeforeSend = new Set(["assistant-old"]);
+  adapter.assistantMaxTurnBeforeSend = null;
+  adapter.page = {
+    async title() {
+      return "ChatGPT";
+    },
+    locator(selector) {
+      if (selector === '[data-message-author-role="assistant"]') {
+        return new AssistantCollection(
+          new AssistantMessage("", { id: "assistant-old", turn: 1 }),
+        );
+      }
+      if (selector === '[data-testid="stop-button"]') {
+        return stopButton;
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    // Yield to macrotasks so the test's own timer (the ESC keypress) can fire
+    // while the wait loop spins.
+    async waitForTimeout() {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    },
+  };
+
+  const waiting = adapter.waitForTurnComplete({
+    timeoutMs: 5_000,
+    stableWindowMs: 0,
+    deadRequestGraceMs: 0,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stdinStream.emit("keypress", "\u001b", {
+    name: "escape",
+    ctrl: false,
+    meta: false,
+    shift: false,
+  });
+
+  await assert.rejects(waiting, (error) => {
+    assert.equal(error.code, "TURN_CANCELLED");
+    return true;
+  });
+  assert.equal(stopClicks, 1);
+  assert.equal(stdinStream.isRaw, false);
+});
+
+test("ESC cancellation is disabled unless cancelOnEsc is set", async () => {
+  const stdinStream = new PassThrough();
+  stdinStream.isTTY = true;
+  let rawModeChanges = 0;
+  stdinStream.setRawMode = () => {
+    rawModeChanges += 1;
+  };
+
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.sentUserTurn = 10;
+  adapter.assistantIdsBeforeSend = new Set(["assistant-old"]);
+  adapter.assistantMaxTurnBeforeSend = null;
+  adapter.page = {
+    async title() {
+      return "ChatGPT";
+    },
+    locator(selector) {
+      if (selector === '[data-message-author-role="assistant"]') {
+        return new AssistantCollection(
+          new AssistantMessage("", { id: "assistant-old", turn: 1 }),
+        );
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {},
+  };
+
+  // Without cancelOnEsc the adapter never touches stdin; the wait ends in a
+  // plain TURN_TIMEOUT (the mock page stays generation-less and stop-free).
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 50,
+      stableWindowMs: 0,
+      deadRequestGraceMs: 10_000,
+    }),
+    (error) => error.code === "TURN_TIMEOUT",
+  );
+  assert.equal(rawModeChanges, 0);
+});
+
+
+test("reconnect drops the dead transport and relaunches", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  let disconnects = 0;
+  adapter.cdpChrome = {
+    disconnect: async () => {
+      disconnects += 1;
+    },
+  };
+  let launches = 0;
+  adapter.launch = async () => {
+    launches += 1;
+  };
+
+  await adapter.reconnect();
+
+  assert.equal(disconnects, 1);
+  assert.equal(launches, 1);
+  assert.equal(adapter.cdpChrome, null);
+  assert.equal(adapter.context, null);
+  assert.equal(adapter.page, null);
+});
+
+test("classifies dead-transport Playwright errors as reconnects", () => {
+  assert.equal(
+    isConnectionLostError(
+      new Error("Target page, context or browser has been closed"),
+    ),
+    true,
+  );
+  assert.equal(isConnectionLostError(new Error("Connection closed")), true);
+  assert.equal(isConnectionLostError(new Error("Connection is closed")), true);
+  assert.equal(
+    isConnectionLostError(new Error("Timeout waiting for the composer")),
+    false,
+  );
+  assert.equal(
+    isConnectionLostError(new Error("Login was not detected")),
+    false,
+  );
+});
+
+
+test("a generation signal that went quiet still counts as a dead request", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.sentUserTurn = 10;
+  adapter.assistantIdsBeforeSend = new Set(["assistant-old"]);
+  adapter.assistantMaxTurnBeforeSend = null;
+  const start = Date.now();
+  adapter.page = {
+    async title() {
+      return "ChatGPT";
+    },
+    locator(selector) {
+      if (selector === '[data-message-author-role="assistant"]') {
+        return new AssistantCollection(
+          new AssistantMessage("", { id: "assistant-old", turn: 1 }),
+        );
+      }
+      if (selector === '[data-testid="stop-button"]') {
+        // Stop button visible for the first 50ms, then gone forever: a
+        // generation attempt that started and died mid-flight.
+        return Date.now() - start < 50
+          ? new VisibleLocator()
+          : new EmptyLocator();
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    },
+  };
+
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 3_000,
+      stableWindowMs: 0,
+      deadRequestGraceMs: 200,
+    }),
+    (error) => error.code === "DEAD_ASSISTANT_REQUEST",
+  );
+});
+
+
+class LimitErrorCardMessage extends AssistantMessage {
+  constructor(text) {
+    super(text);
+  }
+
+  locator(selector) {
+    if (selector === 'button[data-testid="regenerate-thread-error-button"]') {
+      return new VisibleLocator();
+    }
+    return super.locator(selector);
+  }
+}
+
+test("rejects a usage-limit error card instead of returning its text", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistant: new LimitErrorCardMessage("你已达到限额。请稍后重试。"),
+  });
+
+  await assert.rejects(
+    adapter.waitForTurnComplete({
+      timeoutMs: 1_000,
+      stableWindowMs: 0,
+    }),
+    (error) => {
+      assert.equal(error.code, "USAGE_LIMIT_REACHED");
+      return true;
+    },
+  );
+});
+
+test("a protocol reply mentioning a limit is accepted without error-card DOM", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createPage({
+    assistantText:
+      "<agent_response><done>true</done><message>We reached your usage limit earlier; here is the result anyway.</message></agent_response>",
+  });
+
+  const result = await adapter.waitForTurnComplete({
+    timeoutMs: 1_000,
+    stableWindowMs: 0,
+  });
+
+  assert.match(result, /We reached your usage limit earlier/);
+});
+
+
+test("resume tolerates a deleted resume marker when the conversation is verified", async () => {
+  const conversationUrl = "https://chatgpt.com/c/existing";
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createConversationPage({
+    initialUrl: conversationUrl,
+    existingMessages: 4,
+    assistantIds: ["assistant-1"],
+  });
+
+  // The expected marker was deleted by ChatGPT (e.g. a transient limit card).
+  // The URL plus a stable, non-empty history still verify the conversation.
+  await adapter.startConversation(conversationUrl, {
+    expectedAssistantMessageId: "assistant-gone",
+  });
+
+  assert.equal(await adapter.getConversationUrl(), conversationUrl);
+});
+
+test("resume still rejects an empty conversation even with a missing marker", async () => {
+  const conversationUrl = "https://chatgpt.com/c/existing";
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = createConversationPage({
+    initialUrl: conversationUrl,
+    existingMessages: 0,
+    assistantIds: ["assistant-1"],
+  });
+
+  await assert.rejects(
+    adapter.startConversation(conversationUrl, {
+      expectedAssistantMessageId: "assistant-gone",
+    }),
+    /could not be verified/,
+  );
+});
+
+test("resume rejects when the page left the expected conversation", async () => {
+  const conversationUrl = "https://chatgpt.com/c/existing";
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = {
+    async goto() {},
+    url() {
+      return "https://chatgpt.com/c/other";
+    },
+    locator(selector) {
+      if (selector === "#prompt-textarea") {
+        return new VisibleLocator();
+      }
+      if (selector === '[data-message-author-role="assistant"]') {
+        return new MessageCollection([
+          new AssistantMessage("", { id: "assistant-1", turn: 2 }),
+        ]);
+      }
+      if (
+        selector
+        === '[data-message-author-role="user"], [data-message-author-role="assistant"]'
+      ) {
+        return {
+          async count() {
+            return 4;
+          },
+        };
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {},
+  };
+
+  await assert.rejects(
+    adapter.startConversation(conversationUrl, {
+      expectedAssistantMessageId: "assistant-gone",
+    }),
+    /could not be verified/,
+  );
+});
+
+
+test("fails loudly when ChatGPT never renders the sent message", async () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  adapter.page = {
+    url() {
+      return "https://chatgpt.com/";
+    },
+    async title() {
+      return "ChatGPT";
+    },
+    locator(selector) {
+      if (selector === "#prompt-textarea") {
+        return new VisibleLocator();
+      }
+      return new EmptyLocator();
+    },
+    getByRole() {
+      return new EmptyLocator();
+    },
+    async waitForTimeout() {},
+    async waitForURL() {},
+    keyboard: {
+      async press() {},
+      async insertText() {},
+    },
+  };
+
+  await assert.rejects(
+    adapter.sendMessage("hello"),
+    (error) => {
+      assert.equal(error.code, "SEND_NOT_DETECTED");
+      return true;
+    },
   );
 });

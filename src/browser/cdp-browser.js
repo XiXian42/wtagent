@@ -132,11 +132,23 @@ async function setWindowState(context, page, windowState) {
   }
 }
 
+function sameOriginPath(left, right) {
+  try {
+    const leftUrl = new URL(left);
+    const rightUrl = new URL(right);
+    return leftUrl.origin === rightUrl.origin
+      && leftUrl.pathname === rightUrl.pathname;
+  } catch {
+    return false;
+  }
+}
+
 export async function launchAndConnectCdpChrome({
   executablePath,
   profileDir,
   url = "about:blank",
   minimized = false,
+  preferredUrl = null,
 }, {
   acquireProfileLock = acquireCdpProfileLock,
   connectOverCDP = (endpoint) => chromium.connectOverCDP(endpoint),
@@ -267,10 +279,20 @@ export async function launchAndConnectCdpChrome({
     }
 
     // A reused browser may still contain the previous conversation. Keep it
-    // intact and create a fresh target for this CLI session.
-    const page = reused
-      ? await context.newPage()
-      : context.pages()[0] ?? await context.newPage();
+    // intact and, when a preferred URL is given, reuse an existing tab already
+    // showing that conversation (origin + path) so resumed runs do not pile up
+    // tabs; otherwise create a fresh target for this CLI session.
+    let page;
+    if (reused) {
+      const matchingTab = preferredUrl
+        ? context.pages().find((candidate) =>
+          sameOriginPath(candidate.url?.() ?? "", preferredUrl)
+        ) ?? null
+        : null;
+      page = matchingTab ?? await context.newPage();
+    } else {
+      page = context.pages()[0] ?? await context.newPage();
+    }
     if (minimized) {
       await setWindowState(context, page, "minimized");
     }
@@ -292,6 +314,12 @@ export async function launchAndConnectCdpChrome({
       },
       async restore() {
         return await setWindowState(context, page, "normal");
+      },
+      // Drops only the Playwright transport. Unlike close(), never asks Chrome
+      // to exit and never kills the process: used to recover from a dead CDP
+      // connection (e.g. after the Mac slept) while Chrome itself is alive.
+      async disconnect() {
+        await settleWithin(browser.close(), 1_500);
       },
       async close() {
         if (closePromise) {

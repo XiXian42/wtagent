@@ -159,7 +159,14 @@ async function listTree(root, target, options) {
   return entries;
 }
 
-async function rgSearch({ query, searchPath, glob, regex, maxResults }) {
+async function rgSearch({
+  query,
+  searchPath,
+  glob,
+  exclude,
+  regex,
+  maxResults,
+}) {
   const argv = [
     "--line-number",
     "--no-heading",
@@ -173,6 +180,9 @@ async function rgSearch({ query, searchPath, glob, regex, maxResults }) {
   }
   if (glob) {
     argv.push("--glob", glob);
+  }
+  for (const pattern of exclude ?? []) {
+    argv.push("--glob", `!${pattern}`);
   }
   argv.push("--", query, searchPath);
 
@@ -406,14 +416,18 @@ export function createDefaultToolRegistry({
 
   registry.register({
     name: "fs.search",
-    description: "Search project files for text, using a built-in engine and ripgrep when available.",
+    description: [
+      "Search project files for text, using a built-in engine and ripgrep when available.",
+      "The project directory may contain unrelated or generated content (dependency caches, build output, vendored code, large fixtures). Pass comma-separated exclude globs to skip it, e.g. exclude=vendor/**,dist.",
+    ].join(" "),
     inputDescription:
-      "<args><query>search text</query><path>.</path><glob>*.js</glob><regex>false</regex><max_results>200</max_results></args>",
+      "<args><query>search text</query><path>.</path><glob>*.js</glob><exclude>vendor/**,dist</exclude><regex>false</regex><max_results>200</max_results></args>",
     risk: "read",
     inputSchema: z.object({
       query: z.string().min(1),
       path: z.string().default("."),
       glob: z.string().optional(),
+      exclude: z.string().optional(),
       regex: xmlBoolean.default(false),
       max_results: z.coerce.number().int().min(1)
         .max(1000)
@@ -421,6 +435,10 @@ export function createDefaultToolRegistry({
     }),
     execute: async (args, context) => {
       const target = await resolveAllowedPath(args.path, context);
+      const excludePatterns = (args.exclude ?? "")
+        .split(",")
+        .map((pattern) => pattern.trim())
+        .filter(Boolean);
       let output;
       let engine = "rg";
       try {
@@ -428,6 +446,7 @@ export function createDefaultToolRegistry({
           query: args.query,
           searchPath: target,
           glob: args.glob,
+          exclude: excludePatterns,
           regex: args.regex,
           maxResults: args.max_results,
         });
@@ -441,6 +460,7 @@ export function createDefaultToolRegistry({
           query: args.query,
           searchPath: target,
           glob: args.glob,
+          excludePatterns,
           regex: args.regex,
           maxResults: args.max_results,
         });

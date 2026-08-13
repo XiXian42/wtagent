@@ -271,3 +271,50 @@ test("terminal tool guidance tells the model to bound output without shell opera
   assert.match(terminal.description, /Pipes, redirections/);
   assert.match(terminal.description, /not supported/);
 });
+
+test("fs.search excludes paths given in the exclude argument", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-tools-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  await fs.mkdir(path.join(root, "vendor"), { recursive: true });
+  await fs.writeFile(path.join(root, "src", "a.js"), "const needle = 1;", "utf8");
+  await fs.writeFile(path.join(root, "vendor", "b.js"), "const needle = 2;", "utf8");
+
+  const registry = createDefaultToolRegistry({
+    processManager: new ProcessManager(),
+  });
+  const call = registry.validate({
+    id: "search-exclude",
+    name: "fs.search",
+    args: { query: "needle", exclude: "vendor" },
+  });
+  const result = await registry.execute(call, context(root));
+  assert.equal(result.ok, true);
+  assert.match(result.data.matches, /src[\\/]a\.js/);
+  assert.doesNotMatch(result.data.matches, /vendor/);
+});
+
+test("fs.search splits comma-separated exclude patterns", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-tools-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  await fs.mkdir(path.join(root, "vendor"), { recursive: true });
+  await fs.mkdir(path.join(root, "generated"), { recursive: true });
+  await fs.writeFile(path.join(root, "src", "a.js"), "const needle = 1;", "utf8");
+  await fs.writeFile(path.join(root, "vendor", "b.js"), "const needle = 2;", "utf8");
+  await fs.writeFile(path.join(root, "generated", "c.js"), "const needle = 3;", "utf8");
+
+  const registry = createDefaultToolRegistry({
+    processManager: new ProcessManager(),
+  });
+  const call = registry.validate({
+    id: "search-exclude-many",
+    name: "fs.search",
+    args: { query: "needle", exclude: "vendor, generated" },
+  });
+  const result = await registry.execute(call, context(root));
+  assert.equal(result.ok, true);
+  assert.match(result.data.matches, /src[\\/]a\.js/);
+  assert.doesNotMatch(result.data.matches, /vendor/);
+  assert.doesNotMatch(result.data.matches, /generated/);
+});

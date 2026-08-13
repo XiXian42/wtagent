@@ -24,9 +24,16 @@ import {
   ProtocolError,
   ToolValidationError,
 } from "../shared/errors.js";
+import { isConnectionLostError } from "../browser/chatgpt-web-adapter.js";
+import { isUsageLimitNotice } from "../shared/usage-limit.js";
 
 const EMPTY_ASSISTANT_CONTINUE_MESSAGE =
   "The previous assistant response was empty. Continue the immediately preceding task "
+  + "from the existing conversation context. Do not repeat any local tool operation "
+  + "whose result is already present. Reply using the required <agent_response> XML protocol.";
+
+const DEAD_REQUEST_CONTINUE_MESSAGE =
+  "The previous request received no reply. Continue the immediately preceding task "
   + "from the existing conversation context. Do not repeat any local tool operation "
   + "whose result is already present. Reply using the required <agent_response> XML protocol.";
 
@@ -149,7 +156,7 @@ export class AgentRuntime {
   async sendMessage(text, { files = [], maxBytes = null } = {}) {
     const message = appendSystemReminder(text);
     try {
-      await this.adapter.sendMessage(message, { files, maxBytes });
+      await this.#sendMessageWithReconnect(message, { files, maxBytes });
     } finally {
       const conversationUrl = await this.adapter.getConversationUrl()
         .catch(() => null);
@@ -160,6 +167,41 @@ export class AgentRuntime {
         await this.session.update({ conversationUrl });
       }
     }
+  }
+
+  // Sends once; if the browser connection died in between (e.g. the Mac slept
+  // while a tool was running), reconnects to the still-alive Chrome, restores
+  // the conversation, and retries once. A send that never rendered (ChatGPT
+  // did not register the message) is also retried once — the deterministic
+  // message is simply sent again. Anything else propagates.
+  async #sendMessageWithReconnect(message, { files, maxBytes }) {
+    try {
+      await this.adapter.sendMessage(message, { files, maxBytes });
+    } catch (error) {
+      if (isConnectionLostError(error)) {
+        await this.#reconnectAndRestore();
+        await this.adapter.sendMessage(message, { files, maxBytes });
+        return;
+      }
+      if (error?.code === "SEND_NOT_DETECTED") {
+        await this.adapter.sendMessage(message, { files, maxBytes });
+        return;
+      }
+      throw error;
+    }
+  }
+
+  // Reconnects to the still-alive Chrome and navigates back to the session's
+  // conversation, so the DOM state needed by the adapter is restored.
+  async #reconnectAndRestore() {
+    await this.adapter.reconnect?.(this.session.state.conversationUrl);
+    await this.adapter.startConversation(
+      this.session.state.conversationUrl,
+      {
+        expectedAssistantMessageId: this.session.state.lastAssistantMessageId
+          ?? null,
+      },
+    );
   }
 
   buildToolResultMessage(result, { suffix = "" } = {}) {
@@ -185,11 +227,12 @@ export class AgentRuntime {
     instruction = null,
     files = [],
     inPlaceRecovery = false,
+    mode = null,
   } = {}) {
     const {
       task,
       projectRoot,
-      mode,
+      mode: sessionMode,
     } = this.session.state;
     const previousConversationUrl = this.session.state.conversationUrl;
     await this.session.recoverInterruptedSideEffects();
@@ -202,7 +245,11 @@ export class AgentRuntime {
     });
     await this.emit("runtime.initializing");
 
-    await this.adapter.launch();
+    // On resume, prefer an existing tab already showing the conversation so
+    // repeated resumes reuse the same tab instead of piling up new ones.
+    await this.adapter.launch(
+      resume ? this.session.state.conversationUrl : null,
+    );
     await this.emit("browser.started", {
       profileDir: this.adapter.profileDir,
     });
@@ -241,25 +288,32 @@ export class AgentRuntime {
           : null,
       },
     );
+    // A fresh run uses the mode stored at session creation; a resume applies
+    // an explicit mode override (--mode or the interactive choice) when given,
+    // and otherwise keeps the mode the conversation is already on.
+    const requestedMode = mode ?? sessionMode;
     // The actual mode may differ from the requested one (Pro limited, fallback,
     // or switcher not found), so report what was really selected.
     let activeMode = resume
       ? (this.session.state.activeMode ?? null)
       : null;
-    if (!resume && mode) {
-      const modeResult = await this.adapter.selectMode(mode);
+    const selectRequested = Boolean(
+      requestedMode && (!resume || mode != null),
+    );
+    if (selectRequested) {
+      const modeResult = await this.adapter.selectMode(requestedMode);
       if (modeResult) {
         await this.emit("conversation.mode_selected", {
-          requested: mode,
+          requested: requestedMode,
           status: modeResult.status,
           selectedLabel: modeResult.selectedLabel ?? null,
           attempts: modeResult.attempts ?? 0,
           reason: modeResult.reason ?? null,
         });
         if (modeResult.status === "select" || modeResult.status === "already") {
-          activeMode = modeResult.selectedLabel ?? mode;
+          activeMode = modeResult.selectedLabel ?? requestedMode;
         } else if (modeResult.status === "fallback") {
-          activeMode = modeResult.selectedLabel ?? mode;
+          activeMode = modeResult.selectedLabel ?? requestedMode;
         } else {
           // Pro not selected and no known fallback label — the real mode is
           // whatever ChatGPT already had, which we cannot name reliably.
@@ -275,7 +329,7 @@ export class AgentRuntime {
     await this.emit("conversation.started", {
       url: this.session.state.conversationUrl,
       mode: activeMode,
-      requestedMode: mode,
+      requestedMode,
     });
 
     let initialMessage;
@@ -357,12 +411,14 @@ export class AgentRuntime {
       await this.session.update({ turn: turnNumber, phase: "waiting_model" });
       let raw;
       let emptyAssistantRetries = 0;
+      let connectionRetries = 0;
       for (;;) {
         try {
           raw = await this.adapter.waitForTurnComplete({
             timeoutMs: this.limits.modelTurnTimeoutMs,
             stableWindowMs: this.limits.modelStableWindowMs,
             emptyResponseWindowMs: this.limits.emptyAssistantWindowMs,
+            deadRequestGraceMs: this.limits.deadRequestGraceMs,
             onDelta: async (delta) => {
               await this.onEvent?.({
                 type: "model.streaming",
@@ -374,7 +430,31 @@ export class AgentRuntime {
           });
           break;
         } catch (error) {
-          if (error?.code !== "EMPTY_ASSISTANT_RESPONSE") {
+          if (isConnectionLostError(error)) {
+            if (connectionRetries >= 1) {
+              throw error;
+            }
+            connectionRetries += 1;
+            await this.#reconnectAndRestore();
+            // The message was already sent before the connection died; resume
+            // waiting for the reply on the restored page.
+            continue;
+          }
+
+          if (error?.code === "USAGE_LIMIT_REACHED") {
+            // Detected by the adapter from the message's DOM (text + retry
+            // button); surface the same event the text-based path emits.
+            await this.emit("model.limit_reached", {
+              snippet: error.message,
+            });
+            throw error;
+          }
+
+          const deadRequest = error?.code === "DEAD_ASSISTANT_REQUEST";
+          if (
+            error?.code !== "EMPTY_ASSISTANT_RESPONSE"
+            && !deadRequest
+          ) {
             throw error;
           }
 
@@ -393,9 +473,12 @@ export class AgentRuntime {
             await this.emit("model.empty_response_exhausted", {
               retries: emptyAssistantRetries,
               assistantMessageId: emptyAssistantMessageId,
+              deadRequest,
             });
             throw new BrowserAdapterError(
-              `ChatGPT returned empty responses after ${emptyAssistantRetries} continuation attempts.`,
+              deadRequest
+                ? `ChatGPT did not respond after ${emptyAssistantRetries} continuation attempts.`
+                : `ChatGPT returned empty responses after ${emptyAssistantRetries} continuation attempts.`,
               {
                 code: "EMPTY_ASSISTANT_RETRIES_EXHAUSTED",
                 cause: error,
@@ -409,13 +492,20 @@ export class AgentRuntime {
             retry: emptyAssistantRetries,
             maxRetries: this.limits.maxEmptyAssistantRetries,
             assistantMessageId: emptyAssistantMessageId,
+            deadRequest,
           });
           // Do not resend the original request or tool result: both are already
           // present in ChatGPT's conversation. This transport-only continuation
           // also cannot re-execute a local tool by itself.
-          await this.sendMessage(EMPTY_ASSISTANT_CONTINUE_MESSAGE);
+          await this.sendMessage(
+            deadRequest
+              ? DEAD_REQUEST_CONTINUE_MESSAGE
+              : EMPTY_ASSISTANT_CONTINUE_MESSAGE,
+          );
           await this.emit("model.message_sent", {
-            kind: "empty_response_recovery",
+            kind: deadRequest
+              ? "dead_request_recovery"
+              : "empty_response_recovery",
             retry: emptyAssistantRetries,
           });
         }
@@ -445,6 +535,21 @@ export class AgentRuntime {
       } catch (error) {
         if (!(error instanceof ProtocolError)) {
           throw error;
+        }
+        if (isUsageLimitNotice(raw)) {
+          // ChatGPT renders its plan/usage limit as a normal assistant message
+          // (localized). A failed parse whose text matches is a limit notice,
+          // not a format slip: retrying is futile, so stop the run with a
+          // clear error instead of burning retries and the model timeout.
+          await this.emit("model.limit_reached", {
+            snippet: raw.slice(0, 200),
+          });
+          throw new BrowserAdapterError(
+            "ChatGPT reported a usage limit. Try a different thinking level "
+              + "(e.g. wtagent resume with --mode Pro or --mode Current), wait "
+              + "for the limit to reset, or change plans, then resume.",
+            { code: "USAGE_LIMIT_REACHED" },
+          );
         }
         protocolErrors += 1;
         await this.emit("protocol.invalid", {

@@ -14,13 +14,18 @@ function reusableState() {
   };
 }
 
-function fakeBrowserHarness() {
-  const existingPage = { name: "existing" };
+function fakeBrowserHarness({
+  existingPages = [{
+    name: "existing",
+    url: () => "https://chatgpt.com/c/a",
+  }],
+} = {}) {
+  const existingPage = existingPages[0];
   const freshPage = { name: "fresh" };
   let closeCommandSent = false;
   let transportClosed = false;
   const context = {
-    pages: () => [existingPage],
+    pages: () => existingPages,
     newPage: async () => freshPage,
   };
   const browser = {
@@ -279,4 +284,60 @@ test("reaps stale profile holders before launching a fresh Chrome", async () => 
   // Chrome hangs on the locked profile.
   assert.deepEqual(order, ["reap", "spawn"]);
   await connection.close();
+});
+
+test("disconnect drops only the transport and leaves Chrome untouched", async () => {
+  const harness = fakeBrowserHarness();
+  const state = reusableState();
+  const controls = reusableDependencies(harness, {
+    discoverReusable: async () => state,
+  });
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+  }, controls.dependencies);
+
+  await connection.disconnect();
+
+  // The Playwright transport is closed, but Chrome is neither asked to exit
+  // (no Browser.close command) nor killed, and the CDP state + profile lock
+  // stay intact so the next launch can reuse the same browser.
+  assert.equal(harness.transportClosed, true);
+  assert.equal(harness.closeCommandSent, false);
+  assert.equal(controls.stateRemoved, false);
+  assert.equal(controls.released, false);
+});
+
+test("reused browser prefers an existing tab on the preferred conversation", async () => {
+  const harness = fakeBrowserHarness();
+  const state = reusableState();
+  const controls = reusableDependencies(harness, {
+    discoverReusable: async () => state,
+  });
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+    preferredUrl: "https://chatgpt.com/c/a",
+  }, controls.dependencies);
+
+  assert.equal(connection.page, harness.existingPage);
+  assert.notEqual(connection.page, harness.freshPage);
+});
+
+test("reused browser creates a fresh tab when no page matches the preferred URL", async () => {
+  const harness = fakeBrowserHarness();
+  const state = reusableState();
+  const controls = reusableDependencies(harness, {
+    discoverReusable: async () => state,
+  });
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+    preferredUrl: "https://chatgpt.com/c/other",
+  }, controls.dependencies);
+
+  assert.equal(connection.page, harness.freshPage);
 });

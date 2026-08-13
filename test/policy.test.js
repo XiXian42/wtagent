@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
+import { ApprovalStore } from "../src/policy/approval-store.js";
 import { resolveCanonicalWriteTarget } from "../src/policy/path-guard.js";
 
 async function evaluateCommand(root, program, argv = []) {
@@ -162,4 +163,50 @@ test("write guard rejects a parent replaced by an outside symlink", async (t) =>
     resolveCanonicalWriteTarget(root, target),
     /moved outside project root/,
   );
+});
+
+test("always-allowed tools skip confirmation and grant outside-project paths", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-policy-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new ApprovalStore({
+    filePath: path.join(root, "approvals.json"),
+  });
+  store.setAlwaysAllowedTool("terminal.exec");
+  const engine = new PolicyEngine({ store });
+
+  // Without the store the same command needs confirmation.
+  const withoutStore = await evaluateCommand(root, "rm", ["-rf", "dist"]);
+  assert.equal(withoutStore.action, "confirm");
+
+  const decision = await engine.evaluate(
+    {
+      name: "terminal.exec",
+      args: { program: "rm", argv: ["-rf", "dist"], cwd: "." },
+    },
+    { projectRoot: root },
+  );
+  assert.equal(decision.action, "allow");
+  assert.equal(decision.grants.allowOutside, true);
+  assert.deepEqual(decision.reasons, []);
+});
+
+test("allow-all bypasses confirmation for every tool", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-policy-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const store = new ApprovalStore({
+    filePath: path.join(root, "approvals.json"),
+  });
+  store.setAlwaysAllowAll();
+  const engine = new PolicyEngine({ store });
+
+  const decision = await engine.evaluate(
+    {
+      name: "terminal.exec",
+      args: { program: "sudo", argv: ["rm", "-rf", "/"], cwd: "." },
+    },
+    { projectRoot: root },
+  );
+  assert.equal(decision.action, "allow");
 });

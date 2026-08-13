@@ -2,7 +2,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
-import { confirm } from "@inquirer/prompts";
+import { confirm, select } from "@inquirer/prompts";
 import { ChatGPTWebAdapter } from "../browser/chatgpt-web-adapter.js";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
 import {
@@ -20,6 +20,7 @@ import {
 import { AgentRuntime } from "../runtime/agent-runtime.js";
 import { AgentSession } from "../session/agent-session.js";
 import { PolicyEngine } from "../policy/policy-engine.js";
+import { ApprovalStore } from "../policy/approval-store.js";
 import { createDefaultToolRegistry } from "../tools/default-tools.js";
 import { ProcessManager } from "../tools/process-manager.js";
 import { resolveLimits } from "../shared/limits.js";
@@ -180,7 +181,7 @@ async function runDoctor(options) {
 // the session, and each later turn reuses the same open Chrome tab and session
 // state via runtime.run({ resume: true }).
 class ConversationRunner {
-  constructor({ session, options }) {
+  constructor({ session, options, interactive = false }) {
     this.session = session;
     this.options = options;
     this.paths = resolveRuntimePaths(options);
@@ -189,12 +190,20 @@ class ConversationRunner {
     });
     this.processManager = new ProcessManager();
     this.renderer = createRenderer();
+    // "Always allow" decisions from the approval prompt persist here across
+    // turns, resumes, and separate sessions.
+    this.approvalStore = new ApprovalStore({
+      filePath: path.join(this.paths.appDataDir, "approvals.json"),
+    });
     this.adapter = new ChatGPTWebAdapter({
       profileDir: this.paths.profileDir,
       chromePath: options.chromePath,
       debug: options.debug,
       // Minimize by default; `--no-minimize` sets options.minimize === false.
       minimized: options.minimize !== false,
+      // ESC cancels the in-flight turn while ChatGPT is processing. Only in
+      // interactive TTY sessions where stdin is available to listen on.
+      cancelOnEsc: interactive,
     });
     this.interrupted = false;
     this.closed = false;
@@ -207,7 +216,7 @@ class ConversationRunner {
         processManager: this.processManager,
         limits: this.limits,
       }),
-      policy: new PolicyEngine(),
+      policy: new PolicyEngine({ store: this.approvalStore }),
       session: this.session,
       limits: this.limits,
       approval: async ({ toolCall, reasons }) => {
@@ -217,10 +226,33 @@ class ConversationRunner {
           console.log(`- ${reason}`);
         }
         console.log(JSON.stringify(toolCall.args, null, 2));
-        return await confirm({
-          message: "Allow this action once?",
-          default: false,
+        const choice = await select({
+          message: "How should this action be handled?",
+          choices: [
+            { name: "Allow once", value: "once" },
+            { name: `Always allow ${toolCall.name}`, value: "always-tool" },
+            { name: "Always allow everything", value: "always-all" },
+            { name: "Deny", value: "deny" },
+          ],
         });
+        if (choice === "deny") {
+          return false;
+        }
+        if (choice === "always-tool") {
+          this.approvalStore.setAlwaysAllowedTool(toolCall.name);
+          await this.approvalStore.save();
+          console.log(
+            `Saved: ${toolCall.name} will always be allowed `
+            + `(${this.approvalStore.filePath}).`,
+          );
+        } else if (choice === "always-all") {
+          this.approvalStore.setAlwaysAllowAll();
+          await this.approvalStore.save();
+          console.log(
+            `Saved: every tool will always be allowed (${this.approvalStore.filePath}).`,
+          );
+        }
+        return true;
       },
       onEvent: (event) => this.renderer.handle(event),
     });
@@ -234,6 +266,7 @@ class ConversationRunner {
     instruction,
     files = [],
     inPlaceRecovery = false,
+    mode = null,
   }) {
     const runtime = this.#buildRuntime();
     try {
@@ -242,6 +275,7 @@ class ConversationRunner {
         instruction,
         files,
         inPlaceRecovery,
+        mode,
       });
       return result;
     } catch (error) {
@@ -254,6 +288,20 @@ class ConversationRunner {
           message: "Interrupted by user.",
         });
         return null;
+      }
+      if (error?.code === "TURN_CANCELLED") {
+        // ESC during processing: the turn is cancelled but the conversation,
+        // browser, and managed processes stay alive. Return to the prompt so
+        // the user can send a new message or quit.
+        this.renderer.stopSpinner();
+        await this.session.update({
+          phase: "interrupted",
+          lastError: "Turn cancelled by user.",
+        });
+        await this.session.appendEvent("run.turn_cancelled", {
+          message: "Turn cancelled by user.",
+        });
+        return { cancelled: true, error };
       }
       if (error?.code === "EMPTY_ASSISTANT_RETRIES_EXHAUSTED") {
         await this.session.update({
@@ -280,13 +328,25 @@ class ConversationRunner {
     }
   }
 
-  async close() {
+  // Closes the browser and stops managed processes. After a failed run the
+  // browser is kept alive so the page state can be inspected: the saved CDP
+  // state lets the next `wtagent resume` reuse the same window, and a later
+  // launch reaps it if it has died in the meantime.
+  async close({ keepBrowser = false } = {}) {
     if (this.closed) {
       return;
     }
     this.closed = true;
     this.renderer.finish();
     await this.processManager.stopAll().catch(() => {});
+    if (keepBrowser) {
+      console.log(
+        "The run failed; Chrome was left open for debugging. "
+          + "Inspect the page and close it manually, or just run "
+          + "`wtagent resume` again — it will reuse this window.",
+      );
+      return;
+    }
     await this.adapter.close().catch((error) => {
       console.error(`Warning: ${error.message}`);
     });
@@ -300,10 +360,12 @@ async function executeSession({
   instruction = null,
   files = [],
   chatInput = null,
+  mode = null,
 }) {
   const paths = resolveRuntimePaths(options);
   await ensureDirectory(paths.sessionsDir);
-  const runner = new ConversationRunner({ session, options });
+  const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
+  const runner = new ConversationRunner({ session, options, interactive });
 
   const onInterrupt = async () => {
     if (runner.interrupted) {
@@ -316,13 +378,13 @@ async function executeSession({
     process.exitCode = 130;
   };
   process.on("SIGINT", onInterrupt);
-
-  const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
   const activeChatInput = chatInput
     ?? (interactive ? new ShellChatInput() : null);
   if (instruction) {
     activeChatInput?.remember(instruction);
   }
+
+  let runFailed = false;
 
   try {
     runner.renderer.hint(`Session ID: ${session.sessionId}`);
@@ -337,9 +399,19 @@ async function executeSession({
         instruction: turnInstruction,
         files: turnFiles,
         inPlaceRecovery: turnInPlaceRecovery,
+        mode,
       });
       if (runner.interrupted) {
         break;
+      }
+      if (result?.cancelled) {
+        if (!interactive) {
+          throw result.error;
+        }
+        runner.renderer.hint("Turn cancelled. Type a new message or quit.");
+        turnResume = true;
+        turnInPlaceRecovery = false;
+        continue;
       }
       if (result?.recoveryRequired) {
         if (!interactive) {
@@ -393,12 +465,27 @@ async function executeSession({
       turnFiles = next.files;
     }
     return null;
+  } catch (error) {
+    runFailed = true;
+    throw error;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     activeChatInput?.close();
-    await runner.close();
+    await runner.close({ keepBrowser: runFailed });
     console.log(`Session saved at: ${session.directory}`);
+    printResumeHint(session.sessionId);
   }
+}
+
+// A highly visible, blank-line-separated hint for continuing the conversation,
+// printed last so it is not lost in the run output (like Claude Code).
+function printResumeHint(sessionId) {
+  const rule = "─".repeat(48);
+  console.log("");
+  console.log(rule);
+  console.log(`Resume this conversation with: wtagent resume ${sessionId}`);
+  console.log(rule);
+  console.log("");
 }
 
 // Reads the user's next message from the interactive prompt. Empty input simply
@@ -535,7 +622,7 @@ function printChatBanner(projectRoot) {
   const RESET = "\x1b[0m";
   console.log("");
   console.log(`${CYAN}WTAgent${RESET} ${DIM}· GPT Web · ${projectRoot}${RESET}`);
-  console.log(`${DIM}Enter sends · multiline paste · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
+  console.log(`${DIM}Enter sends · Shift+Enter newline · ESC cancels processing · multiline paste · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
   console.log("");
 }
 
@@ -563,6 +650,32 @@ async function runResume(sessionId, instructionParts, options) {
   const session = await loadSession(paths, sessionId);
   await assertDirectory(session.state.projectRoot);
 
+  // Like a fresh run, interactive resumes offer a mode choice, defaulting to
+  // the mode the conversation is already on. `--mode` overrides it and also
+  // works non-interactively. This matters after a usage limit, where switching
+  // thinking levels (Pro vs Current) before retrying can get past the block.
+  let requestedMode;
+  if (options.mode != null) {
+    requestedMode = normalizeConfiguredMode(options.mode);
+  } else if (
+    !options.once
+    && process.stdin.isTTY
+    && process.stdout.isTTY
+  ) {
+    const modeChoice = await promptForSelect({
+      message: "ChatGPT mode",
+      choices: CHATGPT_MODE_CHOICES,
+      default: session.state.activeMode === "Pro" ? "pro" : "current",
+    });
+    if (modeChoice == null) {
+      console.log("");
+      return null;
+    }
+    requestedMode = modeFromPromptChoice(modeChoice);
+  } else {
+    requestedMode = null;
+  }
+
   const instruction = instructionParts.join(" ").trim();
   let files = [];
   if (instruction) {
@@ -586,6 +699,7 @@ async function runResume(sessionId, instructionParts, options) {
     resume: true,
     instruction: instruction || null,
     files,
+    mode: requestedMode,
   });
 }
 
@@ -660,7 +774,7 @@ async function runExport(sessionId, options) {
 const program = new Command()
   .name("wtagent")
   .description("Turn your web AI session into a local tool-using agent.")
-  .version("0.1.0-alpha.6")
+  .version("0.1.0")
   .option("--home <path>", "Application data directory")
   .option("--profile-dir <path>", "Dedicated Chrome profile directory")
   .option("--chrome-path <path>", "Chrome/Chromium executable")
@@ -676,7 +790,7 @@ const program = new Command()
   )
   .option(
     "--model-turn-timeout-ms <milliseconds>",
-    "Maximum wait for one ChatGPT response (default: 600000)",
+    "Maximum wait for one ChatGPT response (default: 1200000)",
   )
   .option(
     "--no-minimize",
@@ -714,6 +828,10 @@ program
   .description("Continue an existing session or recover an interrupted run.")
   .argument("<session-id>", "Saved session ID")
   .argument("[instruction...]", "Optional follow-up instruction")
+  .option(
+    "--mode <name>",
+    'ChatGPT mode: "Pro" selects Pro; "Current" keeps the web setting',
+  )
   .action(async (sessionId, instruction, _, command) => {
     await runResume(
       sessionId,

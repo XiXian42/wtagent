@@ -199,3 +199,45 @@ test("shell chat input exits cleanly on Ctrl+C", async () => {
 
   assert.equal(await pending, null);
 });
+
+
+test("shell chat input turns Shift+Enter into a newline instead of submitting", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("line one\u001b[13;2uline two\r");
+
+  assert.equal(await pending, "line one\nline two");
+});
+
+test("shell chat input keeps a Shift+Enter sequence split across chunks", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("line one\u001b[13;");
+  inputStream.write("2u");
+  inputStream.write("line two\r");
+
+  assert.equal(await pending, "line one\nline two");
+});
+
+test("shell chat input asks the terminal to disambiguate Shift+Enter via kitty protocol", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  let rendered = "";
+  outputStream.on("data", (chunk) => {
+    rendered += chunk.toString("utf8");
+  });
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("hello\r");
+  await pending;
+
+  assert.match(rendered, /\u001b\[>1u/);
+  assert.match(rendered, /\u001b\[<1u/);
+});
