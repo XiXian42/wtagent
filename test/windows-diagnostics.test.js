@@ -7,6 +7,7 @@ import {
   detectWsl,
   findExecutableOnPath,
   getNativeWindowsSupport,
+  getWslSupport,
   isSupportedNodeVersion,
 } from "../src/platform/windows-diagnostics.js";
 
@@ -34,14 +35,36 @@ test("detects WSL from environment and kernel release", () => {
   }), false);
 });
 
-test("WSL runtime is rejected with a native-Windows remediation", () => {
+test("WSL runtime is supported with a Linux graphical display", () => {
+  const context = {
+    platform: "linux",
+    env: {
+      WSL_DISTRO_NAME: "Ubuntu",
+      WAYLAND_DISPLAY: "wayland-0",
+    },
+    osRelease: "6.6.0-microsoft-standard-WSL2",
+  };
+
+  const support = getWslSupport(context);
+  assert.equal(support.supported, true);
+  assert.equal(support.preview, true);
+  assert.match(support.reason, /inside the WSL distribution/i);
+  assert.doesNotThrow(() => assertNativeRuntimeSupported(context));
+});
+
+test("WSL runtime requires WSLg or another Linux graphical display", () => {
+  const context = {
+    platform: "linux",
+    env: { WSL_DISTRO_NAME: "Ubuntu" },
+    osRelease: "6.6.0-microsoft-standard-WSL2",
+  };
+
+  const support = getWslSupport(context);
+  assert.equal(support.supported, false);
+  assert.match(support.reason, /WSLg|X server/i);
   assert.throws(
-    () => assertNativeRuntimeSupported({
-      platform: "linux",
-      env: { WSL_DISTRO_NAME: "Ubuntu" },
-      osRelease: "6.6.0",
-    }),
-    /native Windows PowerShell or CMD/i,
+    () => assertNativeRuntimeSupported(context),
+    /WSLg|X server/i,
   );
 });
 
@@ -90,6 +113,43 @@ test("findExecutableOnPath skips bundled Codex tool paths", async () => {
     }),
   });
   assert.equal(result, "/usr/local/bin/rg");
+});
+
+test("doctor report accepts WSL when Linux GUI Chrome is available", async () => {
+  const paths = {
+    appDataDir: path.join("/tmp", "wtagent-home"),
+    sessionsDir: path.join("/tmp", "wtagent-home", "sessions"),
+    profileDir: path.join("/tmp", "wtagent-home", "chrome-profile"),
+  };
+  const report = await collectDoctorReport(
+    { paths, chromePath: undefined },
+    {
+      platform: "linux",
+      arch: "x64",
+      version: "v20.17.0",
+      env: {
+        WSL_DISTRO_NAME: "Ubuntu",
+        WAYLAND_DISPLAY: "wayland-0",
+      },
+      osRelease: "6.6.0-microsoft-standard-WSL2",
+      access: async () => {},
+      stat: async () => ({ isDirectory: () => true }),
+      discoverChrome: () => "/usr/bin/google-chrome",
+      inspectProfile: async () => ({
+        status: "pass",
+        detail: "no saved CDP state",
+      }),
+      findExecutable: async () => null,
+    },
+  );
+
+  assert.equal(report.exitCode, 0);
+  assert.equal(report.items.find((item) => item.id === "host").status, "pass");
+  assert.equal(report.items.find((item) => item.id === "chrome").status, "pass");
+  assert.equal(
+    report.items.some((item) => item.id === "command-bridge"),
+    false,
+  );
 });
 
 test("doctor report distinguishes required failures, degraded checks, and optional tools", async () => {
