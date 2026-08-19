@@ -55,6 +55,34 @@ export function detectWsl({
   );
 }
 
+export function getWslSupport({
+  platform = process.platform,
+  env = process.env,
+  osRelease = os.release(),
+} = {}) {
+  if (!detectWsl({ platform, env, osRelease })) {
+    return { supported: true, preview: false, reason: null };
+  }
+
+  const display = env.WAYLAND_DISPLAY || env.DISPLAY;
+  if (!display) {
+    return {
+      supported: false,
+      preview: false,
+      reason:
+        "WSL is detected, but no Linux graphical display is available. Enable WSLg (or an X server), install Chrome/Chromium inside the WSL distribution, and retry.",
+    };
+  }
+
+  return {
+    supported: true,
+    preview: true,
+    reason:
+      `WSL is detected with ${env.WAYLAND_DISPLAY ? "Wayland" : "X11"} display support. `
+      + "WTAgent uses Chrome/Chromium installed inside the WSL distribution; Windows-host Chrome is not used.",
+  };
+}
+
 export function getNativeWindowsSupport({
   platform = process.platform,
   arch = process.arch,
@@ -100,11 +128,12 @@ export function assertNativeRuntimeSupported(context = {}) {
       `WTAgent requires Node.js 20.17.0 or newer; current runtime is ${version}.`,
     );
   }
-  if (detectWsl(context)) {
-    throw new Error(
-      "WTAgent does not support running inside WSL in v1. Launch it from native Windows PowerShell or CMD against a Windows project path.",
-    );
+
+  const wsl = getWslSupport(context);
+  if (!wsl.supported) {
+    throw new Error(wsl.reason);
   }
+
   const windows = getNativeWindowsSupport(context);
   if (!windows.supported) {
     throw new Error(windows.reason);
@@ -356,11 +385,12 @@ export async function collectDoctorReport({
 
   const isWsl = detectWsl({ platform, env, osRelease });
   if (isWsl) {
+    const wsl = getWslSupport({ platform, env, osRelease });
     add(
       "host",
       "Runtime host",
-      "fail",
-      "WSL is detected. WTAgent v1 must run from native Windows PowerShell or CMD, not from WSL.",
+      wsl.supported ? "pass" : "fail",
+      wsl.reason,
       { required: true },
     );
   } else {
