@@ -8,7 +8,9 @@ WTAgent connects GPT Web to your local project: GPT reasons in the browser while
 
 ## Quick start
 
-Requires Node.js 20.17+ and Chrome/Chromium. WTAgent supports macOS, Linux, and native Windows. WSL is not currently supported.
+Requires Node.js 20.17+ and Chrome/Chromium. WTAgent supports macOS, Linux, native Windows, and WSL with WSLg or another Linux graphical display.
+
+On WSL, install the Linux Chrome/Chromium package inside the distribution and launch WTAgent from WSL. WTAgent keeps file and command execution in the WSL environment and connects to that Linux browser over local CDP. Windows-host Chrome is not supported from WSL yet.
 
 ```bash
 npm install -g wtagent
@@ -49,7 +51,9 @@ WTAgent 将 GPT 网页聊天连接到本地项目：GPT 在浏览器中思考，
 
 ### 快速开始
 
-需要 Node.js 20.17+ 和 Chrome/Chromium。支持 macOS、Linux 和原生 Windows，暂不支持 WSL。
+需要 Node.js 20.17+ 和 Chrome/Chromium。支持 macOS、Linux、原生 Windows，以及带 WSLg 或其他 Linux 图形显示环境的 WSL。
+
+在 WSL 中使用时，需要在 WSL 发行版内部安装 Linux 版 Chrome/Chromium，并从 WSL 启动 WTAgent。文件读写和命令执行仍然发生在 WSL 环境中，WTAgent 通过本地 CDP 连接这个 Linux 浏览器。当前还不支持从 WSL 直接控制 Windows 主机上的 Chrome。
 
 ```bash
 npm install -g wtagent
