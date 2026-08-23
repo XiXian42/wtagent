@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import {
   cdata,
+  extractTrailingProse,
   parseAgentResponse,
   serializeProtocolError,
   serializeToolResult,
+  stripUiNoiseLines,
 } from "../protocol/xml-protocol.js";
 import { appendSystemReminder } from "../protocol/markers.js";
 import {
@@ -17,14 +19,18 @@ import {
   toolResultOutput,
   userMessage,
 } from "../session/canonical-transcript.js";
-import { DEFAULT_LIMITS } from "../shared/limits.js";
+import {
+  DEFAULT_LIMITS,
+  PRO_MODEL_TURN_TIMEOUT_MS,
+  isProMode,
+} from "../shared/limits.js";
 import { utf8ByteLength } from "../shared/text-budget.js";
 import {
   BrowserAdapterError,
   ProtocolError,
   ToolValidationError,
 } from "../shared/errors.js";
-import { isConnectionLostError } from "../browser/chatgpt-web-adapter.js";
+import { isConnectionLostError } from "../browser/base-web-adapter.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
 
 const EMPTY_ASSISTANT_CONTINUE_MESSAGE =
@@ -36,6 +42,12 @@ const DEAD_REQUEST_CONTINUE_MESSAGE =
   "The previous request received no reply. Continue the immediately preceding task "
   + "from the existing conversation context. Do not repeat any local tool operation "
   + "whose result is already present. Reply using the required <agent_response> XML protocol.";
+
+const GENERATION_FAILED_CONTINUE_MESSAGE =
+  "The previous reply was a provider-side generation failure (server error), not an answer. "
+  + "Retry the immediately preceding task from the existing conversation context. Do not "
+  + "repeat any local tool operation whose result is already present. Reply using the "
+  + "required <agent_response> XML protocol.";
 
 function canonicalize(value) {
   if (Array.isArray(value)) {
@@ -321,6 +333,16 @@ export class AgentRuntime {
         }
       }
     }
+    // ChatGPT Pro can think considerably longer before the first token;
+    // every other provider/mode uses the default. An explicit
+    // --model-turn-timeout-ms always wins (resolveLimits marks it). The
+    // active mode may differ from the requested one (Pro limited, fallback),
+    // so prefer the mode the conversation is actually on.
+    const modelTurnTimeoutMs = !this.limits.modelTurnTimeoutExplicit
+      && (isProMode(activeMode) || isProMode(requestedMode))
+      ? PRO_MODEL_TURN_TIMEOUT_MS
+      : this.limits.modelTurnTimeoutMs;
+
     await this.session.update({
       phase: "running",
       conversationUrl: await this.adapter.getConversationUrl(),
@@ -352,7 +374,7 @@ export class AgentRuntime {
       initialMessage = this.buildToolResultMessage(pendingToolResult, { suffix });
       initialKind = "pending_tool_result";
     } else if (resume && instruction?.trim()) {
-      // The live ChatGPT conversation already contains the bootstrap protocol
+      // The live web conversation already contains the bootstrap protocol
       // and tool catalog. A normal follow-up should be the user's message, not
       // another several-thousand-character protocol bootstrap. sendMessage()
       // still appends the short format reminder.
@@ -361,7 +383,7 @@ export class AgentRuntime {
       initialKind = "follow_up";
     } else if (resume && inPlaceRecovery) {
       // The original request/tool result is already visible in this live web
-      // conversation. Ask ChatGPT to continue without duplicating transport
+      // conversation. Ask the provider to continue without duplicating transport
       // payloads, attachments, or canonical transcript entries.
       initialMessage = EMPTY_ASSISTANT_CONTINUE_MESSAGE;
       initialKind = "empty_response_recovery";
@@ -415,7 +437,7 @@ export class AgentRuntime {
       for (;;) {
         try {
           raw = await this.adapter.waitForTurnComplete({
-            timeoutMs: this.limits.modelTurnTimeoutMs,
+            timeoutMs: modelTurnTimeoutMs,
             stableWindowMs: this.limits.modelStableWindowMs,
             emptyResponseWindowMs: this.limits.emptyAssistantWindowMs,
             deadRequestGraceMs: this.limits.deadRequestGraceMs,
@@ -451,9 +473,11 @@ export class AgentRuntime {
           }
 
           const deadRequest = error?.code === "DEAD_ASSISTANT_REQUEST";
+          const generationFailed = error?.code === "GENERATION_FAILED";
           if (
             error?.code !== "EMPTY_ASSISTANT_RESPONSE"
             && !deadRequest
+            && !generationFailed
           ) {
             throw error;
           }
@@ -474,11 +498,14 @@ export class AgentRuntime {
               retries: emptyAssistantRetries,
               assistantMessageId: emptyAssistantMessageId,
               deadRequest,
+              generationFailed,
             });
             throw new BrowserAdapterError(
               deadRequest
-                ? `ChatGPT did not respond after ${emptyAssistantRetries} continuation attempts.`
-                : `ChatGPT returned empty responses after ${emptyAssistantRetries} continuation attempts.`,
+                ? `${this.adapter.providerName} did not respond after ${emptyAssistantRetries} continuation attempts.`
+                : generationFailed
+                  ? `${this.adapter.providerName} generation kept failing after ${emptyAssistantRetries} continuation attempts.`
+                  : `${this.adapter.providerName} returned empty responses after ${emptyAssistantRetries} continuation attempts.`,
               {
                 code: "EMPTY_ASSISTANT_RETRIES_EXHAUSTED",
                 cause: error,
@@ -493,6 +520,7 @@ export class AgentRuntime {
             maxRetries: this.limits.maxEmptyAssistantRetries,
             assistantMessageId: emptyAssistantMessageId,
             deadRequest,
+            generationFailed,
           });
           // Do not resend the original request or tool result: both are already
           // present in ChatGPT's conversation. This transport-only continuation
@@ -500,12 +528,16 @@ export class AgentRuntime {
           await this.sendMessage(
             deadRequest
               ? DEAD_REQUEST_CONTINUE_MESSAGE
-              : EMPTY_ASSISTANT_CONTINUE_MESSAGE,
+              : generationFailed
+                ? GENERATION_FAILED_CONTINUE_MESSAGE
+                : EMPTY_ASSISTANT_CONTINUE_MESSAGE,
           );
           await this.emit("model.message_sent", {
             kind: deadRequest
               ? "dead_request_recovery"
-              : "empty_response_recovery",
+              : generationFailed
+                ? "generation_failed_recovery"
+                : "empty_response_recovery",
             retry: emptyAssistantRetries,
           });
         }
@@ -545,12 +577,47 @@ export class AgentRuntime {
             snippet: raw.slice(0, 200),
           });
           throw new BrowserAdapterError(
-            "ChatGPT reported a usage limit. Try a different thinking level "
-              + "(e.g. wtagent resume with --mode Pro or --mode Current), wait "
-              + "for the limit to reset, or change plans, then resume.",
+            `${this.adapter.providerName} reported a usage limit. Wait for the limit `
+              + "to reset, try a different mode on resume, or change plans, then resume.",
             { code: "USAGE_LIMIT_REACHED" },
           );
         }
+
+        // The model answered in plain prose without any <agent_response> at
+        // all. That cannot be a broken tool request (tools only exist inside a
+        // parsed envelope), so it is safe to treat the prose as the final
+        // answer: end the run and show it, instead of burning retries on a
+        // model that deliberately finished the conversation. A reply that DOES
+        // contain <agent_response but fails to parse keeps the retry path —
+        // the model tried the protocol and we must not guess its intent.
+        // A bare <tool_calls>/<invoke> reply (no envelope) is likewise a tool
+        // REQUEST, never prose: it goes to the protocol-error retry below.
+        const looksLikeToolRequest = /<tool_calls[\s>]|<tool_call[\s>]|<invoke[\s>]/i
+          .test(raw);
+        const plainAnswer = !raw.includes("<agent_response")
+          && !looksLikeToolRequest
+          ? stripUiNoiseLines(raw)
+          : "";
+        if (plainAnswer) {
+          await this.emit("protocol.plain_answer", {
+            snippet: plainAnswer.slice(0, 200),
+          });
+          await this.session.update({
+            phase: "idle",
+            lastMessage: plainAnswer,
+            pendingToolResult: null,
+          });
+          await this.session.appendTranscriptItem(assistantMessage(plainAnswer));
+          await this.emit("run.completed", {
+            message: plainAnswer,
+            plainAnswer: true,
+          });
+          return {
+            sessionId: this.session.sessionId,
+            message: plainAnswer,
+          };
+        }
+
         protocolErrors += 1;
         await this.emit("protocol.invalid", {
           message: error.message,
@@ -565,20 +632,63 @@ export class AgentRuntime {
         continue;
       }
 
+      // When the run finishes, some models (GLM especially) put their real
+      // deliverable AFTER the envelope: a short done/true stub followed by the
+      // full markdown/HTML answer. That trailing prose is pure display content
+      // (it cannot trigger a tool), so merge it into the final message instead
+      // of dropping it. Non-done turns keep the protocol message untouched.
+      let finalMessage = parsed.message;
+      let usedTrailingProse = false;
+      if (parsed.done) {
+        const trailing = extractTrailingProse(raw);
+        if (trailing) {
+          finalMessage = [parsed.message.trim(), trailing]
+            .filter(Boolean)
+            .join("\n\n");
+          usedTrailingProse = true;
+        }
+      }
+
       // Record the assistant's turn in the canonical transcript. The raw XML is
       // the web rendering; the transcript keeps the plain progress message.
-      if (parsed.message?.trim()) {
+      if (finalMessage?.trim()) {
         await this.session.appendTranscriptItem(
-          assistantMessage(parsed.message),
+          assistantMessage(finalMessage),
         );
       }
 
       if (parsed.done) {
-        if (!parsed.message.trim()) {
+        if (!finalMessage.trim()) {
           const error = new ProtocolError(
             "done=true requires a non-empty final message.",
           );
           await this.emit("protocol.invalid", { message: error.message });
+          await this.sendMessage(serializeProtocolError(error));
+          continue;
+        }
+        // Some models (DeepSeek especially) write their tool request inside
+        // the <message> of a done=true envelope instead of a <tool_call>
+        // element. Completing there would swallow the tool call and end the
+        // run with raw XML as the "answer". Treat it as a format slip: the
+        // protocol-error feedback tells the model where tool calls go, and
+        // the normal retry limit still applies.
+        if (
+          !parsed.toolCall
+          && /<tool_calls[\s>]|<tool_call[\s>]|<invoke[\s>]/i.test(finalMessage)
+        ) {
+          const error = new ProtocolError(
+            "Tool calls must use the <tool_call> element, not the <message> text.",
+          );
+          protocolErrors += 1;
+          await this.emit("protocol.invalid", {
+            message: error.message,
+            count: protocolErrors,
+          });
+          if (protocolErrors >= this.limits.maxProtocolErrors) {
+            throw new ProtocolError(
+              `Protocol failed ${protocolErrors} consecutive times: ${error.message}`,
+            );
+          }
           await this.sendMessage(serializeProtocolError(error));
           continue;
         }
@@ -588,13 +698,16 @@ export class AgentRuntime {
         // and the user's call, not a keyword heuristic.
         await this.session.update({
           phase: "idle",
-          lastMessage: parsed.message,
+          lastMessage: finalMessage,
           pendingToolResult: null,
         });
-        await this.emit("run.completed", { message: parsed.message });
+        await this.emit("run.completed", {
+          message: finalMessage,
+          usedTrailingProse,
+        });
         return {
           sessionId: this.session.sessionId,
-          message: parsed.message,
+          message: finalMessage,
         };
       }
 

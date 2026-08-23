@@ -10,7 +10,11 @@ import { createDefaultToolRegistry } from "../src/tools/default-tools.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
 import { TaskSession } from "../src/session/task-session.js";
-import { DEFAULT_LIMITS } from "../src/shared/limits.js";
+import {
+  DEFAULT_LIMITS,
+  PRO_MODEL_TURN_TIMEOUT_MS,
+  resolveLimits,
+} from "../src/shared/limits.js";
 import { BrowserAdapterError } from "../src/shared/errors.js";
 
 function assertOneTrailingReminder(message) {
@@ -911,6 +915,211 @@ test("completes done=true even when the task wording implies commands", async (t
   assert.equal(session.state.phase, "idle");
   // Only the opening message was sent: no completion-rejection was pushed back.
   assert.equal(adapter.sentMessages.length, 1);
+});
+
+test("merges the trailing markdown report into the done=true final answer", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // GLM-style reply: a short done/true stub inside the envelope, with the real
+  // deliverable (the report) rendered after it.
+  const adapter = new FakeWebModelAdapter([
+    "思考过程\nxml\n<agent_response><done>true</done><message>审查完成</message></agent_response>\n"
+      + "应用分析报告：sweep\n概述\n一个 Swift 磁盘清理工具",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Review the project.",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(
+    result.message,
+    "审查完成\n\n应用分析报告：sweep\n概述\n一个 Swift 磁盘清理工具",
+  );
+  assert.equal(session.state.phase, "idle");
+  assert.equal(
+    session.state.lastMessage,
+    result.message,
+  );
+  // The transcript records the merged message too.
+  const transcript = await session.readTranscript();
+  const assistantItems = transcript.items.filter(
+    (entry) => entry.item.type === "message" && entry.item.role === "assistant",
+  );
+  assert.match(assistantItems.at(-1).item.content[0].text, /应用分析报告/);
+  assert.equal(adapter.sentMessages.length, 1);
+});
+
+test("treats a plain non-protocol reply as the final answer instead of retrying", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // The model answers in plain prose with no <agent_response> at all. There is
+  // no envelope, so no tool could ever be involved: the runtime must end the
+  // run and show the prose instead of burning protocol-error retries.
+  const adapter = new FakeWebModelAdapter([
+    "思考过程\n跳过\n\n抱歉，我无法完成这个任务，因为项目缺少说明文件。",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Deploy the site.",
+    projectRoot,
+    mode: "Pro",
+  });
+  const events = [];
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "抱歉，我无法完成这个任务，因为项目缺少说明文件。");
+  assert.equal(session.state.phase, "idle");
+  assert.equal(session.state.lastMessage, result.message);
+  // No protocol-error was pushed back: exactly one outbound message.
+  assert.equal(adapter.sentMessages.length, 1);
+  const plainEvent = events.find((e) => e.type === "protocol.plain_answer");
+  assert.ok(plainEvent, "a protocol.plain_answer event is emitted");
+  const completed = events.find((e) => e.type === "run.completed");
+  assert.equal(completed.payload.plainAnswer, true);
+});
+
+test("a broken envelope still triggers a protocol retry (never guessed as done)", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // The reply contains <agent_response but the XML is malformed — the model
+  // tried the protocol. It must NOT be treated as a plain answer; the runtime
+  // pushes a format error back and continues (then the model finishes).
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>unclosed",
+    "<agent_response><done>true</done><message>fixed</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Hello.",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "fixed");
+  assert.equal(session.state.phase, "idle");
+  // Two sends: the opening message plus the protocol-error feedback.
+  assert.equal(adapter.sentMessages.length, 2);
+  assert.match(adapter.sentMessages[1], /protocol_error/);
+});
+
+test("a tool call written inside a done=true message is re-prompted, not swallowed", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // DeepSeek-style slip: the model puts <tool_calls><invoke> INSIDE the message
+  // of a done=true envelope. The runtime must NOT complete with raw XML as the
+  // answer; it feeds the format error back and lets the model redo it as a real
+  // tool call, which then executes and the run finishes properly.
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message><tool_calls><invoke name=\"fs.write\"><parameter name=\"path\">slip.txt</parameter><parameter name=\"content\">ok</parameter></invoke></tool_calls></message></agent_response>",
+    "<agent_response><done>false</done><message>writing now</message>"
+      + "<tool_call name=\"fs.write\"><args><path>slip.txt</path><content>ok</content></args></tool_call></agent_response>",
+    "<agent_response><done>true</done><message>done</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Write slip.txt.",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "done");
+  assert.equal(await fs.readFile(path.join(projectRoot, "slip.txt"), "utf8"), "ok");
+  assert.equal(session.state.phase, "idle");
+  // Sends: opening + protocol-error feedback + tool result.
+  assert.equal(adapter.sentMessages.length, 3);
+  assert.match(adapter.sentMessages[1], /protocol_error/);
+  assert.match(adapter.sentMessages[2], /<tool_result name="fs\.write"/);
+});
+
+test("a bare tool_calls reply without an envelope is a tool request, not a plain answer", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  // The model emits a bare Claude-style tool call with NO <agent_response>.
+  // It must NOT be displayed as a plain final answer; it is a tool request
+  // and feeds the protocol-error retry path (the model then finishes).
+  const adapter = new FakeWebModelAdapter([
+    "<tool_calls><invoke name=\"fs.write\"><parameter name=\"path\" string=\"true\">bare.txt</parameter><parameter name=\"content\" string=\"true\">ok</parameter></invoke></tool_calls>",
+    "<agent_response><done>true</done><message>done</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Write bare.txt.",
+    projectRoot,
+    mode: "Pro",
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "done");
+  assert.equal(await fs.readFile(path.join(projectRoot, "bare.txt"), "utf8"), "ok");
+  // The bare tool call was wrapped and executed, then the result was returned.
+  assert.equal(adapter.sentMessages.length, 2);
+  assert.match(adapter.sentMessages[1], /<tool_result name="fs\.write"/);
 });
 
 test("done ends the current run but the same session accepts a follow-up", async (t) => {
@@ -1822,4 +2031,116 @@ test("resume launches with the conversation URL so an existing tab can be reused
 
   await runtime.run({ resume: true, instruction: "Continue" });
   assert.equal(adapter.lastLaunchUrl, "https://chatgpt.com/c/fake");
+});
+
+test("uses the 16-minute timeout for ChatGPT Pro and 6 minutes otherwise", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const seen = [];
+  const adapter = new FakeWebModelAdapter(["<agent_response><done>true</done><message>ok</message></agent_response>"]);
+  adapter.waitForTurnComplete = async (options) => {
+    seen.push(options.timeoutMs);
+    return "<agent_response><done>true</done><message>ok</message></agent_response>";
+  };
+
+  const proSession = await TaskSession.create({
+    tasksDir,
+    task: "Pro timeout",
+    projectRoot,
+    mode: "Pro",
+  });
+  await new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session: proSession,
+    approval: async () => false,
+  }).run();
+
+  const plainSession = await TaskSession.create({
+    tasksDir,
+    task: "Default timeout",
+    projectRoot,
+    mode: null,
+  });
+  await new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session: plainSession,
+    approval: async () => false,
+  }).run();
+
+  assert.equal(seen[0], PRO_MODEL_TURN_TIMEOUT_MS);
+  assert.equal(seen[1], DEFAULT_LIMITS.modelTurnTimeoutMs);
+});
+
+test("an explicit --model-turn-timeout-ms overrides the Pro timeout", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const seen = [];
+  const adapter = new FakeWebModelAdapter(["<agent_response><done>true</done><message>ok</message></agent_response>"]);
+  adapter.waitForTurnComplete = async (options) => {
+    seen.push(options.timeoutMs);
+    return "<agent_response><done>true</done><message>ok</message></agent_response>";
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Explicit timeout",
+    projectRoot,
+    mode: "Pro",
+  });
+  await new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    limits: resolveLimits({ modelTurnTimeoutMs: "720000" }),
+  }).run();
+
+  assert.equal(seen[0], 720_000);
+});
+
+test("recovers after a provider-side generation failure", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    new BrowserAdapterError(
+      "ChatGPT generation failed (Internal Server Error).",
+      { code: "GENERATION_FAILED" },
+    ),
+    "<agent_response><done>true</done><message>Recovered after retry.</message></agent_response>",
+  ]);
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Server error recovery",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: new ToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+  });
+
+  const result = await runtime.run();
+
+  assert.equal(result.message, "Recovered after retry.");
+  assert.match(adapter.sentMessages[1], /generation failure \(server error\)/i);
+  assertOneTrailingReminder(adapter.sentMessages[1]);
 });

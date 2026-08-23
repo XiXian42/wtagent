@@ -54,8 +54,9 @@ function summarizeArgs(name, args = {}) {
 }
 
 export class Renderer {
-  constructor({ stream = process.stdout } = {}) {
+  constructor({ stream = process.stdout, providerLabel = "model" } = {}) {
     this.stream = stream;
+    this.providerLabel = providerLabel;
     this.isTTY = Boolean(stream.isTTY);
     this.spinner = null;
     this.timer = null;
@@ -263,10 +264,10 @@ export class Renderer {
         break;
       case "browser.auth_required":
         this.stopSpinner();
-        this.println(`${YELLOW}Log in to ChatGPT in the opened Chrome window…${RESET}`);
+        this.println(`${YELLOW}Log in to ${this.providerLabel} in the opened Chrome window…${RESET}`);
         break;
       case "browser.authenticated":
-        this.println(`${GREEN}ChatGPT login detected.${RESET}`);
+        this.println(`${GREEN}${this.providerLabel} login detected.${RESET}`);
         break;
       case "conversation.mode_selected": {
         const { requested, status, selectedLabel } = payload;
@@ -304,16 +305,17 @@ export class Renderer {
         this.stopSpinner();
         this.note(
           payload.deadRequest
-            ? `no reply from ChatGPT; asking it to continue (${payload.retry}/${payload.maxRetries})`
-            : `empty ChatGPT response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
+            ? `no reply from ${this.providerLabel}; asking it to continue (${payload.retry}/${payload.maxRetries})`
+            : payload.generationFailed
+              ? `${this.providerLabel} generation failed (server error); asking it to retry (${payload.retry}/${payload.maxRetries})`
+              : `empty ${this.providerLabel} response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
         );
         break;
       case "model.limit_reached":
         this.stopSpinner();
         this.note(
-          "ChatGPT usage limit reached. Try a different thinking level on resume "
-            + "(wtagent resume <session-id> --mode Pro or --mode Current), wait "
-            + "for the limit to reset, or change plans.",
+          `${this.providerLabel} usage limit reached. Wait for the limit to reset, `
+            + "try a different mode on resume, or change plans.",
         );
         break;
       case "model.progress":
@@ -324,6 +326,10 @@ export class Renderer {
         break;
       case "protocol.invalid":
         this.note(`format retry${payload.count ? ` (${payload.count})` : ""}: ${truncate(payload.message, 100)}`);
+        break;
+      case "protocol.plain_answer":
+        this.stopSpinner();
+        this.note("The model answered without the XML protocol; showing the reply as the final answer.");
         break;
       case "tool.proposed":
         this.stopSpinner();

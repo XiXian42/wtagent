@@ -1,7 +1,7 @@
 export const DEFAULT_LIMITS = Object.freeze({
   maxProtocolErrors: 3,
   maxEmptyAssistantRetries: 3,
-  modelTurnTimeoutMs: 20 * 60_000,
+  modelTurnTimeoutMs: 10 * 60_000,
   modelStableWindowMs: 1_500,
   emptyAssistantWindowMs: 10_000,
   // How long a sent message may sit with neither a reply node nor a stop
@@ -19,6 +19,15 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxSearchResults: 200,
 });
 
+// ChatGPT Pro plans can legitimately think longer than the default before the
+// first token (see the runtime's mode-aware timeout selection).
+export const PRO_MODEL_TURN_TIMEOUT_MS = 16 * 60_000;
+
+// The CLI's --model-turn-timeout-ms always wins over the mode-aware default.
+export function isProMode(mode) {
+  return String(mode ?? "") === "Pro";
+}
+
 export function resolveLimits({ modelTurnTimeoutMs } = {}) {
   if (modelTurnTimeoutMs == null || modelTurnTimeoutMs === "") {
     return DEFAULT_LIMITS;
@@ -34,5 +43,6 @@ export function resolveLimits({ modelTurnTimeoutMs } = {}) {
   return Object.freeze({
     ...DEFAULT_LIMITS,
     modelTurnTimeoutMs: parsed,
+    modelTurnTimeoutExplicit: true,
   });
 }

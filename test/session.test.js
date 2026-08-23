@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { TaskSession } from "../src/session/task-session.js";
+import { AgentSession } from "../src/session/agent-session.js";
 
 async function makeFixture(t) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-session-"));
@@ -140,3 +141,40 @@ test(
     assert.equal(first.payload.source, "wtagent");
   },
 );
+
+test("persists the provider and reloads it", async (t) => {
+  const { tasksDir, projectRoot } = await makeFixture(t);
+  const created = await AgentSession.create({
+    sessionsDir: tasksDir,
+    task: "deepseek task",
+    projectRoot,
+    provider: "deepseek",
+    mode: null,
+  });
+  assert.equal(created.state.provider, "deepseek");
+
+  const reloaded = await AgentSession.load({
+    sessionsDir: tasksDir,
+    sessionId: created.sessionId,
+  });
+  assert.equal(reloaded.state.provider, "deepseek");
+});
+
+test("defaults the provider to chatgpt for pre-provider sessions", async (t) => {
+  const { tasksDir, projectRoot } = await makeFixture(t);
+  const created = await AgentSession.create({
+    sessionsDir: tasksDir,
+    task: "legacy task",
+    projectRoot,
+    mode: null,
+  });
+  // Simulate a session saved before the provider field existed.
+  delete created.state.provider;
+  await created.save();
+
+  const reloaded = await AgentSession.load({
+    sessionsDir: tasksDir,
+    sessionId: created.sessionId,
+  });
+  assert.equal(reloaded.state.provider, "chatgpt");
+});

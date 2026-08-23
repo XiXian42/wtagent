@@ -63,24 +63,185 @@ function escapeBareAmpersands(text) {
   return out;
 }
 
+function closeDanglingToolCall(envelope) {
+  const open = (envelope.match(/<tool_call(?:\s|>)/gi) ?? []).length;
+  const close = (envelope.match(/<\/tool_call>/gi) ?? []).length;
+  if (open !== close + 1) {
+    return envelope;
+  }
+  return envelope.replace(
+    /(<\/args>\s*)(<\/agent_response>\s*)$/i,
+    "$1</tool_call>\n$2",
+  );
+}
+
+function wrapBareToolCall(text) {
+  const start = text.search(/<tool_call(?:\s|>)/i);
+  const endTag = "</tool_call>";
+  const end = start < 0 ? -1 : text.indexOf(endTag, start);
+  if (start >= 0 && end >= start) {
+    const toolCall = text.slice(start, end + endTag.length);
+    if (/<args[\s>/]/i.test(toolCall)) {
+      return [
+        "<agent_response>",
+        "  <done>false</done>",
+        "  <message></message>",
+        `  ${toolCall}`,
+        "</agent_response>",
+      ].join("\n");
+    }
+  }
+  return wrapClaudeStyleInvoke(text);
+}
+
+// DeepSeek (and some others) occasionally emit Claude-style tool XML:
+//   <tool_calls><invoke name="fs.read"><parameter name="path">README.md</parameter></invoke></tool_calls>
+// and sometimes annotate parameters with attributes, e.g.
+//   <parameter name="program" string="true">npm</parameter>
+//   <parameter name="argv" string="false">["test"]</parameter>
+// Map a single complete invoke onto our envelope so the turn can proceed
+// instead of hanging or burning a format retry.
+function wrapClaudeStyleInvoke(text) {
+  const invoke = /<invoke\s+name="([A-Za-z0-9_.-]+)"(?:\s[^>]*)?>([\s\S]*?)<\/invoke>/i.exec(text);
+  if (!invoke) {
+    return null;
+  }
+  const name = invoke[1];
+  const body = invoke[2];
+  const args = [];
+  const paramRe = /<parameter\s+name="([A-Za-z0-9_.-]+)"(?:\s[^>]*)?>([\s\S]*?)<\/parameter>/gi;
+  for (const match of body.matchAll(paramRe)) {
+    const key = match[1];
+    const value = String(match[2] ?? "").trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key)) {
+      return null;
+    }
+    args.push(`<${key}>${value}</${key}>`);
+  }
+  if (args.length === 0) {
+    return null;
+  }
+  return [
+    "<agent_response>",
+    "  <done>false</done>",
+    "  <message></message>",
+    `  <tool_call name="${name}">`,
+    `    <args>${args.join("")}</args>`,
+    "  </tool_call>",
+    "</agent_response>",
+  ].join("\n");
+}
+
 function extractEnvelope(text) {
   const cleaned = stripSingleCodeFence(text);
   const start = cleaned.indexOf("<agent_response");
   const endTag = "</agent_response>";
-  const end = cleaned.lastIndexOf(endTag);
+  const end = start < 0 ? -1 : cleaned.indexOf(endTag, start);
 
-  if (start < 0 || end < 0 || end < start) {
+  if (start < 0 || end < 0) {
+    const wrapped = wrapBareToolCall(cleaned);
+    if (wrapped) {
+      return wrapped;
+    }
     throw new ProtocolError(
       "Response must contain one complete <agent_response> envelope.",
       { details: { raw: cleaned } },
     );
   }
 
-  // ChatGPT Web may prepend a preamble (e.g. "Sure, here is the response:")
-  // or append trailing text / render rich cards around the XML. We only care
-  // about the envelope itself, so surrounding text is stripped instead of
-  // being treated as a protocol violation.
+  // Take the first complete envelope only. Web UIs (especially Kimi) often
+  // render the same reply twice — a code-fence copy plus the visible markdown
+  // — so first-open + last-close would glue two envelopes together and fail
+  // with "Extra text at the end". Trailing chatter after that first envelope
+  // is ignored the same way a preamble before it is.
   return cleaned.slice(start, end + endTag.length);
+}
+
+// Web-UIs render provider chrome into the assistant text: thinking-block
+// headers, code-fence language banners, and code-block action button labels.
+// These tokens are UI noise, never model content, but only when they appear as
+// standalone leading lines — a report may legitimately contain the word "运行"
+// inside its prose, so we only strip complete noise lines at the start.
+const UI_NOISE_TOKENS = new Set([
+  // 中文
+  "思考过程",
+  "正在思考",
+  "思考已完成",
+  "思考完成",
+  "跳过",
+  "复制",
+  "复制代码",
+  "下载",
+  "运行",
+  // English
+  "thinking",
+  "thinking process",
+  "reasoning",
+  "skip",
+  "copy",
+  "copy code",
+  "download",
+  "run",
+  // 日本語
+  "考え中",
+  "検討中",
+  "スキップ",
+  "コピー",
+  "コードをコピー",
+  "ダウンロード",
+  "実行",
+  // 한국어
+  "생각 중",
+  "복사",
+  "코드 복사",
+  "다운로드",
+  "실행",
+  "건너뛰기",
+  // Language banner on rendered code blocks (locale-independent).
+  "xml",
+]);
+
+export function stripUiNoiseLines(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim());
+  while (
+    lines.length
+    && (
+      lines[0] === ""
+      || UI_NOISE_TOKENS.has(lines[0])
+      || UI_NOISE_TOKENS.has(lines[0].toLowerCase())
+    )
+  ) {
+    lines.shift();
+  }
+  return lines.join("\n").trim();
+}
+
+// Returns the substantive prose that follows the first complete
+// <agent_response> envelope, or null when there is none.
+//
+// Some models (GLM especially) put their REAL deliverable after the envelope:
+// the XML carries only a short done/true stub and the full answer is rendered
+// as ordinary markdown/HTML text right after it. That text is pure display
+// content — it can never trigger a tool call — so the runtime may surface it
+// as the final answer instead of dropping it.
+//
+// Defensive rule: if the trailing text contains another <agent_response (some
+// UIs render the reply twice, a code-fence copy plus the visible copy), we
+// cannot cleanly separate real content from the duplicated XML, so return null
+// and let the caller keep the envelope's own message.
+export function extractTrailingProse(rawText) {
+  const text = String(rawText ?? "");
+  const endTag = "</agent_response>";
+  const end = text.indexOf(endTag);
+  if (end < 0) {
+    return null;
+  }
+  const trailing = text.slice(end + endTag.length);
+  if (trailing.includes("<agent_response")) {
+    return null;
+  }
+  const withoutFenceCloser = trailing.replace(/\n*```\s*$/, "");
+  return stripUiNoiseLines(withoutFenceCloser) || null;
 }
 
 function normalizeXmlValue(value) {
@@ -206,10 +367,13 @@ export function parseAgentResponse(rawText) {
     throw new ProtocolError("DTD and XML entities are not allowed.");
   }
 
-  // Repair the single most common corruption first: bare ampersands the model
-  // wrote outside CDATA. This is done before validation so an otherwise
-  // well-formed envelope with a stray "&" parses instead of triggering a retry.
-  const envelope = escapeBareAmpersands(rawEnvelope);
+  // Repair the most common, meaning-preserving corruptions before validation:
+  // 1. bare ampersands the model wrote outside CDATA
+  // 2. a missing </tool_call> immediately before </agent_response>
+  // GLM in particular often streams a complete <tool_call>…</args> and then
+  // closes the envelope without the matching </tool_call>. Inserting that one
+  // tag is safe: we never invent arguments, only finish an already-complete call.
+  const envelope = closeDanglingToolCall(escapeBareAmpersands(rawEnvelope));
 
   const validation = XMLValidator.validate(envelope);
   if (validation !== true) {
@@ -401,9 +565,27 @@ export function serializeToolResult(result, { maxBytes = Infinity } = {}) {
 }
 
 export function serializeProtocolError(error) {
+  // Structural XML failures need more than the raw parser message. The two
+  // recurring causes: (a) raw code placed directly inside the envelope — bare
+  // < or & outside CDATA is illegal XML (the parser reports things like
+  // "Invalid space after '<'"); (b) a reply cut off before </agent_response>,
+  // so nothing in it was executed. Tell the model exactly how to fix both.
+  const message = String(error?.message ?? "");
+  const structural = /complete <agent_response> envelope|closing tag|invalid xml|space after '<'/i.test(message);
+  const guidance = structural
+    ? cdata(
+      "Wrap ALL code and file content in CDATA (<![CDATA[...]]>) inside "
+        + "<content>, <new_text>, or <message>. Never put raw code directly "
+        + "inside the envelope: XML forbids a bare < or & in text. Split large "
+        + "changes into SMALL fs.edit calls (each new_text at most ~30 lines) "
+        + "and close the envelope with </agent_response> immediately after "
+        + "the last tool_call. Never leave the envelope open.",
+    )
+    : "";
   return [
     "<protocol_error>",
-    cdata(error.message),
+    cdata(message),
+    guidance,
     "</protocol_error>",
   ].join("");
 }

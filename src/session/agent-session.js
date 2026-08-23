@@ -155,7 +155,7 @@ export class AgentSession {
     this.stateFileName = stateFileName;
   }
 
-  static async create({ sessionsDir, tasksDir, task, projectRoot, mode }) {
+  static async create({ sessionsDir, tasksDir, task, projectRoot, mode, provider = "chatgpt" }) {
     const root = await ensureSessionsRoot(sessionsDir ?? tasksDir);
     const sessionId = `session_${new Date().toISOString().replaceAll(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
     const directory = path.join(root, sessionId);
@@ -167,6 +167,7 @@ export class AgentSession {
       sessionId,
       task,
       projectRoot: path.resolve(projectRoot),
+      provider,
       mode,
       phase: "idle",
       turn: 0,
@@ -197,6 +198,7 @@ export class AgentSession {
     await session.appendEvent("session.created", {
       task,
       projectRoot: state.projectRoot,
+      provider,
       mode,
     });
     return session;
@@ -237,6 +239,7 @@ export class AgentSession {
     state.phase ??= ["completed", "paused"].includes(state.status)
       ? "idle"
       : (state.status ?? "idle");
+    state.provider ??= "chatgpt";
     state.runCount ??= 0;
     state.lastAssistantMessageId ??= null;
     state.activeMode ??= null;

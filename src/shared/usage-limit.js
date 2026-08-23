@@ -1,8 +1,8 @@
-// ChatGPT renders plan/usage limit notices as ordinary assistant messages,
+// Web providers render plan/usage limit notices as ordinary assistant messages,
 // localized per UI language. Matching one means "stop, not retry". Text
 // patterns are the primary signal (a limit notice always says something
 // recognizable); callers may additionally confirm via DOM features (e.g. the
-// retry/upgrade button ChatGPT shows on the notice) to guard against protocol
+// retry/upgrade button shown on the notice) to guard against protocol
 // replies that merely mention "limit" in their content.
 const USAGE_LIMIT_PATTERNS = [
   /reached (?:your )?(?:current )?(?:usage |plan )?limit/i,

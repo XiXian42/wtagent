@@ -23,7 +23,7 @@ function firstTimestamp(items, fallback) {
   return items.find((item) => item.timestamp)?.timestamp ?? fallback;
 }
 
-// The uploaded bytes of an @file attachment live only in the ChatGPT
+// The uploaded bytes of an @file attachment live only in the web provider
 // conversation, not in the portable transcript. So exports append a short,
 // self-describing note naming the attached files, keeping the exported session
 // honest about what the user actually provided.
@@ -70,7 +70,7 @@ export function toCodexRollout(transcript, { now } = {}) {
   for (const entry of items) {
     const item = entry.item;
     if (isDeveloper(item)) {
-      // This is the XML/tool transport scaffold used only on ChatGPT Web.
+      // This is the XML/tool transport scaffold used only by the web provider.
       continue;
     }
 

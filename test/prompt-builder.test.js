@@ -44,6 +44,8 @@ test("bootstrap prompt defines current-run done semantics", () => {
     /run the appropriate verification \(build, tests, etc\.\) before finishing/,
   );
   assert.match(web, /The user is running WTAgent/);
+  assert.match(web, /web AI conversation/);
+  assert.doesNotMatch(web, /ChatGPT/);
   assert.doesNotMatch(web, /\bwebagent\b/i);
 });
 

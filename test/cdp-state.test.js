@@ -181,8 +181,14 @@ test("profile lock rejects a second live WTAgent session", async (t) => {
   t.after(release);
 
   await assert.rejects(
-    acquireCdpProfileLock(profileDir),
-    /Another WTAgent session/,
+    // The holder started long before the lock was written, so the live pid is
+    // accepted as the real owner and the lock is kept.
+    acquireCdpProfileLock(profileDir, {
+      processStartTime: async () => 0,
+    }),
+    (error) =>
+      error.code === "PROFILE_LOCKED"
+      && /Another WTAgent session/.test(error.message),
   );
 });
 
@@ -195,6 +201,29 @@ test("profile lock recovers after a dead owner", async (t) => {
   );
 
   const release = await acquireCdpProfileLock(profileDir);
+  await release();
+
+  await assert.rejects(fs.stat(lockFile), { code: "ENOENT" });
+});
+
+test("profile lock recovers when the owner pid was recycled", async (t) => {
+  const profileDir = await createProfile(t);
+  const lockFile = path.join(profileDir, ".wtagent-session.lock");
+  await fs.writeFile(
+    lockFile,
+    JSON.stringify({
+      pid: 4_242,
+      token: "stale",
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+    }),
+  );
+
+  // The pid is now alive again (recycled by an unrelated process) but that
+  // process started AFTER the lock was written, so it cannot own the lock.
+  const release = await acquireCdpProfileLock(profileDir, {
+    isAlive: () => true,
+    processStartTime: async () => Date.now() - 10_000,
+  });
   await release();
 
   await assert.rejects(fs.stat(lockFile), { code: "ENOENT" });

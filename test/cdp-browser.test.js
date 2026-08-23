@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { launchAndConnectCdpChrome } from "../src/browser/cdp-browser.js";
+import {
+  ensureCdpPageTarget,
+  launchAndConnectCdpChrome,
+} from "../src/browser/cdp-browser.js";
 
 function reusableState() {
   return {
@@ -57,6 +60,7 @@ function fakeBrowserHarness({
 
 function reusableDependencies(harness, {
   discoverReusable,
+  ensurePageTarget = async () => false,
   spawnChrome = () => {
     throw new Error("Chrome should not be spawned");
   },
@@ -70,6 +74,7 @@ function reusableDependencies(harness, {
       },
       connectOverCDP: async () => harness.browser,
       discoverReusable,
+      ensurePageTarget,
       fetchVersion: async () => ({
         webSocketDebuggerUrl:
           "ws://127.0.0.1:9333/devtools/browser/reused",
@@ -90,6 +95,81 @@ function reusableDependencies(harness, {
     },
   };
 }
+
+test("creates a blank CDP page target when a reused Chrome has no windows", async () => {
+  const calls = [];
+  const created = await ensureCdpPageTarget("http://127.0.0.1:9333", {
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, method: options.method ?? "GET" });
+      if (url.endsWith("/json/list")) {
+        return { ok: true, async json() { return []; } };
+      }
+      return {
+        ok: true,
+        async json() {
+          return {
+            type: "page",
+            webSocketDebuggerUrl: "ws://127.0.0.1:9333/devtools/page/new",
+          };
+        },
+      };
+    },
+  });
+
+  assert.equal(created, true);
+  assert.deepEqual(calls, [
+    { url: "http://127.0.0.1:9333/json/list", method: "GET" },
+    {
+      url: "http://127.0.0.1:9333/json/new?about%3Ablank",
+      method: "PUT",
+    },
+  ]);
+});
+
+test("keeps existing CDP page targets untouched", async () => {
+  let requests = 0;
+  const created = await ensureCdpPageTarget("http://127.0.0.1:9333", {
+    fetchImpl: async () => {
+      requests += 1;
+      return {
+        ok: true,
+        async json() {
+          return [{ type: "page", url: "https://gemini.google.com/app" }];
+        },
+      };
+    },
+  });
+
+  assert.equal(created, false);
+  assert.equal(requests, 1);
+});
+
+test("repairs a no-window reused Chrome before Playwright connects", async () => {
+  const harness = fakeBrowserHarness({ existingPages: [] });
+  const state = reusableState();
+  const order = [];
+  const controls = reusableDependencies(harness, {
+    discoverReusable: async () => state,
+    ensurePageTarget: async (endpoint) => {
+      assert.equal(endpoint, state.endpoint);
+      order.push("ensure-page");
+      return true;
+    },
+  });
+  controls.dependencies.connectOverCDP = async () => {
+    order.push("connect");
+    return harness.browser;
+  };
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+  }, controls.dependencies);
+
+  assert.deepEqual(order, ["ensure-page", "connect"]);
+  assert.equal(connection.page, harness.freshPage);
+  await connection.close();
+});
 
 test("reuses a healthy CDP browser and creates a fresh page", async () => {
   const harness = fakeBrowserHarness();
@@ -307,6 +387,26 @@ test("disconnect drops only the transport and leaves Chrome untouched", async ()
   assert.equal(harness.closeCommandSent, false);
   assert.equal(controls.stateRemoved, false);
   assert.equal(controls.released, false);
+});
+
+test("detach drops the transport and lock but leaves Chrome reusable", async () => {
+  const harness = fakeBrowserHarness();
+  const state = reusableState();
+  const controls = reusableDependencies(harness, {
+    discoverReusable: async () => state,
+  });
+
+  const connection = await launchAndConnectCdpChrome({
+    executablePath: "/fake/chrome",
+    profileDir: state.profileDir,
+  }, controls.dependencies);
+
+  await connection.detach();
+
+  assert.equal(harness.transportClosed, true);
+  assert.equal(harness.closeCommandSent, false);
+  assert.equal(controls.stateRemoved, false);
+  assert.equal(controls.released, true);
 });
 
 test("reused browser prefers an existing tab on the preferred conversation", async () => {

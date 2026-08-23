@@ -541,9 +541,38 @@ export async function inspectCdpProfileState(profileDir, {
   };
 }
 
+// The instant a process was started, in epoch milliseconds. Used to tell a
+// live lock-holder pid from a recycled one: a process that started after the
+// lock file was written cannot own it. Returns null when it cannot be
+// determined (unknown process, platform tool unavailable).
+async function processStartTimeMs(pid, { execFileImpl = execFileAsync } = {}) {
+  if (process.platform === "win32") {
+    const { stdout } = await execFileImpl(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`,
+      ],
+      { windowsHide: true },
+    );
+    const parsed = Date.parse(String(stdout).trim());
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const { stdout } = await execFileImpl(
+    "ps",
+    ["-p", String(pid), "-o", "etimes="],
+  );
+  const seconds = Number.parseInt(String(stdout), 10);
+  return Number.isFinite(seconds) ? Date.now() - seconds * 1_000 : null;
+}
+
 export async function acquireCdpProfileLock(profileDir, {
   ownerPid = process.pid,
   isAlive = isProcessAlive,
+  processStartTime = processStartTimeMs,
 } = {}) {
   const resolvedProfile = path.resolve(profileDir);
   const filePath = lockPath(resolvedProfile);
@@ -581,10 +610,29 @@ export async function acquireCdpProfileLock(profileDir, {
       }
       const existing = await readInitializedLock(filePath);
       if (existing && isAlive(Number(existing.pid))) {
-        throw new Error(
-          `Another WTAgent session (pid=${existing.pid}) is already using `
-          + `${resolvedProfile}.`,
-        );
+        // A live pid usually IS the real holder, but a crashed session's pid
+        // can be recycled by an unrelated process. A process that started
+        // after the lock was written cannot own it, so the lock is stale and
+        // may be removed. When the start time is unknown, assume the holder is
+        // real rather than deleting a lock we cannot verify is stale.
+        const startedAt = await processStartTime(Number(existing.pid))
+          .catch(() => null);
+        const lockCreatedAt = Date.parse(existing.createdAt ?? "");
+        const recycled = Number.isFinite(lockCreatedAt)
+          && startedAt != null
+          && startedAt > lockCreatedAt + 2_000;
+        if (!recycled) {
+          const error = new Error(
+            `Another WTAgent session (pid=${existing.pid}) is already using `
+            + `${resolvedProfile}.`,
+          );
+          error.code = "PROFILE_LOCKED";
+          error.details = {
+            pid: Number(existing.pid),
+            profileDir: resolvedProfile,
+          };
+          throw error;
+        }
       }
       if (!existing) {
         const stat = await fs.stat(filePath).catch(() => null);

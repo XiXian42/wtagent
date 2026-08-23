@@ -59,7 +59,7 @@ test("keeps non-lifecycle events visible on later turns", () => {
 
 test("renders bounded empty-response recovery and preserved-session guidance", () => {
   const stream = captureStream();
-  const renderer = new Renderer({ stream });
+  const renderer = new Renderer({ stream, providerLabel: "GLM" });
 
   renderer.handle({
     type: "model.empty_response",
@@ -68,10 +68,11 @@ test("renders bounded empty-response recovery and preserved-session guidance", (
   renderer.handle({
     type: "run.recovery_required",
     payload: {
-      message: "ChatGPT returned empty responses after 3 continuation attempts.",
+      message: "GLM returned empty responses after 3 continuation attempts.",
     },
   });
 
-  assert.match(stream.output(), /asking it to continue \(2\/3\)/);
+  assert.match(stream.output(), /empty GLM response; asking it to continue \(2\/3\)/);
+  assert.doesNotMatch(stream.output(), /ChatGPT/);
   assert.match(stream.output(), /session and Chrome window remain open/i);
 });

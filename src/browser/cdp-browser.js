@@ -108,6 +108,55 @@ async function waitForCdp({
   );
 }
 
+// A headful Chrome process can stay alive in background mode after its final
+// window is closed. Its browser CDP endpoint remains healthy, but recent
+// Playwright versions cannot initialize the default context when Chrome has no
+// page target (`Browser.setDownloadBehavior`: context management unsupported).
+// Recreate one blank tab through Chrome's own local debugging endpoint before
+// connecting. Existing tabs and conversations are left untouched.
+export async function ensureCdpPageTarget(
+  endpoint,
+  { fetchImpl = fetch, timeoutMs = 1_500 } = {},
+) {
+  let targets;
+  try {
+    const response = await fetchImpl(`${endpoint}/json/list`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      return false;
+    }
+    targets = await response.json();
+  } catch {
+    // This preflight is compatibility hardening. If the optional discovery
+    // endpoint is unavailable, preserve the normal Playwright connect path and
+    // let it report the authoritative CDP error.
+    return false;
+  }
+
+  if (!Array.isArray(targets) || targets.some((target) => target?.type === "page")) {
+    return false;
+  }
+
+  const response = await fetchImpl(
+    `${endpoint}/json/new?${encodeURIComponent("about:blank")}`,
+    { method: "PUT", signal: AbortSignal.timeout(timeoutMs) },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Chrome CDP at ${endpoint} has no page target and could not create one `
+        + `(HTTP ${response.status}).`,
+    );
+  }
+  const target = await response.json();
+  if (target?.type !== "page" || !target?.webSocketDebuggerUrl) {
+    throw new Error(
+      `Chrome CDP at ${endpoint} returned an invalid new-page target.`,
+    );
+  }
+  return true;
+}
+
 // Sets the OS window state (e.g. "minimized" / "normal") of the window hosting
 // `page` via the CDP Browser domain. On macOS the Chromium launch flags for
 // minimizing (--start-minimized) and off-screen positioning are ignored or
@@ -153,6 +202,7 @@ export async function launchAndConnectCdpChrome({
   acquireProfileLock = acquireCdpProfileLock,
   connectOverCDP = (endpoint) => chromium.connectOverCDP(endpoint),
   discoverReusable = discoverReusableCdpState,
+  ensurePageTarget = ensureCdpPageTarget,
   fetchVersion = fetchCdpVersion,
   killTree = killProcessTree,
   matchesState = processMatchesCdpState,
@@ -244,6 +294,9 @@ export async function launchAndConnectCdpChrome({
     // without this guard Playwright hangs ~30s and leaves a dirty CDP state.
     let context;
     try {
+      if (reused) {
+        await ensurePageTarget(state.endpoint);
+      }
       browser = await withTimeout(
         connectOverCDP(state.endpoint),
         connectTimeoutMs,
@@ -318,8 +371,17 @@ export async function launchAndConnectCdpChrome({
       // Drops only the Playwright transport. Unlike close(), never asks Chrome
       // to exit and never kills the process: used to recover from a dead CDP
       // connection (e.g. after the Mac slept) while Chrome itself is alive.
+      // The profile lock stays held because the same CLI session will reconnect.
       async disconnect() {
         await settleWithin(browser.close(), 1_500);
+      },
+      // Leaves Chrome running (and its saved CDP state intact) but drops the
+      // Playwright transport and the profile lock so a later WTAgent process
+      // can reuse the window. Used after a failed run that wants the page
+      // left open for inspection without blocking the next launch.
+      async detach() {
+        await settleWithin(browser.close(), 1_500);
+        await releaseProfileLock();
       },
       async close() {
         if (closePromise) {

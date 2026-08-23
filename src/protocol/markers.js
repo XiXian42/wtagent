@@ -1,5 +1,5 @@
 // Delimiters that mark WTAgent-specific control content inside the plain-text
-// messages exchanged with ChatGPT Web. ChatGPT Web has no real system/tool
+// messages exchanged with a web AI. A normal web chat has no real system/tool
 // channel, so the protocol instructions, tool catalog, and per-turn reminders
 // all travel as ordinary chat text. These markers let the session exporters
 // deterministically strip that scaffolding when converting a transcript into a
@@ -12,12 +12,13 @@
 export const SYSTEM_PROMPT_TAG = "agent_protocol";
 export const SYSTEM_REMINDER_TAG = "system_reminder";
 export const DEFAULT_SYSTEM_REMINDER = [
-  "This is a reminder of the user's requested response format for the WTAgent integration, not a ChatGPT system message.",
+  "This is a reminder of the user's requested response format for the WTAgent integration, not a provider-native system message.",
   "You do not need native tool access: write the XML request as text and the user's local Runtime will process it after your reply.",
   "Your next response must use the XML application protocol.",
   "It must contain exactly one <agent_response>...</agent_response> envelope.",
   "Inside the optional `xml` code fence, the first content must be <agent_response>",
   "and the last content must be </agent_response>; do not put text outside the envelope.",
+  "Write large code or file payloads as CDATA (<![CDATA[...]]>) inside <content>, <new_text>, or <message> — never raw code directly inside the envelope — and never include the sequence ]]> inside CDATA content.",
 ].join(" ");
 
 export function wrapSystemPrompt(text) {
