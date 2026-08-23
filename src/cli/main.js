@@ -208,7 +208,14 @@ async function runDoctor(options) {
   }
   console.log(`Data: ${paths.appDataDir}`);
   console.log(`Profile: ${paths.profileDir}`);
-  console.log(report.exitCode === 0 ? "Doctor: OK" : "Doctor: FAILED");
+  const hasWarnings = report.items.some((item) => item.status === "degraded");
+  console.log(
+    report.exitCode !== 0
+      ? "Doctor: FAILED"
+      : hasWarnings
+        ? "Doctor: OK (with warnings)"
+        : "Doctor: OK",
+  );
   process.exitCode = report.exitCode;
 }
 

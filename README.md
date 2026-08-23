@@ -8,9 +8,9 @@ WTAgent connects ChatGPT, Claude, DeepSeek, Gemini, Kimi, or GLM Web to your loc
 
 ## Quick start
 
-Requires Node.js 20.17+ and Chrome/Chromium. WTAgent supports macOS, Linux, native Windows, and WSL with WSLg or another Linux graphical display.
+Requires Node.js 20.17+ and Chrome/Chromium. WTAgent supports macOS, Linux, native Windows, and preview support for WSL2 with WSLg. WSL1 and external X11 configurations are best effort.
 
-On WSL, install the Linux Chrome/Chromium package inside the distribution and launch WTAgent from WSL. WTAgent keeps file and command execution in the WSL environment and connects to that Linux browser over local CDP. Windows-host Chrome is not supported from WSL yet.
+On WSL, install the Linux Chrome/Chromium package inside the distribution and launch WTAgent from WSL. WTAgent keeps file and command execution in the WSL environment and connects to that Linux browser over local CDP. Display environment variables are only configuration hints; actual GUI availability is confirmed when Chrome starts. Windows-host Chrome is not supported from WSL yet.
 
 ```bash
 npm install -g wtagent
@@ -61,9 +61,9 @@ WTAgent 将 ChatGPT、Claude、DeepSeek、Gemini、Kimi 或 GLM 网页聊天连�
 
 ### 快速开始
 
-需要 Node.js 20.17+ 和 Chrome/Chromium。支持 macOS、Linux、原生 Windows，以及带 WSLg 或其他 Linux 图形显示环境的 WSL。
+需要 Node.js 20.17+ 和 Chrome/Chromium。支持 macOS、Linux、原生 Windows，以及预览支持带 WSLg 的 WSL2。WSL1 和外部 X11 配置仅按尽力支持处理。
 
-在 WSL 中使用时，需要在 WSL 发行版内部安装 Linux 版 Chrome/Chromium，并从 WSL 启动 WTAgent。文件读写和命令执行仍然发生在 WSL 环境中，WTAgent 通过本地 CDP 连接这个 Linux 浏览器。当前还不支持从 WSL 直接控制 Windows 主机上的 Chrome。
+在 WSL 中使用时，需要在 WSL 发行版内部安装 Linux 版 Chrome/Chromium，并从 WSL 启动 WTAgent。文件读写和命令执行仍然发生在 WSL 环境中，WTAgent 通过本地 CDP 连接这个 Linux 浏览器。图形环境变量仅表示已配置，实际可用性会在 Chrome 启动时确认。当前还不支持从 WSL 直接控制 Windows 主机上的 Chrome。
 
 ```bash
 npm install -g wtagent

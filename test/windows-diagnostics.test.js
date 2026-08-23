@@ -35,7 +35,7 @@ test("detects WSL from environment and kernel release", () => {
   }), false);
 });
 
-test("WSL runtime is supported with a Linux graphical display", () => {
+test("WSL runtime is allowed when a Linux graphical display is configured", () => {
   const context = {
     platform: "linux",
     env: {
@@ -48,8 +48,24 @@ test("WSL runtime is supported with a Linux graphical display", () => {
   const support = getWslSupport(context);
   assert.equal(support.supported, true);
   assert.equal(support.preview, true);
-  assert.match(support.reason, /inside the WSL distribution/i);
+  assert.match(support.reason, /does not verify that the display is reachable/i);
   assert.doesNotThrow(() => assertNativeRuntimeSupported(context));
+});
+
+test("WSL display variables are treated as unverified configuration hints", () => {
+  const support = getWslSupport({
+    platform: "linux",
+    env: {
+      WSL_DISTRO_NAME: "Ubuntu",
+      DISPLAY: ":99",
+    },
+    osRelease: "6.6.0-microsoft-standard-WSL2",
+  });
+
+  assert.equal(support.supported, true);
+  assert.equal(support.preview, true);
+  assert.match(support.reason, /preview check/i);
+  assert.match(support.reason, /only when Linux Chrome starts/i);
 });
 
 test("WSL runtime requires WSLg or another Linux graphical display", () => {
@@ -115,7 +131,7 @@ test("findExecutableOnPath skips bundled Codex tool paths", async () => {
   assert.equal(result, "/usr/local/bin/rg");
 });
 
-test("doctor report accepts WSL when Linux GUI Chrome is available", async () => {
+test("doctor report marks configured WSL GUI support as an unverified preview", async () => {
   const paths = {
     appDataDir: path.join("/tmp", "wtagent-home"),
     sessionsDir: path.join("/tmp", "wtagent-home", "sessions"),
@@ -144,7 +160,7 @@ test("doctor report accepts WSL when Linux GUI Chrome is available", async () =>
   );
 
   assert.equal(report.exitCode, 0);
-  assert.equal(report.items.find((item) => item.id === "host").status, "pass");
+  assert.equal(report.items.find((item) => item.id === "host").status, "degraded");
   assert.equal(report.items.find((item) => item.id === "chrome").status, "pass");
   assert.equal(
     report.items.some((item) => item.id === "command-bridge"),

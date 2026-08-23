@@ -70,7 +70,7 @@ export function getWslSupport({
       supported: false,
       preview: false,
       reason:
-        "WSL is detected, but no Linux graphical display is available. Enable WSLg (or an X server), install Chrome/Chromium inside the WSL distribution, and retry.",
+        "WSL is detected, but no Linux graphical display is configured. Enable WSLg (or an X server), install Chrome/Chromium inside the WSL distribution, and retry.",
     };
   }
 
@@ -78,8 +78,9 @@ export function getWslSupport({
     supported: true,
     preview: true,
     reason:
-      `WSL is detected with ${env.WAYLAND_DISPLAY ? "Wayland" : "X11"} display support. `
-      + "WTAgent uses Chrome/Chromium installed inside the WSL distribution; Windows-host Chrome is not used.",
+      `WSL is detected with a ${env.WAYLAND_DISPLAY ? "Wayland" : "X11"} display environment configured. `
+      + "This preview check does not verify that the display is reachable; WTAgent confirms that only when Linux Chrome starts. "
+      + "Windows-host Chrome is not used.",
   };
 }
 
@@ -389,7 +390,7 @@ export async function collectDoctorReport({
     add(
       "host",
       "Runtime host",
-      wsl.supported ? "pass" : "fail",
+      wsl.supported ? (wsl.preview ? "degraded" : "pass") : "fail",
       wsl.reason,
       { required: true },
     );
