@@ -17,9 +17,13 @@ test("package exposes only the wtagent executable", async () => {
   const manifest = JSON.parse(
     await fs.readFile(path.join(repositoryRoot, "package.json"), "utf8"),
   );
+  const lockfile = JSON.parse(
+    await fs.readFile(path.join(repositoryRoot, "package-lock.json"), "utf8"),
+  );
 
   assert.equal(manifest.name, "wtagent");
-  assert.equal(manifest.version, "0.2.0");
+  assert.equal(lockfile.version, manifest.version);
+  assert.equal(lockfile.packages[""].version, manifest.version);
   assert.deepEqual(manifest.bin, {
     wtagent: "src/cli/main.js",
   });
@@ -27,6 +31,9 @@ test("package exposes only the wtagent executable", async () => {
 
 test("CLI help and version use the WTAgent package identity", async () => {
   const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const manifest = JSON.parse(
+    await fs.readFile(path.join(repositoryRoot, "package.json"), "utf8"),
+  );
   const [{ stdout: help }, { stdout: version }] = await Promise.all([
     execFileAsync(process.execPath, [entry, "--help"]),
     execFileAsync(process.execPath, [entry, "--version"]),
@@ -38,7 +45,7 @@ test("CLI help and version use the WTAgent package identity", async () => {
   assert.match(help, /-C, --project <path>/);
   assert.match(help, /^\s+update\s+/m);
   assert.doesNotMatch(help, /^\s+run(?:\s|$)/m);
-  assert.equal(version.trim(), "0.2.0");
+  assert.equal(version.trim(), manifest.version);
 });
 
 test("update command is documented and does not require a project", async () => {
