@@ -36,8 +36,86 @@ test("CLI help and version use the WTAgent package identity", async () => {
   assert.match(help, /Turn your web AI session into a local tool-using agent/);
   assert.match(help, /\[task\.\.\.\]/);
   assert.match(help, /-C, --project <path>/);
+  assert.match(help, /^\s+update\s+/m);
   assert.doesNotMatch(help, /^\s+run(?:\s|$)/m);
   assert.equal(version.trim(), "0.1.0");
+});
+
+test("update command is documented and does not require a project", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const { stdout } = await execFileAsync(process.execPath, [
+    entry,
+    "update",
+    "--help",
+  ]);
+
+  assert.match(stdout, /^Usage: wtagent update/);
+  assert.match(stdout, /Install the latest WTAgent from npm/);
+});
+
+test("help documents the --model provider option", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const { stdout } = await execFileAsync(process.execPath, [entry, "--help"]);
+
+  assert.match(stdout, /--model <provider>/);
+  assert.match(stdout, /chatgpt.*deepseek/);
+  assert.match(stdout, /claude/);
+  assert.match(stdout, /gemini/);
+});
+
+test("an unknown --model is rejected with the known provider list", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const missingSafe = path.join(repositoryRoot, "test");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      entry, "--once", "--model", "bogus", "-C", missingSafe, "hi",
+    ]),
+    (error) => {
+      assert.match(error.stderr, /Unknown model "bogus"/);
+      assert.match(error.stderr, /chatgpt, deepseek/);
+      return true;
+    },
+  );
+});
+
+test("--mode kimi is accepted as a provider alias", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const missingProject = path.join(
+    repositoryRoot,
+    "test",
+    `missing-kimi-${process.pid}`,
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      entry, "--once", "--mode", "kimi", "-C", missingProject, "hi",
+    ]),
+    (error) => {
+      assert.doesNotMatch(error.stderr, /must be either "Pro" or "Current"/);
+      assert.ok(
+        error.stderr.includes(
+          `Project directory does not exist: ${missingProject}`,
+        ),
+      );
+      return true;
+    },
+  );
+});
+
+test("a planned --model reports it is not supported yet", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      entry, "--once", "--model", "grok", "-C", repositoryRoot, "hi",
+    ]),
+    (error) => {
+      assert.match(error.stderr, /not supported yet/);
+      assert.match(error.stderr, /Active providers: chatgpt/);
+      return true;
+    },
+  );
 });
 
 test("a task is accepted directly without a run subcommand", async () => {

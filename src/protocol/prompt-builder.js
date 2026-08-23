@@ -29,14 +29,14 @@ const DONE_SEMANTICS = `Current-run completion semantics:
 function buildBootstrapScaffold({ projectRoot, tools }) {
   const toolDocs = tools.map(formatTool).join("\n\n");
 
-  return `The user is running WTAgent, a local application that uses this ChatGPT conversation for reasoning. The following is the user's requested application-level response format and collaboration contract; it is not a claim that ChatGPT has native filesystem or function-call tools.
+  return `The user is running WTAgent, a local application that uses this web AI conversation for reasoning. The following is the user's requested application-level response format and collaboration contract; it is not a claim that this web chat has native filesystem or function-call tools.
 
-You do not need direct filesystem access or visible ChatGPT tool buttons. Return local operation requests as XML text. After your reply is complete, the user's local Node.js Runtime will parse the XML, validate the arguments, apply local policy, and may execute the requested operation. Its result will arrive in the next user message as <tool_result>. XML by itself never guarantees execution.
+You do not need direct filesystem access or provider-native tool buttons. Return local operation requests as XML text. After your reply is complete, the user's local Node.js Runtime will parse the XML, validate the arguments, apply local policy, and may execute the requested operation. Its result will arrive in the next user message as <tool_result>. XML by itself never guarantees execution.
 
 You are not limited to coding tasks. You can answer questions, write text, brainstorm, analyze, summarize, and — when the task requires it — request that the user's Runtime read, create, or modify files or run commands.
 
 ## Filesystem boundary
-The project filesystem described below is a logical, virtual filesystem namespace exposed by the local Runtime. It is not mounted in ChatGPT's own environment and cannot be inspected directly from this webpage.
+The project filesystem described below is a logical, virtual filesystem namespace exposed by the local Runtime. It is not mounted in the web provider's own environment and cannot be inspected directly from this webpage.
 
 Do not inspect /workspace, /mnt/data, or any ambient, cloud, or sandbox filesystem. Those locations are unrelated to the user's project. Request all project reads, listings, writes, edits, and commands only through the XML operations declared below.
 
@@ -98,11 +98,15 @@ The project directory may contain content unrelated to the current task: depende
 }
 
 // Returns the pieces needed by both transports:
-//   web       - the exact text to send to ChatGPT Web (scaffold is wrapped in
+//   web       - the exact text to send to the web AI (scaffold is wrapped in
 //               <agent_protocol> markers, the user task follows outside them)
 //   developer - the transport scaffold, exposed for diagnostics/tests only
 //   user      - the user task, for the canonical user message
-export function buildBootstrapPrompt({ task, projectRoot, tools }) {
+export function buildBootstrapPrompt({
+  task,
+  projectRoot,
+  tools,
+}) {
   const developer = buildBootstrapScaffold({ projectRoot, tools });
   const web = `${wrapSystemPrompt(developer)}\n\n## User task\n${task}`;
   return { web, developer, user: task };

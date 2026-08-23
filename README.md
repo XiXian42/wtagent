@@ -1,8 +1,8 @@
 # WTAgent
 
-Use GPT Web as a local CLI agent.
+Use your web AI account as a local CLI agent.
 
-WTAgent connects GPT Web to your local project: GPT reasons in the browser while WTAgent reads and writes local files and runs commands on your machine.
+WTAgent connects ChatGPT, Claude, DeepSeek, Gemini, Kimi, or GLM Web to your local project: the model reasons in the browser while WTAgent reads and writes local files and runs commands on your machine.
 
 [中文](#中文)
 
@@ -22,7 +22,7 @@ cd wtagent-demo
 wtagent
 ```
 
-Choose `Pro` or `Current`, then type a task:
+ChatGPT asks you to choose `Pro` or `Current`; other providers keep or silently select their configured default. Then type a task:
 
 ```text
 $ wtagent
@@ -31,9 +31,19 @@ you › Create hello.js that writes "Hello from WTAgent" to hello.txt. Run it wi
 
 WTAgent creates the files in the current directory, runs the script locally, and checks its output. You can continue chatting in the same terminal after the task finishes.
 
-If ChatGPT is not signed in, WTAgent opens its dedicated Chrome profile and asks you to sign in. Your task continues automatically after login.
+Choose a provider with `--model` (ChatGPT is the default). Supported values are `chatgpt`, `claude`, `deepseek`, `gemini`, `kimi`, and `glm`:
 
-No OpenAI API key or ChatGPT Pro subscription is required. WTAgent uses your own ChatGPT Web account, available models, and quota.
+```bash
+wtagent --model claude "inspect this project and summarize its architecture"
+wtagent --model gemini "inspect this project and summarize its architecture"
+```
+
+Claude keeps the model selected by claude.ai in its browser profile; WTAgent does not override it.
+Gemini likewise keeps the model selected in its browser profile.
+
+If the provider is not signed in, WTAgent opens its dedicated Chrome profile and asks you to sign in. Each provider has an independent profile, and your task continues automatically after login.
+
+WTAgent itself does not require an API key. It uses your own web account, available models, and quota.
 
 You can also provide the first task directly:
 
@@ -45,7 +55,7 @@ Multiline paste and `↑` / `↓` input history are supported. Press `Ctrl+C` or
 
 ## 中文
 
-WTAgent 将 GPT 网页聊天连接到本地项目：GPT 在浏览器中思考，WTAgent 在你的电脑上读写本地文件并运行命令。
+WTAgent 将 ChatGPT、Claude、DeepSeek、Gemini、Kimi 或 GLM 网页聊天连接到本地项目：模型在浏览器中思考，WTAgent 在你的电脑上读写本地文件并运行命令。
 
 ### 快速开始
 
@@ -63,7 +73,7 @@ cd wtagent-demo
 wtagent
 ```
 
-选择 `Pro` 或 `Current`，然后直接输入任务：
+ChatGPT 会让你选择 `Pro` 或 `Current`；其他 provider 会保持或自动选择配置的默认模式。然后直接输入任务：
 
 ```text
 $ wtagent
@@ -72,9 +82,19 @@ you › 创建 hello.js，将“Hello from WTAgent”写入 hello.txt。用 Node
 
 WTAgent 会在当前目录创建文件、运行本地脚本并检查输出。任务完成后，可以继续在同一个终端中对话。
 
-如果尚未登录 ChatGPT，WTAgent 会打开专用 Chrome 并提示登录；登录成功后任务会自动继续。
+通过 `--model` 选择 provider（默认是 ChatGPT）。可选值包括 `chatgpt`、`claude`、`deepseek`、`gemini`、`kimi` 和 `glm`：
 
-无需 OpenAI API Key，也不要求 ChatGPT Pro。WTAgent 使用你自己的 ChatGPT 网页账号、可用模型和额度。
+```bash
+wtagent --model claude "分析这个项目并总结架构"
+wtagent --model gemini "分析这个项目并总结架构"
+```
+
+Claude 会沿用 claude.ai 在该浏览器 Profile 中选择的模型，WTAgent 不会自动切换模型。
+Gemini 同样沿用其浏览器 Profile 当前选择的模型。
+
+如果尚未登录对应 provider，WTAgent 会打开它的独立专用 Chrome Profile 并提示登录；登录成功后任务会自动继续。
+
+WTAgent 本身无需 API Key，而是使用你自己的网页账号、可用模型和额度。
 
 也可以在启动时直接附带第一个任务：
 

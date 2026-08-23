@@ -113,11 +113,11 @@ test("shell chat input recalls previous messages with the up arrow", async () =>
   const chatInput = new ShellChatInput({ inputStream, outputStream });
 
   const first = chatInput.read();
-  inputStream.write("first message\n");
+  inputStream.write("first message\r");
   assert.equal(await first, "first message");
 
   const recalled = chatInput.read();
-  inputStream.write("\u001b[A\n");
+  inputStream.write("\u001b[A\r");
   assert.equal(await recalled, "first message");
 });
 
@@ -129,7 +129,7 @@ test("shell chat input supports up and down history navigation", async () => {
   chatInput.remember("second");
 
   const selected = chatInput.read();
-  inputStream.write("\u001b[A\u001b[A\u001b[B\n");
+  inputStream.write("\u001b[A\u001b[A\u001b[B\r");
 
   assert.equal(await selected, "second");
 });
@@ -150,7 +150,7 @@ test("shell chat input keeps a bracketed multiline paste as one message", async 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false, "paste must not submit before a separate Enter");
 
-  inputStream.write("\n");
+  inputStream.write("\r");
   assert.equal(await pending, "first line\nsecond line\nthird line");
 });
 
@@ -161,7 +161,7 @@ test("shell chat input recognizes an unbracketed multiline paste in one chunk", 
 
   const pending = chatInput.read();
   inputStream.write("first line\nsecond line\nthird line");
-  inputStream.write("\n");
+  inputStream.write("\r");
 
   assert.equal(await pending, "first line\nsecond line\nthird line");
 });
@@ -173,7 +173,7 @@ test("shell chat history preserves multiline pasted messages", async () => {
   chatInput.remember("first line\nsecond line");
 
   const pending = chatInput.read();
-  inputStream.write("\u001b[A\n");
+  inputStream.write("\u001b[A\r");
 
   assert.equal(await pending, "first line\nsecond line");
 });
@@ -212,6 +212,69 @@ test("shell chat input turns Shift+Enter into a newline instead of submitting", 
   assert.equal(await pending, "line one\nline two");
 });
 
+test("shell chat input treats xterm modifyOtherKeys Shift+Enter as a newline", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("line one\u001b[27;2;13~line two\r");
+
+  assert.equal(await pending, "line one\nline two");
+});
+
+test("cursor stays on the last line after a Shift+Enter newline insert", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  let rendered = "";
+  outputStream.on("data", (chunk) => {
+    rendered += chunk.toString("utf8");
+  });
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("ab\u001b[13;2uc\r");
+  assert.equal(await pending, "ab\nc");
+
+  // Drawing ends at the last rendered line ("c"); the cursor already sits on
+  // that line, so its placement must be a plain CR + column move. A wrong
+  // cursor-up here would make the NEXT redraw wipe the line above the prompt.
+  assert.ok(rendered.includes("c\r\u001b[1C"), "cursor placed via CR + column");
+  assert.ok(
+    !rendered.includes("c\u001b[1A"),
+    "cursor must not move up after drawing the last line",
+  );
+});
+
+test("shell chat input treats ESC+CR Shift+Enter as a newline", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  inputStream.write("line one\u001b\rline two\r");
+
+  assert.equal(await pending, "line one\nline two");
+});
+
+test("shell chat input treats Ctrl+J as a newline instead of submitting", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  let settled = false;
+  const pending = chatInput.read().then((value) => {
+    settled = true;
+    return value;
+  });
+  inputStream.write("line one\nline two");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "Ctrl+J must insert a newline instead of submitting");
+
+  inputStream.write("\r");
+  assert.equal(await pending, "line one\nline two");
+});
+
 test("shell chat input keeps a Shift+Enter sequence split across chunks", async () => {
   const inputStream = createTtyStream();
   const outputStream = createTtyStream();
@@ -223,6 +286,30 @@ test("shell chat input keeps a Shift+Enter sequence split across chunks", async 
   inputStream.write("line two\r");
 
   assert.equal(await pending, "line one\nline two");
+});
+
+test("shell chat input pauses stdin after reading so lingering keypress listeners cannot pin the process", async () => {
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  // Simulate readline's keypress machinery still holding its internal 'data'
+  // listener on stdin (as left behind by the adapter's ESC-cancel attach):
+  // keep a keypress listener registered so that listener never self-removes.
+  const { emitKeypressEvents } = await import("node:readline");
+  emitKeypressEvents(inputStream);
+  const onKeypress = () => {};
+  inputStream.on("keypress", onKeypress);
+
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+  const pending = chatInput.read();
+  inputStream.write("hello\r");
+
+  assert.equal(await pending, "hello");
+  assert.equal(
+    inputStream.isPaused(),
+    true,
+    "stdin must be paused after the prompt ends or the process cannot exit",
+  );
+  inputStream.removeListener("keypress", onKeypress);
 });
 
 test("shell chat input asks the terminal to disambiguate Shift+Enter via kitty protocol", async () => {
@@ -239,5 +326,7 @@ test("shell chat input asks the terminal to disambiguate Shift+Enter via kitty p
   await pending;
 
   assert.match(rendered, /\u001b\[>1u/);
+  assert.match(rendered, /\u001b\[>4;2m/);
+  assert.match(rendered, /\u001b\[>4;0m/);
   assert.match(rendered, /\u001b\[<1u/);
 });

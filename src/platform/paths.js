@@ -63,6 +63,13 @@ export function getChromeProfileDir(appDataDir = getAppDataDir()) {
   return path.join(appDataDir, "chrome-profile");
 }
 
+// Resolves a named Chrome profile directory under the app data dir. The
+// provider→basename mapping lives in the provider registry; this helper only
+// joins the path so paths.js stays free of provider dependencies.
+export function getProfileDir(appDataDir, basename) {
+  return path.join(appDataDir, basename);
+}
+
 export function getTasksDir(appDataDir = getAppDataDir()) {
   return path.join(appDataDir, "tasks");
 }

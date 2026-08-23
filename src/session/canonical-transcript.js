@@ -1,7 +1,7 @@
 // Canonical conversation transcript.
 //
 // The source of truth for a task's dialogue is stored in this Codex-compatible
-// shape from the very first exchange. ChatGPT Web only ever sees a rendered
+// shape from the very first exchange. The web provider only ever sees a rendered
 // projection (XML for tool results, a marked prompt for instructions); the
 // structured record below is what we persist and later export to Codex or
 // Claude Code sessions.
@@ -39,7 +39,7 @@ export function developerMessage(text) {
 
 // A user message. `attachments` records any @file uploads that accompanied the
 // message on the web transport (name + local path), so exporters can note them
-// even though the uploaded bytes live only in the ChatGPT conversation.
+// even though the uploaded bytes live only in the web conversation.
 export function userMessage(text, { attachments = [] } = {}) {
   const item = {
     type: "message",
