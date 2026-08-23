@@ -19,7 +19,7 @@ test("package exposes only the wtagent executable", async () => {
   );
 
   assert.equal(manifest.name, "wtagent");
-  assert.equal(manifest.version, "0.1.0");
+  assert.equal(manifest.version, "0.2.0");
   assert.deepEqual(manifest.bin, {
     wtagent: "src/cli/main.js",
   });
@@ -38,7 +38,7 @@ test("CLI help and version use the WTAgent package identity", async () => {
   assert.match(help, /-C, --project <path>/);
   assert.match(help, /^\s+update\s+/m);
   assert.doesNotMatch(help, /^\s+run(?:\s|$)/m);
-  assert.equal(version.trim(), "0.1.0");
+  assert.equal(version.trim(), "0.2.0");
 });
 
 test("update command is documented and does not require a project", async () => {
