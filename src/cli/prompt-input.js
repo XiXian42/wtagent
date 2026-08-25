@@ -198,7 +198,17 @@ export class ShellChatInput {
     const outputStream = this.outputStream;
     const previousRaw = inputStream.isRaw;
     const decoder = new StringDecoder("utf8");
-    const columns = () => Math.max(10, Number(inputStream.columns) || 80);
+    // Terminal width lives on the TTY *output* stream; process.stdin.columns is
+    // undefined, so reading it always fell back to 80 — wrapping CJK input after
+    // ~40 chars and, worse, making the editor's multi-line row model disagree
+    // with the terminal's real wrapping (arrow-key redraws then duplicated the
+    // input up the screen). Prefer the output stream's live column count.
+    const columns = () => Math.max(
+      10,
+      Number(outputStream.columns)
+        || Number(inputStream.columns)
+        || 80,
+    );
 
     let buffer = []; // flat code-point buffer; "\n" chars are real line breaks
     let cursor = 0;
@@ -507,8 +517,14 @@ export class ShellChatInput {
         ranges.push({ start: 0, end: 0 });
       }
 
-      if (linesDrawn > 1) {
-        outputStream.write(`\x1b[${linesDrawn - 1}A`);
+      // The previous render left the physical cursor on row `cursorRow`, which
+      // is NOT always the last drawn row: arrowing left/up into an earlier
+      // wrapped row leaves it higher. Move up by that actual row to reach the
+      // top — using `linesDrawn - 1` here overshoots whenever the cursor sits
+      // above the bottom row, drifting the whole block up the screen on every
+      // keystroke (duplicating wrapped lines). Mirror of finishLine()'s move.
+      if (cursorRow > 0) {
+        outputStream.write(`\x1b[${cursorRow}A`);
       }
       outputStream.write("\r");
       for (let index = 0; index < rendered.length; index += 1) {

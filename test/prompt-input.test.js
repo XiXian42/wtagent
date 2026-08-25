@@ -246,6 +246,105 @@ test("cursor stays on the last line after a Shift+Enter newline insert", async (
   );
 });
 
+test("wraps input width from the output stream, not the column-less input stream", async () => {
+  // Regression: terminal width lives on the TTY output stream. Reading
+  // inputStream.columns (always undefined for stdin) fell back to 80, wrapping
+  // CJK input after ~40 chars and corrupting arrow-key redraws. A wide output
+  // terminal must keep a short CJK line on a single drawn row.
+  const inputStream = createTtyStream();
+  delete inputStream.columns; // stdin has no columns, like real process.stdin
+  const outputStream = createTtyStream();
+  outputStream.columns = 200;
+  let rendered = "";
+  outputStream.on("data", (chunk) => {
+    rendered += chunk.toString("utf8");
+  });
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  // 50 CJK chars = 100 display columns: with the 7-col " you › " prompt this
+  // overflows the old 80-col stdin fallback (wrapping to ~15 rows) but fits on
+  // one row at 200. Must clear 80 by a real margin — 30 chars (60 cols) fit
+  // under both widths and would make this test pass even with the bug present.
+  inputStream.write("的".repeat(50) + "\r");
+  assert.equal(await pending, "的".repeat(50));
+
+  // The discriminator: wrapping to multiple rows forces cursor-up escapes
+  // (\x1b[<n>A) into every redraw — the motion that duplicated input up the
+  // screen. A single drawn row never emits one. (Do not assert on "\r\n的":
+  // render writes "\r\n" then a clear-line "\x1b[2K" before the text, so that
+  // substring can never appear and the assertion would be vacuous.)
+  assert.ok(
+    !/\x1b\[\d+A/.test(rendered),
+    "wide terminal must keep short CJK input on one row (no cursor-up redraw)",
+  );
+});
+
+test("arrow-key redraws never scroll a wrapped input above its home row", async () => {
+  // Regression for the "content scrolls/duplicates upward" bug: render() began
+  // each redraw by moving up `linesDrawn - 1` to reach the block's top row. But
+  // after arrowing left into an earlier WRAPPED row the cursor sits at
+  // `cursorRow` (above the bottom), so that move overshoots ABOVE the prompt,
+  // erasing the scrollback line above it and shifting the whole block up on
+  // every keystroke. The fix moves up by the true `cursorRow` instead.
+  //
+  // Replay the editor's own escape stream through a tiny vertical-position
+  // tracker: relative row 0 is the prompt's home line. A correct redraw never
+  // drives the cursor negative (above home); the bug does exactly that.
+  const inputStream = createTtyStream();
+  delete inputStream.columns;
+  const outputStream = createTtyStream();
+  outputStream.columns = 88; // wide enough to need two rows, not fifteen
+  let minRow = 0;
+  let row = 0;
+  outputStream.on("data", (chunk) => {
+    const bytes = chunk.toString("utf8");
+    for (let i = 0; i < bytes.length; i += 1) {
+      if (bytes[i] === "\n") {
+        row += 1;
+        continue;
+      }
+      if (bytes[i] === "\x1b" && bytes[i + 1] === "[") {
+        let j = i + 2;
+        let params = "";
+        while (j < bytes.length && /[0-9;>?]/.test(bytes[j])) {
+          params += bytes[j];
+          j += 1;
+        }
+        const n = parseInt(params, 10);
+        const num = Number.isNaN(n) ? 1 : n;
+        if (bytes[j] === "A") row -= num;
+        else if (bytes[j] === "B") row += num;
+        i = j; // skip the consumed CSI
+        if (row < minRow) minRow = row;
+      }
+    }
+  });
+  const chatInput = new ShellChatInput({ inputStream, outputStream });
+
+  const pending = chatInput.read();
+  // Long enough to wrap to THREE rows at 88 cols so the cursor can land on a
+  // MIDDLE row — where the buggy `linesDrawn - 1` up-move overshoots the home
+  // line. A two-row message keeps the cursor on the bottom row and hides it.
+  const message =
+    "分析 review/seo 下的内容 和本项目。 你需要进一步补充信息。 给出一个全面的 seo 优化方案。";
+  inputStream.write(message);
+  // Arrow left across the wrap boundary and back out; each press triggers a
+  // full redraw whose vertical moves must stay at or below the home row.
+  const LEFT = "[D";
+  const RIGHT = "[C";
+  inputStream.write((LEFT.repeat(40) + RIGHT.repeat(40)));
+  await new Promise((resolve) => setImmediate(resolve));
+  inputStream.write("\r");
+  assert.equal(await pending, message);
+
+  assert.ok(
+    minRow >= 0,
+    `redraw moved ${-minRow} row(s) above the prompt's home line — ` +
+      "wrapped input would scroll/duplicate up the screen",
+  );
+});
+
 test("shell chat input treats ESC+CR Shift+Enter as a newline", async () => {
   const inputStream = createTtyStream();
   const outputStream = createTtyStream();
