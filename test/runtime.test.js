@@ -12,7 +12,6 @@ import { PolicyEngine } from "../src/policy/policy-engine.js";
 import { TaskSession } from "../src/session/task-session.js";
 import {
   DEFAULT_LIMITS,
-  PRO_MODEL_TURN_TIMEOUT_MS,
   resolveLimits,
 } from "../src/shared/limits.js";
 import { BrowserAdapterError } from "../src/shared/errors.js";
@@ -321,7 +320,7 @@ test("continues beyond the former 36-step run limit", async (t) => {
   assert.equal(session.state.turn, 38);
 });
 
-test("current mode skips ChatGPT mode selection entirely", async (t) => {
+test("runtime never invokes provider model selection", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
@@ -336,9 +335,9 @@ test("current mode skips ChatGPT mode selection entirely", async (t) => {
   };
   const session = await TaskSession.create({
     tasksDir,
-    task: "Use the current ChatGPT setting",
+    task: "Use the model already selected in the browser",
     projectRoot,
-    mode: null,
+    mode: "legacy-mode-value",
   });
   const events = [];
   const runtime = new AgentRuntime({
@@ -358,7 +357,9 @@ test("current mode skips ChatGPT mode selection entirely", async (t) => {
     false,
   );
   const started = events.find((event) => event.type === "conversation.started");
-  assert.equal(started.payload.mode, null);
+  assert.equal("mode" in started.payload, false);
+  assert.equal("requestedMode" in started.payload, false);
+  assert.equal(session.state.activeMode, null);
 });
 
 test("keeps the final browser tool-result message within 24 KiB", async (t) => {
@@ -510,7 +511,7 @@ test("restores the window for manual login, then re-minimizes", async (t) => {
   assert.deepEqual(adapter.windowStateCalls, ["restore", "minimize"]);
 });
 
-test("conversation.started reports the actual mode, not the requested one", async (t) => {
+test("conversation.started stays model-agnostic for fresh and resumed sessions", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
@@ -521,14 +522,6 @@ test("conversation.started reports the actual mode, not the requested one", asyn
   const adapter = new FakeWebModelAdapter([
     `<agent_response><done>true</done><message>Done on the current mode.</message></agent_response>`,
   ]);
-  adapter.selectMode = async () => ({
-    status: "unavailable_disabled",
-    requested: "Pro",
-    selectedLabel: null,
-    attempts: 1,
-    reason: "Pro is limited.",
-  });
-
   const session = await TaskSession.create({
     tasksDir,
     task: "Do a thing",
@@ -548,9 +541,8 @@ test("conversation.started reports the actual mode, not the requested one", asyn
   await runtime.run();
 
   const started = events.find((e) => e.type === "conversation.started");
-  // Actual mode is unknown (not "Pro"), so it must not falsely claim Pro.
-  assert.equal(started.payload.mode, null);
-  assert.equal(started.payload.requestedMode, "Pro");
+  assert.equal("mode" in started.payload, false);
+  assert.equal("requestedMode" in started.payload, false);
   assert.equal(session.state.activeMode, null);
 
   const resumedEvents = [];
@@ -573,8 +565,8 @@ test("conversation.started reports the actual mode, not the requested one", asyn
   const resumedStarted = resumedEvents.find(
     (event) => event.type === "conversation.started",
   );
-  assert.equal(resumedStarted.payload.mode, null);
-  assert.equal(resumedStarted.payload.requestedMode, "Pro");
+  assert.equal("mode" in resumedStarted.payload, false);
+  assert.equal("requestedMode" in resumedStarted.payload, false);
 });
 
 test("returns invalid tool calls to the model instead of executing them", async (t) => {
@@ -1920,7 +1912,7 @@ test("emits the limit event when the adapter detects a usage-limit card", async 
   assert.ok(events.some((event) => event.type === "model.limit_reached"));
 });
 
-test("resume applies an explicit mode and keeps the current mode otherwise", async (t) => {
+test("resume ignores legacy mode overrides and keeps the browser-selected model", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
@@ -1950,13 +1942,13 @@ test("resume applies an explicit mode and keeps the current mode otherwise", asy
   await runtime.run();
   assert.equal(adapter.mode, null);
 
-  // Resume with an explicit mode override selects it.
-  await runtime.run({ resume: true, mode: "Pro" });
-  assert.equal(adapter.mode, "Pro");
+  // Legacy callers may still pass a mode field; runtime ignores it.
+  await runtime.run({ resume: true, mode: "legacy-mode" });
+  assert.equal(adapter.mode, null);
 
-  // A plain resume does not re-select anything.
+  // A plain resume also leaves the browser-selected model untouched.
   await runtime.run({ resume: true });
-  assert.equal(adapter.mode, "Pro");
+  assert.equal(adapter.mode, null);
 });
 
 test("retries a send that ChatGPT never rendered", async (t) => {
@@ -2033,7 +2025,7 @@ test("resume launches with the conversation URL so an existing tab can be reused
   assert.equal(adapter.lastLaunchUrl, "https://chatgpt.com/c/fake");
 });
 
-test("uses the 16-minute timeout for ChatGPT Pro and 6 minutes otherwise", async (t) => {
+test("uses the same default timeout regardless of legacy session mode", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
@@ -2075,11 +2067,11 @@ test("uses the 16-minute timeout for ChatGPT Pro and 6 minutes otherwise", async
     approval: async () => false,
   }).run();
 
-  assert.equal(seen[0], PRO_MODEL_TURN_TIMEOUT_MS);
+  assert.equal(seen[0], DEFAULT_LIMITS.modelTurnTimeoutMs);
   assert.equal(seen[1], DEFAULT_LIMITS.modelTurnTimeoutMs);
 });
 
-test("an explicit --model-turn-timeout-ms overrides the Pro timeout", async (t) => {
+test("an explicit --model-turn-timeout-ms overrides the default timeout", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");

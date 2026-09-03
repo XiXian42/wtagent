@@ -86,40 +86,39 @@ test("an unknown --model is rejected with the known provider list", async () => 
   );
 });
 
-test("--mode kimi is accepted as a provider alias", async () => {
+test("--mode is no longer exposed or accepted", async () => {
   const entry = path.join(repositoryRoot, "src", "cli", "main.js");
-  const missingProject = path.join(
-    repositoryRoot,
-    "test",
-    `missing-kimi-${process.pid}`,
-  );
+  const { stdout: help } = await execFileAsync(process.execPath, [entry, "--help"]);
+  assert.doesNotMatch(help, /--mode\b/);
 
   await assert.rejects(
-    execFileAsync(process.execPath, [
-      entry, "--once", "--mode", "kimi", "-C", missingProject, "hi",
-    ]),
+    execFileAsync(process.execPath, [entry, "--once", "--mode", "kimi", "hi"]),
     (error) => {
-      assert.doesNotMatch(error.stderr, /must be either "Pro" or "Current"/);
-      assert.ok(
-        error.stderr.includes(
-          `Project directory does not exist: ${missingProject}`,
-        ),
-      );
+      assert.match(error.stderr, /unknown option '--mode'/i);
       return true;
     },
   );
 });
 
-test("a planned --model reports it is not supported yet", async () => {
+test("--model grok is recognized as an active provider", async () => {
   const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const missingProject = path.join(
+    repositoryRoot,
+    "test",
+    `missing-grok-${process.pid}`,
+  );
 
   await assert.rejects(
     execFileAsync(process.execPath, [
-      entry, "--once", "--model", "grok", "-C", repositoryRoot, "hi",
+      entry, "--once", "--model", "grok", "-C", missingProject, "hi",
     ]),
     (error) => {
-      assert.match(error.stderr, /not supported yet/);
-      assert.match(error.stderr, /Active providers: chatgpt/);
+      assert.doesNotMatch(error.stderr, /not supported yet/);
+      assert.ok(
+        error.stderr.includes(
+          `Project directory does not exist: ${missingProject}`,
+        ),
+      );
       return true;
     },
   );

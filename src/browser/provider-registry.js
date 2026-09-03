@@ -2,6 +2,7 @@ import { ChatGPTWebAdapter } from "./chatgpt-web-adapter.js";
 import { ClaudeWebAdapter } from "./claude-web-adapter.js";
 import { DeepSeekWebAdapter } from "./deepseek-web-adapter.js";
 import { GeminiWebAdapter } from "./gemini-web-adapter.js";
+import { GrokWebAdapter } from "./grok-web-adapter.js";
 import { KimiWebAdapter } from "./kimi-web-adapter.js";
 import { GLMWebAdapter } from "./glm-web-adapter.js";
 import { getProfileDir } from "../platform/paths.js";
@@ -18,14 +19,12 @@ import { getProfileDir } from "../platform/paths.js";
 //                          data dir; each provider logs in once, independently
 //   status               - "active" (has a working adapter) | "planned" (named
 //                          but not implemented yet)
-//   promptsForMode       - whether the CLI shows an interactive mode picker at
-//                          conversation start (ChatGPT has Pro/Current; most
-//                          providers do not prompt)
-//   defaultMode          - mode applied silently at conversation start when the
-//                          provider does not prompt (null = keep the site's
-//                          current setting). The adapter's selectMode()
-//                          interprets this value.
 //   adapter              - the adapter class, or null until implemented
+//
+// WTAgent deliberately does not encode provider-specific model names or choose
+// a model automatically. After login, interactive runs give the user a chance
+// to choose directly on the provider website; pressing Enter keeps whatever
+// the website currently has selected.
 //
 // ChatGPT keeps the historical "chrome-profile" basename so existing logins,
 // the logout guard, and cli.test.js keep working unchanged.
@@ -36,8 +35,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://chatgpt.com/",
     profileBasename: "chrome-profile",
     status: "active",
-    promptsForMode: true,
-    defaultMode: null,
     adapter: ChatGPTWebAdapter,
   }),
   deepseek: Object.freeze({
@@ -46,10 +43,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://chat.deepseek.com/",
     profileBasename: "deepseek-profile",
     status: "active",
-    // DeepSeek does not prompt; every new conversation silently switches to
-    // 专家模式 (Expert) + 深度思考 (Deep Thinking) — see DeepSeekWebAdapter.selectMode.
-    promptsForMode: false,
-    defaultMode: "expert-thinking",
     adapter: DeepSeekWebAdapter,
   }),
   claude: Object.freeze({
@@ -58,10 +51,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://claude.ai/",
     profileBasename: "claude-profile",
     status: "active",
-    promptsForMode: false,
-    // Keep whatever model claude.ai selects in this browser profile. WTAgent
-    // does not open the model menu or override the account/site default.
-    defaultMode: null,
     adapter: ClaudeWebAdapter,
   }),
   grok: Object.freeze({
@@ -69,10 +58,8 @@ export const PROVIDERS = Object.freeze({
     label: "Grok",
     baseUrl: "https://grok.com/",
     profileBasename: "grok-profile",
-    status: "planned",
-    promptsForMode: false,
-    defaultMode: null,
-    adapter: null,
+    status: "active",
+    adapter: GrokWebAdapter,
   }),
   kimi: Object.freeze({
     id: "kimi",
@@ -80,10 +67,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://www.kimi.com/",
     profileBasename: "kimi-profile",
     status: "active",
-    // Kimi does not prompt; every new conversation silently switches to the K3
-    // flagship model — see KimiWebAdapter.selectMode.
-    promptsForMode: false,
-    defaultMode: "k3",
     adapter: KimiWebAdapter,
   }),
   glm: Object.freeze({
@@ -92,10 +75,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://chat.z.ai/",
     profileBasename: "glm-profile",
     status: "active",
-    // GLM does not prompt; every new conversation silently selects the newest
-    // available model (GLM-5.3, else GLM-5.2) — see GLMWebAdapter.selectMode.
-    promptsForMode: false,
-    defaultMode: "latest",
     adapter: GLMWebAdapter,
   }),
   gemini: Object.freeze({
@@ -104,9 +83,6 @@ export const PROVIDERS = Object.freeze({
     baseUrl: "https://gemini.google.com/app",
     profileBasename: "gemini-profile",
     status: "active",
-    promptsForMode: false,
-    // Preserve the model currently selected by Gemini in this profile.
-    defaultMode: null,
     adapter: GeminiWebAdapter,
   }),
 });
@@ -136,24 +112,6 @@ export function getProvider(providerId) {
     throw new Error(`Unknown model "${providerId}". Known providers: ${known}.`);
   }
   return provider;
-}
-
-// `--mode` is ChatGPT's Pro/Current switch, but people often type
-// `--mode kimi` meaning the Kimi provider. If the value is a known provider
-// id, treat it as `--model` and clear `--mode` so ChatGPT mode parsing is not
-// applied. Conflicting `--model` + `--mode <provider>` is rejected.
-export function resolveCliProviderSelection({ model, mode } = {}) {
-  const modeAsProvider = findProvider(mode);
-  if (!modeAsProvider) {
-    return { model, mode };
-  }
-  if (model != null && getProvider(model).id !== modeAsProvider.id) {
-    throw new Error(
-      `--mode ${mode} selects ${modeAsProvider.label}, but --model ${model} is already set. `
-        + `Use --model ${modeAsProvider.id}.`,
-    );
-  }
-  return { model: modeAsProvider.id, mode: undefined };
 }
 
 // Resolves the dedicated Chrome profile directory for a provider under the

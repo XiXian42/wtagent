@@ -11,51 +11,25 @@ const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
 //   ESC + CR                         some iTerm / VS Code / tmux setups
 // Terminals that still send a bare CR for Shift+Enter cannot be disambiguated;
 // Ctrl+J (bare LF in raw mode) is the reliable fallback and is also mapped.
-const SHIFT_ENTER_KITTY = "\u001b[13;2u";
-const SHIFT_ENTER_MODIFY_OTHER = "\u001b[27;2;13~";
 const SHIFT_ENTER_ESC_CR = "\u001b\r";
-const SHIFT_ENTER_SEQUENCES = Object.freeze([
-  SHIFT_ENTER_KITTY,
-  SHIFT_ENTER_MODIFY_OTHER,
-  SHIFT_ENTER_ESC_CR,
-]);
 const ENABLE_KITTY_KEYBOARD = "\u001b[>1u";
 const DISABLE_KITTY_KEYBOARD = "\u001b[<1u";
 const ENABLE_MODIFY_OTHER_KEYS = "\u001b[>4;2m";
 const DISABLE_MODIFY_OTHER_KEYS = "\u001b[>4;0m";
+// DECAWM: if a redraw fills the last column, the terminal otherwise wraps onto a
+// phantom next row (XENL). CJK is width 2 so it hits that edge constantly, and
+// the next backspace then leaves the "deleted" glyph sitting on that extra row.
+const DISABLE_AUTOWRAP = "\u001b[?7l";
+const ENABLE_AUTOWRAP = "\u001b[?7h";
 
-const KEY_UP = "\u001b[A";
-const KEY_DOWN = "\u001b[B";
-const KEY_RIGHT = "\u001b[C";
-const KEY_LEFT = "\u001b[D";
-const KEY_HOME = "\u001b[H";
-const KEY_END = "\u001b[F";
-const KEY_HOME_TILDE = "\u001b[1~";
-const KEY_END_TILDE = "\u001b[4~";
-const KEY_HOME_APP = "\u001bOH";
-const KEY_END_APP = "\u001bOF";
-const KEY_DELETE = "\u001b[3~";
-
-// Every escape sequence the editor understands, used both for dispatch and to
-// hold a split-across-chunks prefix back instead of inserting it as text.
-const KNOWN_ESCAPE_SEQUENCES = Object.freeze([
-  BRACKETED_PASTE_START,
-  BRACKETED_PASTE_END,
-  KEY_UP,
-  KEY_DOWN,
-  KEY_RIGHT,
-  KEY_LEFT,
-  KEY_HOME,
-  KEY_END,
-  KEY_HOME_TILDE,
-  KEY_END_TILDE,
-  KEY_HOME_APP,
-  KEY_END_APP,
-  KEY_DELETE,
-  SHIFT_ENTER_KITTY,
-  SHIFT_ENTER_MODIFY_OTHER,
-  SHIFT_ENTER_ESC_CR,
-]);
+const SS3_ACTIONS = Object.freeze({
+  A: "up",
+  B: "down",
+  C: "right",
+  D: "left",
+  H: "home",
+  F: "end",
+});
 
 const CLEAN_EXIT_ERRORS = new Set([
   "AbortPromptError",
@@ -69,22 +43,30 @@ const EXIT_COMMANDS = new Set([
   "/quit",
 ]);
 
-// Rough terminal cell width for one code point. Good enough for wrap and
-// cursor math on typical chat input: CJK/fullwidth/emoji count 2, combining
-// marks count 0, everything else 1.
-function charWidth(codePoint) {
+// Rough terminal cell width for one code point. CJK/fullwidth/emoji count 2,
+// combining marks count 0, everything else 1 — including East-Asian Ambiguous
+// (quotes, dashes, ›, box drawing), which wcwidth and every default terminal
+// config render as 1 cell.
+//
+// The › in the prompt makes this a hard rule, not a taste call: the 7-cell
+// prompt is ODD and every CJK glyph is 2 cells, so the cursor column after any
+// amount of CJK is always odd = the LEADING cell of a glyph. macOS Terminal.app
+// does not draw the cursor on a glyph's trailing cell, so counting › as 2
+// (prompt 8, even) makes the cursor land on trailing cells and visibly blink
+// in and out of existence while typing Chinese.
+export function charWidth(codePoint) {
   if (
     codePoint >= 0x1100 && (
       codePoint <= 0x115F
       || (codePoint >= 0x2E80 && codePoint <= 0xA4CF)
-      || (codePoint >= 0xAC00 && codePoint <= 0xD7A3)
+      || (codePoint >= 0xA960 && codePoint <= 0xA97F)
+      || (codePoint >= 0xAC00 && codePoint <= 0xD7FB)
       || (codePoint >= 0xF900 && codePoint <= 0xFAFF)
       || (codePoint >= 0xFE10 && codePoint <= 0xFE19)
       || (codePoint >= 0xFE30 && codePoint <= 0xFE6F)
       || (codePoint >= 0xFF00 && codePoint <= 0xFF60)
       || (codePoint >= 0xFFE0 && codePoint <= 0xFFE6)
-      || (codePoint >= 0x1F300 && codePoint <= 0x1F64F)
-      || (codePoint >= 0x1F900 && codePoint <= 0x1F9FF)
+      || (codePoint >= 0x1F300 && codePoint <= 0x1FAFF)
       || (codePoint >= 0x20000 && codePoint <= 0x3FFFD)
     )
   ) {
@@ -103,12 +85,180 @@ function charWidth(codePoint) {
   return 1;
 }
 
-function displayWidth(text) {
+export function displayWidth(text) {
   let width = 0;
   for (const ch of String(text ?? "")) {
     width += charWidth(ch.codePointAt(0));
   }
   return width;
+}
+
+function splitGraphemes(text) {
+  const value = String(text ?? "");
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    return [...new Intl.Segmenter(undefined, { granularity: "grapheme" })
+      .segment(value)]
+      .map((part) => part.segment);
+  }
+  return [...value];
+}
+
+function graphemeWidth(grapheme) {
+  let width = 0;
+  for (const ch of String(grapheme ?? "")) {
+    width += charWidth(ch.codePointAt(0));
+  }
+  return width;
+}
+
+// Parse one escape at the start of `text`. Incomplete sequences (split across
+// TTY chunks) are held back; complete unknown CSI is consumed, never inserted.
+function matchEscape(text) {
+  if (!text.startsWith("\u001b")) {
+    return null;
+  }
+  if (text.length === 1) {
+    return { incomplete: true };
+  }
+  if (text[1] === "\r") {
+    return { sequence: SHIFT_ENTER_ESC_CR, kind: "shift-enter" };
+  }
+  if (text[1] === "O") {
+    if (text.length < 3) {
+      return { incomplete: true };
+    }
+    return { sequence: text.slice(0, 3), kind: "ss3", final: text[2] };
+  }
+  if (text[1] === "[") {
+    let index = 2;
+    while (
+      index < text.length
+      && text.charCodeAt(index) >= 0x30
+      && text.charCodeAt(index) <= 0x3F
+    ) {
+      index += 1;
+    }
+    while (
+      index < text.length
+      && text.charCodeAt(index) >= 0x20
+      && text.charCodeAt(index) <= 0x2F
+    ) {
+      index += 1;
+    }
+    if (index >= text.length) {
+      return { incomplete: true };
+    }
+    const finalCode = text.charCodeAt(index);
+    if (finalCode < 0x40 || finalCode > 0x7E) {
+      return { sequence: "\u001b", kind: "unknown" };
+    }
+    return {
+      sequence: text.slice(0, index + 1),
+      kind: "csi",
+      final: text[index],
+      params: text.slice(2, index),
+    };
+  }
+  return { sequence: text.slice(0, 2), kind: "unknown" };
+}
+
+function parseCsiParams(params) {
+  const body = String(params ?? "").replace(/^[?<>]/, "");
+  if (!body) {
+    return [];
+  }
+  return body.split(";").map((part) => {
+    const base = part.split(":")[0];
+    const value = Number(base);
+    return Number.isFinite(value) && base.length > 0 ? value : 0;
+  });
+}
+
+function classifyUnicodeKey(key, mods) {
+  const bits = Math.max(0, (mods || 1) - 1);
+  const shift = (bits & 1) !== 0;
+  const ctrl = (bits & 4) !== 0;
+  if (key === 13) {
+    return shift ? { type: "newline" } : { type: "submit" };
+  }
+  if (key === 10) {
+    return { type: "newline" };
+  }
+  if (key === 127 || key === 8) {
+    return { type: "backspace" };
+  }
+  if (key === 27 || key === 9) {
+    return { type: "ignore" };
+  }
+  if (ctrl) {
+    if (key === 99 || key === 67) {
+      return { type: "cancel" };
+    }
+    if (key === 100 || key === 68) {
+      return { type: "eof-or-delete" };
+    }
+    if (key === 97 || key === 65) {
+      return { type: "home" };
+    }
+    if (key === 101 || key === 69) {
+      return { type: "end" };
+    }
+    if (key === 107 || key === 75) {
+      return { type: "kill-line" };
+    }
+    if (key === 117 || key === 85) {
+      return { type: "kill-all" };
+    }
+  }
+  return { type: "ignore" };
+}
+
+function classifyCsi(final, params) {
+  const nums = parseCsiParams(params);
+  if (final === "u") {
+    return classifyUnicodeKey(nums[0] || 0, nums[1] || 1);
+  }
+  if (final === "~") {
+    const first = nums[0] || 0;
+    if (first === 200) {
+      return { type: "paste-start" };
+    }
+    if (first === 201) {
+      return { type: "paste-end" };
+    }
+    if (first === 3) {
+      return { type: "delete" };
+    }
+    if (first === 1) {
+      return { type: "home" };
+    }
+    if (first === 4) {
+      return { type: "end" };
+    }
+    if (first === 27) {
+      return classifyUnicodeKey(nums[2] || 0, nums[1] || 1);
+    }
+    return { type: "ignore" };
+  }
+  if (final === "A") {
+    return { type: "up" };
+  }
+  if (final === "B") {
+    return { type: "down" };
+  }
+  if (final === "C") {
+    return { type: "right" };
+  }
+  if (final === "D") {
+    return { type: "left" };
+  }
+  if (final === "H") {
+    return { type: "home" };
+  }
+  if (final === "F") {
+    return { type: "end" };
+  }
+  return { type: "ignore" };
 }
 
 // Longest tail of `text` that is a strict prefix of `sequence` — the part that
@@ -210,7 +360,7 @@ export class ShellChatInput {
         || 80,
     );
 
-    let buffer = []; // flat code-point buffer; "\n" chars are real line breaks
+    let buffer = []; // grapheme clusters; "\n" entries are real line breaks
     let cursor = 0;
     let historyIndex = this.history.length;
     let draft = "";
@@ -225,6 +375,7 @@ export class ShellChatInput {
       inputStream.removeListener("end", onEnd);
       inputStream.removeListener("close", onEnd);
       inputStream.setRawMode?.(previousRaw);
+      outputStream.write(ENABLE_AUTOWRAP);
       outputStream.write(DISABLE_MODIFY_OTHER_KEYS);
       outputStream.write(DISABLE_BRACKETED_PASTE);
       outputStream.write(DISABLE_KITTY_KEYBOARD);
@@ -244,7 +395,10 @@ export class ShellChatInput {
     };
 
     // Moves to the end of the drawn input and starts a fresh line.
+    // CR first: CUU/CUD from the trailing cell of a CJK glyph splits it in
+    // half on macOS Terminal.app. Column 0 is always a safe cell boundary.
     const finishLine = () => {
+      outputStream.write("\r");
       if (cursorRow < linesDrawn - 1) {
         outputStream.write(`\x1b[${linesDrawn - 1 - cursorRow}B`);
       }
@@ -266,17 +420,37 @@ export class ShellChatInput {
     };
 
     const setBufferText = (text) => {
-      buffer = [...String(text)];
+      buffer = splitGraphemes(text);
       cursor = buffer.length;
       render();
     };
 
     const insertText = (text) => {
-      const chars = [...String(text)];
+      const chars = splitGraphemes(text).filter((ch) => ch !== "\u001b");
+      if (chars.length === 0) {
+        return;
+      }
       buffer.splice(cursor, 0, ...chars);
       cursor += chars.length;
       historyIndex = this.history.length;
       render();
+    };
+
+    const applyBackspace = () => {
+      if (cursor > 0) {
+        buffer.splice(cursor - 1, 1);
+        cursor -= 1;
+        historyIndex = this.history.length;
+        render();
+      }
+    };
+
+    const applyDelete = () => {
+      if (cursor < buffer.length) {
+        buffer.splice(cursor, 1);
+        historyIndex = this.history.length;
+        render();
+      }
     };
 
     // historyIndex is the DISPLAYED entry's index, or history.length while the
@@ -308,6 +482,74 @@ export class ShellChatInput {
       }
     };
 
+    const handleAction = (action) => {
+      switch (action?.type) {
+        case "paste-start":
+          inPaste = true;
+          return;
+        case "paste-end":
+          inPaste = false;
+          return;
+        case "up":
+          historyPrev();
+          return;
+        case "down":
+          historyNext();
+          return;
+        case "right":
+          cursor = Math.min(cursor + 1, buffer.length);
+          render();
+          return;
+        case "left":
+          cursor = Math.max(cursor - 1, 0);
+          render();
+          return;
+        case "home":
+          cursor = 0;
+          render();
+          return;
+        case "end":
+          cursor = buffer.length;
+          render();
+          return;
+        case "backspace":
+          applyBackspace();
+          return;
+        case "delete":
+          applyDelete();
+          return;
+        case "submit":
+          submit();
+          return;
+        case "newline":
+          insertText("\n");
+          return;
+        case "cancel":
+          cancel();
+          return;
+        case "eof-or-delete":
+          if (buffer.length === 0) {
+            done(null);
+          } else {
+            applyDelete();
+          }
+          return;
+        case "kill-line":
+          buffer = buffer.slice(0, cursor);
+          historyIndex = this.history.length;
+          render();
+          return;
+        case "kill-all":
+          buffer = [];
+          cursor = 0;
+          historyIndex = this.history.length;
+          render();
+          return;
+        default:
+          return;
+      }
+    };
+
     const handlePlainText = (text) => {
       for (const ch of String(text)) {
         if (ch === "\r") {
@@ -318,46 +560,39 @@ export class ShellChatInput {
           insertText("\n");
           continue;
         }
-        if (ch === "") {
+        if (ch === "\u0003") {
           cancel();
           return;
         }
-        if (ch === "") {
+        if (ch === "\u0004") {
           if (buffer.length === 0) {
             done(null);
-          } else if (cursor < buffer.length) {
-            buffer.splice(cursor, 1);
-            historyIndex = this.history.length;
-            render();
+          } else {
+            applyDelete();
           }
           continue;
         }
-        if (ch === "" || ch === "") {
-          if (cursor > 0) {
-            buffer.splice(cursor - 1, 1);
-            cursor -= 1;
-            historyIndex = this.history.length;
-            render();
-          }
+        if (ch === "\u007f" || ch === "\u0008") {
+          applyBackspace();
           continue;
         }
-        if (ch === "") {
+        if (ch === "\u0001") {
           cursor = 0;
           render();
           continue;
         }
-        if (ch === "") {
+        if (ch === "\u0005") {
           cursor = buffer.length;
           render();
           continue;
         }
-        if (ch === "") {
+        if (ch === "\u000b") {
           buffer = buffer.slice(0, cursor);
           historyIndex = this.history.length;
           render();
           continue;
         }
-        if (ch === "") {
+        if (ch === "\u0015") {
           buffer = [];
           cursor = 0;
           historyIndex = this.history.length;
@@ -365,55 +600,6 @@ export class ShellChatInput {
           continue;
         }
         insertText(ch);
-      }
-    };
-
-    const handleSequence = (sequence) => {
-      switch (sequence) {
-        case BRACKETED_PASTE_START:
-          inPaste = true;
-          return;
-        case BRACKETED_PASTE_END:
-          inPaste = false;
-          return;
-        case KEY_UP:
-          historyPrev();
-          return;
-        case KEY_DOWN:
-          historyNext();
-          return;
-        case KEY_RIGHT:
-          cursor = Math.min(cursor + 1, buffer.length);
-          render();
-          return;
-        case KEY_LEFT:
-          cursor = Math.max(cursor - 1, 0);
-          render();
-          return;
-        case KEY_HOME:
-        case KEY_HOME_TILDE:
-        case KEY_HOME_APP:
-          cursor = 0;
-          render();
-          return;
-        case KEY_END:
-        case KEY_END_TILDE:
-        case KEY_END_APP:
-          cursor = buffer.length;
-          render();
-          return;
-        case KEY_DELETE:
-          if (cursor < buffer.length) {
-            buffer.splice(cursor, 1);
-            historyIndex = this.history.length;
-            render();
-          }
-          return;
-        default:
-          break;
-      }
-      if (SHIFT_ENTER_SEQUENCES.includes(sequence)) {
-        insertText("\n");
       }
     };
 
@@ -453,26 +639,26 @@ export class ShellChatInput {
           continue;
         }
 
-        // pending starts with ESC.
-        const sequence = KNOWN_ESCAPE_SEQUENCES.find((candidate) => (
-          pending.startsWith(candidate)
-        ));
-        if (sequence) {
-          handleSequence(sequence);
-          pending = pending.slice(sequence.length);
-          continue;
-        }
-        if (
-          pending.length === 1
-          || KNOWN_ESCAPE_SEQUENCES.some((candidate) => (
-            candidate.startsWith(pending)
-          ))
-        ) {
-          // The rest of the sequence may arrive in the next chunk.
+        const matched = matchEscape(pending);
+        if (!matched) {
+          handlePlainText(pending);
+          pending = "";
           return;
         }
-        // Unknown escape: drop the ESC byte and re-scan what follows.
-        pending = pending.slice(1);
+        if (matched.incomplete) {
+          return;
+        }
+        if (matched.kind === "shift-enter") {
+          handleAction({ type: "newline" });
+        } else if (matched.kind === "ss3") {
+          const type = SS3_ACTIONS[matched.final];
+          if (type) {
+            handleAction({ type });
+          }
+        } else if (matched.kind === "csi") {
+          handleAction(classifyCsi(matched.final, matched.params));
+        }
+        pending = pending.slice(matched.sequence.length);
       }
     };
 
@@ -481,7 +667,6 @@ export class ShellChatInput {
     const render = () => {
       const width = columns();
       const promptWidth = displayWidth(prompt);
-      const text = buffer.join("");
 
       const rendered = [];
       const ranges = []; // { start, end } flat char indices per rendered line
@@ -496,15 +681,27 @@ export class ShellChatInput {
         currentWidth = 0;
         rangeStart = charIndex;
       };
-      for (const ch of text) {
+      for (let index = 0; index < buffer.length; index += 1) {
+        const ch = buffer[index];
         if (ch === "\n") {
           flush();
           charIndex += 1;
+          // The "\n" itself belongs to no rendered line. flush() left
+          // rangeStart on the "\n"'s index, so the next line's range would
+          // include it — and the cursor column (displayWidth of the row
+          // prefix) came out 1 too far right on every row after a newline,
+          // parking the cursor on a CJK glyph's trailing cell where macOS
+          // Terminal.app hides it (the "cursor blinks out" bug).
+          rangeStart = charIndex;
           continue;
         }
-        const w = charWidth(ch.codePointAt(0));
+        const w = graphemeWidth(ch);
         const base = rendered.length === 0 ? promptWidth : 0;
-        if (base + currentWidth + w > width && currentWidth > 0) {
+        // `>= width` (not `>`): filling the last column trips terminal autowrap
+        // even with DECAWM off on some emulators, and CJK (width 2) lands on
+        // that boundary far more often than ASCII. Keep one spare cell so the
+        // editor's row model and the physical cursor stay aligned.
+        if (base + currentWidth + w >= width && currentWidth > 0) {
           flush();
         }
         current += ch;
@@ -523,10 +720,12 @@ export class ShellChatInput {
       // top — using `linesDrawn - 1` here overshoots whenever the cursor sits
       // above the bottom row, drifting the whole block up the screen on every
       // keystroke (duplicating wrapped lines). Mirror of finishLine()'s move.
+      // CR first: CUU from the trailing cell of a CJK glyph splits it in half
+      // on macOS Terminal.app. Column 0 is always a safe cell boundary.
+      outputStream.write("\r");
       if (cursorRow > 0) {
         outputStream.write(`\x1b[${cursorRow}A`);
       }
-      outputStream.write("\r");
       for (let index = 0; index < rendered.length; index += 1) {
         outputStream.write("\x1b[2K");
         if (index === 0) {
@@ -537,14 +736,11 @@ export class ShellChatInput {
           outputStream.write("\r\n");
         }
       }
-      if (rendered.length < linesDrawn) {
-        for (let index = rendered.length; index < linesDrawn; index += 1) {
-          outputStream.write("\x1b[2K");
-          if (index < linesDrawn - 1) {
-            outputStream.write("\r\n");
-          }
-        }
-      }
+      // Erase leftover rows from a previous taller wrap (CJK backspace/unwrap).
+      // ED 0 from the end of the last content line. The old shrink path CSI-2K'd
+      // the current line instead — wiping the row we just drew and never moving
+      // onto the stale row below, so the "deleted" glyph stayed visible.
+      outputStream.write("\x1b[J");
       linesDrawn = rendered.length;
 
       // Position the cursor at the flat cursor index.
@@ -555,20 +751,21 @@ export class ShellChatInput {
         if (cursor < range.end || r === rendered.length - 1) {
           row = r;
           const base = r === 0 ? promptWidth : 0;
-          const prefixLength = Math.max(0, cursor - range.start);
           col = base + displayWidth(
-            [...rendered[r]].slice(0, prefixLength).join(""),
+            buffer.slice(range.start, cursor).join(""),
           );
           break;
         }
       }
       cursorRow = row;
-      // Drawing ends at the last rendered line; move UP to the cursor's row.
+      // Drawing ends at the last rendered line; CR first, then move UP. After
+      // the CR the cursor is at column 0, so CUU keeps column 0 — no second CR
+      // is needed before the CUF.
       const moveUp = rendered.length - 1 - row;
+      outputStream.write("\r");
       if (moveUp > 0) {
         outputStream.write(`\x1b[${moveUp}A`);
       }
-      outputStream.write("\r");
       if (col > 0) {
         outputStream.write(`\x1b[${col}C`);
       }
@@ -586,6 +783,7 @@ export class ShellChatInput {
     };
 
     inputStream.setRawMode?.(true);
+    outputStream.write(DISABLE_AUTOWRAP);
     outputStream.write(ENABLE_BRACKETED_PASTE);
     // Ask the terminal to disambiguate modified Enter. Kitty CSI-u covers
     // kitty/iTerm; xterm modifyOtherKeys covers many others, including some

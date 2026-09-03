@@ -2,7 +2,7 @@
 
 Use your web AI account as a local CLI agent.
 
-WTAgent connects ChatGPT, Claude, DeepSeek, Gemini, Kimi, or GLM Web to your local project: the model reasons in the browser while WTAgent reads and writes local files and runs commands on your machine.
+WTAgent connects ChatGPT, Claude, DeepSeek, Gemini, Grok, Kimi, or GLM Web to your local project: the model reasons in the browser while WTAgent reads and writes local files and runs commands on your machine.
 
 [中文](#中文)
 
@@ -57,7 +57,7 @@ Multiline paste and `↑` / `↓` input history are supported. Press `Ctrl+C` or
 
 ## 中文
 
-WTAgent 将 ChatGPT、Claude、DeepSeek、Gemini、Kimi 或 GLM 网页聊天连接到本地项目：模型在浏览器中思考，WTAgent 在你的电脑上读写本地文件并运行命令。
+WTAgent 将 ChatGPT、Claude、DeepSeek、Gemini、Grok、Kimi 或 GLM 网页聊天连接到本地项目：模型在浏览器中思考，WTAgent 在你的电脑上读写本地文件并运行命令。
 
 ### 快速开始
 

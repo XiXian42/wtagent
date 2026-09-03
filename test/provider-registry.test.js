@@ -9,12 +9,12 @@ import {
   isProviderProfileBasename,
   listActiveProviderIds,
   PROVIDERS,
-  resolveCliProviderSelection,
   resolveProvider,
 } from "../src/browser/provider-registry.js";
 import { ChatGPTWebAdapter } from "../src/browser/chatgpt-web-adapter.js";
 import { ClaudeWebAdapter } from "../src/browser/claude-web-adapter.js";
 import { GeminiWebAdapter } from "../src/browser/gemini-web-adapter.js";
+import { GrokWebAdapter } from "../src/browser/grok-web-adapter.js";
 
 test("chatgpt is the default active provider", () => {
   assert.equal(DEFAULT_PROVIDER, "chatgpt");
@@ -30,23 +30,11 @@ test("resolveProvider returns chatgpt by default and by id", () => {
   assert.equal(resolveProvider("ChatGPT").id, "chatgpt");
 });
 
-test("--mode kimi is treated as --model kimi", () => {
-  assert.deepEqual(
-    resolveCliProviderSelection({ mode: "kimi" }),
-    { model: "kimi", mode: undefined },
-  );
-  assert.deepEqual(
-    resolveCliProviderSelection({ model: "Kimi", mode: "kimi" }),
-    { model: "kimi", mode: undefined },
-  );
-  assert.deepEqual(
-    resolveCliProviderSelection({ mode: "Pro" }),
-    { model: undefined, mode: "Pro" },
-  );
-  assert.throws(
-    () => resolveCliProviderSelection({ model: "chatgpt", mode: "kimi" }),
-    /--mode kimi selects Kimi/,
-  );
+test("providers do not declare automatic model-selection policy", () => {
+  for (const provider of Object.values(PROVIDERS)) {
+    assert.equal("defaultMode" in provider, false);
+    assert.equal("promptsForMode" in provider, false);
+  }
 });
 
 test("resolveProvider rejects an unknown model with the known list", () => {
@@ -57,29 +45,19 @@ test("resolveProvider rejects an unknown model with the known list", () => {
 });
 
 test("claude, deepseek, gemini, kimi, and glm are active with working adapters", () => {
-  for (const id of ["claude", "deepseek", "gemini", "kimi", "glm"]) {
+  for (const id of ["claude", "deepseek", "gemini", "grok", "kimi", "glm"]) {
     assert.equal(PROVIDERS[id].status, "active");
     assert.ok(PROVIDERS[id].adapter, id + " should have an adapter");
     assert.equal(resolveProvider(id).id, id);
   }
   assert.deepEqual(
     listActiveProviderIds().sort(),
-    ["chatgpt", "claude", "deepseek", "gemini", "glm", "kimi"],
+    ["chatgpt", "claude", "deepseek", "gemini", "glm", "grok", "kimi"],
   );
-  assert.equal(PROVIDERS.claude.defaultMode, null);
-  assert.equal(PROVIDERS.gemini.defaultMode, null);
+  assert.equal(PROVIDERS.grok.adapter, GrokWebAdapter);
 });
 
-test("resolveProvider rejects a planned provider that has no adapter yet", () => {
-  // Grok remains registered-but-planned in this pass.
-  assert.equal(PROVIDERS.grok.status, "planned");
-  assert.throws(
-    () => resolveProvider("grok"),
-    /not supported yet.*Active providers/s,
-  );
-});
-
-test("getProvider allows a planned provider (for profile/logout) but rejects unknown", () => {
+test("getProvider returns registered providers but rejects unknown", () => {
   assert.equal(getProvider("grok").id, "grok");
   assert.throws(() => getProvider("nope"), /Unknown model/);
 });
@@ -130,11 +108,9 @@ test("createWebAdapter builds the provider's adapter with its base URL", () => {
     gemini.baseUrl,
     "https://gemini.google.com/app",
   );
-});
 
-test("createWebAdapter refuses a provider without a working adapter", () => {
-  assert.throws(
-    () => createWebAdapter({ provider: "grok", profileDir: "/tmp/p" }),
-    /not supported yet/,
-  );
+  const grok = createWebAdapter({ provider: "grok", profileDir: "/tmp/grok" });
+  assert.ok(grok instanceof GrokWebAdapter);
+  assert.equal(grok.providerName, "Grok");
+  assert.equal(grok.baseUrl, "https://grok.com/");
 });

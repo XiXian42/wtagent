@@ -555,16 +555,7 @@ test("clears Gemini's composer before a fallback fill", async () => {
   assert.ok(events.includes("fill"));
 });
 
-test("keeps Gemini's browser-selected model untouched", async () => {
+test("Gemini adapter never selects a model automatically", () => {
   const adapter = new GeminiWebAdapter({ profileDir: "." });
-  let locatorCalls = 0;
-  adapter.page = {
-    locator() {
-      locatorCalls += 1;
-      return new EmptyLocator();
-    },
-  };
-  const result = await adapter.selectMode(null);
-  assert.equal(result.status, "skipped");
-  assert.equal(locatorCalls, 0);
+  assert.equal(typeof adapter.selectMode, "undefined");
 });

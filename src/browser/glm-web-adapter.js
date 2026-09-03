@@ -5,11 +5,6 @@ export { isConnectionLostError } from "./base-web-adapter.js";
 
 const GLM_URL = "https://chat.z.ai/";
 
-// Preferred models, newest first: try GLM-5.3 when present, else GLM-5.2. The
-// site sometimes exposes 5.3 and sometimes only 5.2, so selection walks this
-// list and clicks the first one present in the menu.
-const PREFERRED_MODELS = ["GLM-5.3", "GLM-5.2"];
-
 // GLM / Z.ai (chat.z.ai) adapter.
 //
 // chat.z.ai is an Open WebUI (Svelte) frontend, verified against the live app:
@@ -21,8 +16,8 @@ const PREFERRED_MODELS = ["GLM-5.3", "GLM-5.2"];
 //   - assistant answer markdown is `.markdown-prose` / `.prose`; a "思考过程"
 //     (deep-thinking) block may precede it and is excluded when reading the reply
 //   - a live conversation URL is /c/<uuid>
-//   - model switcher: `button.modelSelectorButton`; the registry defaultMode
-//     "latest" picks the newest available model (GLM-5.3, else GLM-5.2)
+//   - model choice is intentionally left to the user on chat.z.ai; WTAgent does
+//     not inspect or override the site's current model selection
 //   - Cloudflare guards the site; the base throwIfBlockedPage surfaces the
 //     window so the user can pass the check (wtagent's own CDP launch is not
 //     fingerprinted the way headless automation is)
@@ -161,86 +156,4 @@ export class GLMWebAdapter extends BaseWebAdapter {
     return 120;
   }
 
-  // Selects the newest available model. The registry's defaultMode "latest" maps
-  // to PREFERRED_MODELS (GLM-5.3, else GLM-5.2). Best-effort and non-throwing.
-  //
-  // The switcher is `button.modelSelectorButton`; opening it lists options whose
-  // visible text is the exact model name. After clicking, the switcher label
-  // becomes the selected model name.
-  async selectMode(mode) {
-    this.requirePage();
-    if (mode !== "latest") {
-      return { status: "skipped", requested: mode, attempts: 0 };
-    }
-
-    const switcher = this.page.locator("button.modelSelectorButton").first();
-    await switcher.waitFor({ state: "visible", timeout: 10_000 }).catch(() => null);
-    if (await switcher.count().catch(() => 0) === 0) {
-      await this.writeDiagnostics("glm-model-switcher-not-found");
-      return {
-        status: "switcher_not_found",
-        requested: mode,
-        attempts: 0,
-        reason: "Model switcher was not found.",
-      };
-    }
-
-    const current = (await switcher.innerText().catch(() => "")).trim();
-    // Already on the most-preferred model that exists? If the current label is
-    // the first preferred model, nothing to do.
-    if (current.startsWith(PREFERRED_MODELS[0])) {
-      return {
-        status: "already",
-        requested: mode,
-        selectedLabel: PREFERRED_MODELS[0],
-        attempts: 0,
-        reason: `Already using ${PREFERRED_MODELS[0]}.`,
-      };
-    }
-
-    for (const model of PREFERRED_MODELS) {
-      await switcher.click({ timeout: 5_000 }).catch(() => null);
-      await this.page.waitForTimeout(600);
-      const option = this.page.getByText(model, { exact: true }).first();
-      if (await option.count().catch(() => 0) === 0) {
-        // Not in the menu; close and try the next preferred model.
-        await this.page.keyboard.press("Escape").catch(() => null);
-        continue;
-      }
-      await option.click({ timeout: 5_000 }).catch(() => null);
-      await this.page.waitForTimeout(600);
-      const after = (await switcher.innerText().catch(() => "")).trim();
-      if (after.startsWith(model)) {
-        // The model menu stays open after a selection; a click in the page
-        // center dismisses it so it does not cover the composer.
-        await this.#dismissModelMenu();
-        return {
-          status: current.startsWith(model) ? "already" : "select",
-          requested: mode,
-          selectedLabel: model,
-          attempts: 1,
-          reason: `Selected ${model}.`,
-        };
-      }
-    }
-
-    await this.#dismissModelMenu();
-    await this.writeDiagnostics("glm-mode-latest-unresolved");
-    return {
-      status: "unresolved",
-      requested: mode,
-      attempts: 1,
-      reason: `Could not select any of: ${PREFERRED_MODELS.join(", ")}.`,
-    };
-  }
-
-  async #dismissModelMenu() {
-    const viewport = this.page.viewportSize?.() ?? { width: 1280, height: 800 };
-    await this.page.mouse.click(
-      Math.floor(viewport.width / 2),
-      Math.floor(viewport.height / 2),
-    ).catch(() => null);
-    await this.page.keyboard.press("Escape").catch(() => null);
-    await this.page.waitForTimeout(200);
-  }
 }

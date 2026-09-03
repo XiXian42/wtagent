@@ -2,8 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_LIMITS,
-  PRO_MODEL_TURN_TIMEOUT_MS,
-  isProMode,
   resolveLimits,
 } from "../src/shared/limits.js";
 
@@ -11,15 +9,6 @@ test("model turn timeout defaults to ten minutes", () => {
   assert.equal(DEFAULT_LIMITS.modelTurnTimeoutMs, 10 * 60_000);
   assert.equal(resolveLimits().modelTurnTimeoutMs, 10 * 60_000);
   assert.equal(resolveLimits().modelTurnTimeoutExplicit, undefined);
-});
-
-test("ChatGPT Pro gets the longer sixteen-minute turn timeout", () => {
-  assert.equal(PRO_MODEL_TURN_TIMEOUT_MS, 16 * 60_000);
-  assert.equal(isProMode("Pro"), true);
-  assert.equal(isProMode("pro"), false);
-  assert.equal(isProMode("Current"), false);
-  assert.equal(isProMode(null), false);
-  assert.equal(isProMode("expert-thinking"), false);
 });
 
 test("empty assistant responses use a ten-second window and three retries", () => {
@@ -40,8 +29,7 @@ test("model turn timeout accepts a positive integer CLI value", () => {
   });
 
   assert.equal(limits.modelTurnTimeoutMs, 720_000);
-  // An explicit CLI value is marked so the runtime never overrides it with
-  // the mode-aware Pro timeout.
+  // An explicit CLI value is marked so the runtime uses it as-is.
   assert.equal(limits.modelTurnTimeoutExplicit, true);
   assert.notEqual(limits, DEFAULT_LIMITS);
 });

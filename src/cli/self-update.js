@@ -6,12 +6,14 @@ import { getPackageName, getPackageVersion } from "../shared/package-info.js";
 export const UPDATE_CHECK_TIMEOUT_MS = NETWORK_TIMEOUT_MS;
 export const UPDATE_COMMAND_TIMEOUT_MS = 10_000;
 export const INSTALL_TIMEOUT_MS = 120_000;
-export const MANUAL_INSTALL_COMMAND = "npm install -g wtagent@latest";
+export const OFFICIAL_NPM_REGISTRY = "https://registry.npmjs.org/";
+export const MANUAL_INSTALL_COMMAND =
+  `npm install -g wtagent@latest --registry=${OFFICIAL_NPM_REGISTRY}`;
 
 const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
 
 export function npmRegistryLatestUrl(name = getPackageName()) {
-  return `https://registry.npmjs.org/${encodeURIComponent(name)}/latest`;
+  return `${OFFICIAL_NPM_REGISTRY}${encodeURIComponent(name)}/latest`;
 }
 
 export function parseVersion(value) {
@@ -76,7 +78,12 @@ export async function installLatest({
   timeoutMs = INSTALL_TIMEOUT_MS,
   stdio = "inherit",
 } = {}) {
-  const plan = planCommandImpl("npm", ["install", "-g", "wtagent@latest"]);
+  const plan = planCommandImpl("npm", [
+    "install",
+    "-g",
+    "wtagent@latest",
+    `--registry=${OFFICIAL_NPM_REGISTRY}`,
+  ]);
   return await new Promise((resolve) => {
     let settled = false;
     let timer;

@@ -8,6 +8,8 @@
 // A single Renderer instance is shared across every turn of a conversation so
 // spinner state and per-tool timing survive between the model's replies.
 
+import { t } from "./i18n.js";
+
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
 const CYAN = "\x1b[36m";
@@ -109,7 +111,7 @@ export class Renderer {
     }
     this.spinner = {
       kind: "processing",
-      label: "processing request",
+      label: t("renderer.processing"),
       start: Date.now(),
       bytes: 0,
     };
@@ -119,7 +121,7 @@ export class Renderer {
   beginRunning(name) {
     this.spinner = {
       kind: "running",
-      label: `running ${name}`,
+      label: t("renderer.running", { tool: name }),
       start: Date.now(),
       bytes: 0,
     };
@@ -235,7 +237,7 @@ export class Renderer {
   answer(message) {
     this.stopSpinner();
     this.println("");
-    this.println(`${GREEN}${BOLD}⏺ assistant${RESET}`);
+    this.println(`${GREEN}${BOLD}⏺ ${t("renderer.assistant")}${RESET}`);
     for (const line of String(message ?? "").split(/\r?\n/)) {
       this.println(line);
     }
@@ -260,36 +262,25 @@ export class Renderer {
           break;
         }
         this.lifecycleShown.add(type);
-        this.status("Chrome started.");
+        this.status(t("renderer.chromeStarted"));
         break;
       case "browser.auth_required":
         this.stopSpinner();
-        this.println(`${YELLOW}Log in to ${this.providerLabel} in the opened Chrome window…${RESET}`);
+        this.println(
+          `${YELLOW}${t("renderer.loginRequired", { provider: this.providerLabel })}${RESET}`,
+        );
         break;
       case "browser.authenticated":
-        this.println(`${GREEN}${this.providerLabel} login detected.${RESET}`);
+        this.println(
+          `${GREEN}${t("renderer.loginDetected", { provider: this.providerLabel })}${RESET}`,
+        );
         break;
-      case "conversation.mode_selected": {
-        const { requested, status, selectedLabel } = payload;
-        if (status === "select" || status === "already") {
-          this.status(`Mode: ${selectedLabel ?? requested}.`);
-        } else if (status === "fallback") {
-          this.note(`Mode: ${requested} unavailable; using ${selectedLabel}.`);
-        } else {
-          this.note(`Mode: could not select ${requested}; continuing on current mode.`);
-        }
-        break;
-      }
       case "conversation.started":
         if (this.lifecycleShown.has(type)) {
           break;
         }
         this.lifecycleShown.add(type);
-        if (payload.mode) {
-          this.status(`Conversation ready (${payload.mode}).`);
-        } else {
-          this.status("Conversation ready (current mode).");
-        }
+        this.status(t("renderer.conversationReady"));
         break;
       case "model.message_sent":
         this.beginProcessing();
@@ -305,18 +296,29 @@ export class Renderer {
         this.stopSpinner();
         this.note(
           payload.deadRequest
-            ? `no reply from ${this.providerLabel}; asking it to continue (${payload.retry}/${payload.maxRetries})`
+            ? t("renderer.noReply", {
+              provider: this.providerLabel,
+              retry: payload.retry,
+              maxRetries: payload.maxRetries,
+            })
             : payload.generationFailed
-              ? `${this.providerLabel} generation failed (server error); asking it to retry (${payload.retry}/${payload.maxRetries})`
-              : `empty ${this.providerLabel} response; asking it to continue (${payload.retry}/${payload.maxRetries})`,
+              ? t("renderer.generationFailed", {
+                provider: this.providerLabel,
+                retry: payload.retry,
+                maxRetries: payload.maxRetries,
+              })
+              : t("renderer.emptyResponse", {
+                provider: this.providerLabel,
+                retry: payload.retry,
+                maxRetries: payload.maxRetries,
+              }),
         );
         break;
       case "model.limit_reached":
         this.stopSpinner();
-        this.note(
-          `${this.providerLabel} usage limit reached. Wait for the limit to reset, `
-            + "try a different mode on resume, or change plans.",
-        );
+        this.note(t("renderer.limitReached", {
+          provider: this.providerLabel,
+        }));
         break;
       case "model.progress":
         this.stopSpinner();
@@ -329,7 +331,7 @@ export class Renderer {
         break;
       case "protocol.plain_answer":
         this.stopSpinner();
-        this.note("The model answered without the XML protocol; showing the reply as the final answer.");
+        this.note(t("renderer.plainAnswer"));
         break;
       case "tool.proposed":
         this.stopSpinner();
@@ -361,21 +363,25 @@ export class Renderer {
         this.stopSpinner();
         if (!payload.id || !this.handled.has(payload.id)) {
           if (payload.id) this.handled.add(payload.id);
-          this.println(`${this.#hdr()} ${DIM}↺ reused prior result for ${payload.name}${RESET}`);
+          this.println(
+            `${this.#hdr()} ${DIM}↺ ${t("renderer.reused", { tool: payload.name })}${RESET}`,
+          );
         }
         break;
       case "tool.reused_unknown":
         this.stopSpinner();
         if (!payload.id || !this.handled.has(payload.id)) {
           if (payload.id) this.handled.add(payload.id);
-          this.println(`${this.#hdr()} ${YELLOW}↺ reused (completion unknown) for ${payload.name}${RESET}`);
+          this.println(
+            `${this.#hdr()} ${YELLOW}↺ ${t("renderer.reusedUnknown", { tool: payload.name })}${RESET}`,
+          );
         }
         break;
       case "tool.conflict":
         this.stopSpinner();
         if (!payload.id || !this.handled.has(payload.id)) {
           if (payload.id) this.handled.add(payload.id);
-          this.note(`conflicting reuse for ${payload.name}`);
+          this.note(t("renderer.conflictingReuse", { tool: payload.name }));
         }
         break;
       case "run.completed":
@@ -383,12 +389,16 @@ export class Renderer {
         break;
       case "run.interrupted":
         this.stopSpinner();
-        this.println(`${YELLOW}Run interrupted: ${truncate(payload.message, 160)}${RESET}`);
+        this.println(`${YELLOW}${t("renderer.interrupted", {
+          message: truncate(payload.message, 160),
+        })}${RESET}`);
         break;
       case "run.recovery_required":
         this.stopSpinner();
         this.println(
-          `${YELLOW}${truncate(payload.message, 180)} The session and Chrome window remain open.${RESET}`,
+          `${YELLOW}${t("renderer.recoveryOpen", {
+            message: truncate(payload.message, 180),
+          })}${RESET}`,
         );
         break;
       case "tool.result_sent":

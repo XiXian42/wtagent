@@ -5,7 +5,6 @@ import { launchAndConnectCdpChrome } from "./cdp-browser.js";
 import { discoverChromeExecutable } from "../platform/chrome-discovery.js";
 import { ensureDirectory } from "../platform/paths.js";
 import { BrowserAdapterError } from "../shared/errors.js";
-import { runModeSelection } from "./mode-selection.js";
 
 // Playwright error messages for a dead transport. The Chrome process itself is
 // usually still alive (e.g. the connection died while the Mac slept); these
@@ -76,9 +75,10 @@ function sameConversationUrl(left, right) {
 // The runtime talks to this class only through its public methods; everything
 // that varies between providers (ChatGPT, DeepSeek, …) is isolated behind the
 // overridable "primitive" methods below. A concrete provider subclass supplies
-// its base URL, DOM locators, message-identity extraction, and (optionally) a
-// model-switcher port; it must NOT re-implement the turn-completion loop, the
-// send/auth/reconnect flow, or the WTAgent <agent_response> protocol timing.
+// its base URL, DOM locators, and message-identity extraction; it must NOT
+// re-implement the turn-completion loop, send/auth/reconnect flow, or the
+// WTAgent <agent_response> protocol timing. Model selection deliberately stays
+// outside adapters: users choose their model directly on the provider website.
 //
 // IMPORTANT (JavaScript semantics): primitives that the base dispatches to a
 // provider are declared as ordinary (non-#private) methods. `#private` methods
@@ -113,7 +113,6 @@ export class BaseWebAdapter {
     this.assistantCountBeforeSend = 0;
     this.sentUserTurn = null;
     this.lastAssistantMessageId = null;
-    this.lastModeSelection = null;
   }
 
   // ---- provider primitives (override in subclasses) ----------------------
@@ -201,23 +200,6 @@ export class BaseWebAdapter {
   // nudges the model to regenerate instead. Default: never a failure card.
   async findGenerationErrorMarker(_message) {
     return null;
-  }
-
-  // Port consumed by runModeSelection(). Default reports no switcher, so
-  // selectMode() resolves to "switcher_not_found" and never blocks a provider
-  // that has no model picker.
-  modeSelectionPort() {
-    return {
-      alreadyOnMode: async () => false,
-      hasSwitcher: async () => false,
-      openMenu: async () => {},
-      readOptions: async () => [],
-      clickOption: async () => false,
-      waitClosed: async () => false,
-      waitSelected: async () => false,
-      closeMenu: async () => {},
-      writeDiagnostics: async (label) => this.writeDiagnostics(label),
-    };
   }
 
   // Best-effort composer file upload. Default: nothing attached.
@@ -519,18 +501,6 @@ export class BaseWebAdapter {
         );
       }
     }
-  }
-
-  async selectMode(mode) {
-    this.requirePage();
-    if (!mode) {
-      return { status: "skipped", requested: mode, attempts: 0 };
-    }
-
-    const port = this.modeSelectionPort();
-    const result = await runModeSelection(port, mode);
-    this.lastModeSelection = result;
-    return result;
   }
 
   async getConversationUrl() {

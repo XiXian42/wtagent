@@ -19,15 +19,8 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxSearchResults: 200,
 });
 
-// ChatGPT Pro plans can legitimately think longer than the default before the
-// first token (see the runtime's mode-aware timeout selection).
-export const PRO_MODEL_TURN_TIMEOUT_MS = 16 * 60_000;
-
-// The CLI's --model-turn-timeout-ms always wins over the mode-aware default.
-export function isProMode(mode) {
-  return String(mode ?? "") === "Pro";
-}
-
+// Model response timing is provider/model agnostic. Users who need a longer
+// window can override it explicitly with --model-turn-timeout-ms.
 export function resolveLimits({ modelTurnTimeoutMs } = {}) {
   if (modelTurnTimeoutMs == null || modelTurnTimeoutMs === "") {
     return DEFAULT_LIMITS;

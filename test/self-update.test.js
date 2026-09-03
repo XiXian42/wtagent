@@ -74,7 +74,7 @@ test("fetchJson times out and returns null instead of throwing", async () => {
   assert.equal(result, null);
 });
 
-test("installLatest treats a zero exit as success", async () => {
+test("installLatest uses the official registry and treats a zero exit as success", async () => {
   const calls = [];
   const result = await installLatest({
     planCommandImpl: (program, argv) => {
@@ -91,7 +91,12 @@ test("installLatest treats a zero exit as success", async () => {
   assert.equal(result.ok, true);
   assert.deepEqual(calls, [{
     program: "npm",
-    argv: ["install", "-g", "wtagent@latest"],
+    argv: [
+      "install",
+      "-g",
+      "wtagent@latest",
+      "--registry=https://registry.npmjs.org/",
+    ],
   }]);
 });
 
@@ -164,7 +169,10 @@ test("wtagent update prints a manual command when the check or install fails", a
     writeError: (line) => errors.push(line),
   });
   assert.equal(offline.status, "error");
-  assert.match(errors.join("\n"), /npm install -g wtagent@latest/);
+  assert.match(
+    errors.join("\n"),
+    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\//,
+  );
 
   errors.length = 0;
   const failed = await runSelfUpdate({
@@ -176,5 +184,8 @@ test("wtagent update prints a manual command when the check or install fails", a
   });
   assert.equal(failed.status, "error");
   assert.match(errors.join("\n"), /Update failed/);
-  assert.match(errors.join("\n"), /npm install -g wtagent@latest/);
+  assert.match(
+    errors.join("\n"),
+    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\//,
+  );
 });

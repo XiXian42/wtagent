@@ -402,63 +402,7 @@ function createModePage({ expertChecked = false, thinkingOn = false } = {}) {
   return page;
 }
 
-test("selectMode silently applies 专家模式 + 深度思考 from a fresh (fast) conversation", async () => {
+test("DeepSeek adapter never selects a model or mode automatically", () => {
   const adapter = new DeepSeekWebAdapter({ profileDir: "." });
-  adapter.page = createModePage({ expertChecked: false, thinkingOn: false });
-
-  const result = await adapter.selectMode("expert-thinking");
-
-  assert.equal(result.status, "select");
-  assert.match(result.selectedLabel, /expert.*deep-thinking/i);
-  assert.equal(adapter.page.controls.expert.on, true);
-  assert.equal(adapter.page.controls.thinking.on, true);
-  // Each control was clicked exactly once (it was off).
-  assert.equal(adapter.page.controls.expert.clicks, 1);
-  assert.equal(adapter.page.controls.thinking.clicks, 1);
-});
-
-test("selectMode is idempotent when already on 专家模式 + 深度思考", async () => {
-  const adapter = new DeepSeekWebAdapter({ profileDir: "." });
-  adapter.page = createModePage({ expertChecked: true, thinkingOn: true });
-
-  const result = await adapter.selectMode("expert-thinking");
-
-  assert.equal(result.status, "select");
-  // No clicks needed — both were already in the desired state.
-  assert.equal(adapter.page.controls.expert.clicks, 0);
-  assert.equal(adapter.page.controls.thinking.clicks, 0);
-  assert.equal(adapter.page.controls.expert.on, true);
-  assert.equal(adapter.page.controls.thinking.on, true);
-});
-
-test("selectMode ignores non-expert-thinking modes (keeps current)", async () => {
-  const adapter = new DeepSeekWebAdapter({ profileDir: "." });
-  adapter.page = createModePage();
-
-  const result = await adapter.selectMode(null);
-  assert.equal(result.status, "skipped");
-  assert.equal(adapter.page.controls.expert.clicks, 0);
-});
-
-test("selectMode reports unresolved when a control is missing", async () => {
-  const adapter = new DeepSeekWebAdapter({ profileDir: "." });
-  // A page missing the 深度思考 toggle (UI drift) — expert still selects, but the
-  // toggle cannot be confirmed, so the result is unresolved (never throws).
-  const expert = new ModeControl({ kind: "chip", label: "专家模式", on: true, group: [] });
-  adapter.page = {
-    async waitForTimeout() {},
-    locator(selector) {
-      if (selector === '[role="radio"]') {
-        return {
-          async count() { return 1; },
-          nth() { return expert; },
-        };
-      }
-      return { async count() { return 0; }, first() { return this; } };
-    },
-  };
-
-  const result = await adapter.selectMode("expert-thinking");
-  assert.equal(result.status, "unresolved");
-  assert.match(result.reason, /deep-thinking-toggle/);
+  assert.equal(typeof adapter.selectMode, "undefined");
 });

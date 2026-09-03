@@ -19,11 +19,7 @@ import {
   toolResultOutput,
   userMessage,
 } from "../session/canonical-transcript.js";
-import {
-  DEFAULT_LIMITS,
-  PRO_MODEL_TURN_TIMEOUT_MS,
-  isProMode,
-} from "../shared/limits.js";
+import { DEFAULT_LIMITS } from "../shared/limits.js";
 import { utf8ByteLength } from "../shared/text-budget.js";
 import {
   BrowserAdapterError,
@@ -148,6 +144,7 @@ export class AgentRuntime {
     session,
     approval,
     onEvent,
+    postAuthSetup = null,
     limits = DEFAULT_LIMITS,
   }) {
     this.adapter = adapter;
@@ -156,6 +153,7 @@ export class AgentRuntime {
     this.session = session;
     this.approval = approval;
     this.onEvent = onEvent;
+    this.postAuthSetup = postAuthSetup;
     this.limits = limits;
   }
 
@@ -239,12 +237,10 @@ export class AgentRuntime {
     instruction = null,
     files = [],
     inPlaceRecovery = false,
-    mode = null,
   } = {}) {
     const {
       task,
       projectRoot,
-      mode: sessionMode,
     } = this.session.state;
     const previousConversationUrl = this.session.state.conversationUrl;
     await this.session.recoverInterruptedSideEffects();
@@ -300,58 +296,25 @@ export class AgentRuntime {
           : null,
       },
     );
-    // A fresh run uses the mode stored at session creation; a resume applies
-    // an explicit mode override (--mode or the interactive choice) when given,
-    // and otherwise keeps the mode the conversation is already on.
-    const requestedMode = mode ?? sessionMode;
-    // The actual mode may differ from the requested one (Pro limited, fallback,
-    // or switcher not found), so report what was really selected.
-    let activeMode = resume
-      ? (this.session.state.activeMode ?? null)
-      : null;
-    const selectRequested = Boolean(
-      requestedMode && (!resume || mode != null),
-    );
-    if (selectRequested) {
-      const modeResult = await this.adapter.selectMode(requestedMode);
-      if (modeResult) {
-        await this.emit("conversation.mode_selected", {
-          requested: requestedMode,
-          status: modeResult.status,
-          selectedLabel: modeResult.selectedLabel ?? null,
-          attempts: modeResult.attempts ?? 0,
-          reason: modeResult.reason ?? null,
-        });
-        if (modeResult.status === "select" || modeResult.status === "already") {
-          activeMode = modeResult.selectedLabel ?? requestedMode;
-        } else if (modeResult.status === "fallback") {
-          activeMode = modeResult.selectedLabel ?? requestedMode;
-        } else {
-          // Pro not selected and no known fallback label — the real mode is
-          // whatever ChatGPT already had, which we cannot name reliably.
-          activeMode = null;
-        }
-      }
+
+    // Optional setup after authentication and the target conversation are
+    // ready, but before the first message is sent. Interactive CLI runs use
+    // this to let the user choose a model directly on the provider website.
+    // WTAgent never names, selects, or overrides a provider-specific model.
+    // Resumes skip this setup so an existing conversation is not interrupted.
+    if (!resume && this.postAuthSetup) {
+      await this.postAuthSetup({ adapter: this.adapter });
     }
-    // ChatGPT Pro can think considerably longer before the first token;
-    // every other provider/mode uses the default. An explicit
-    // --model-turn-timeout-ms always wins (resolveLimits marks it). The
-    // active mode may differ from the requested one (Pro limited, fallback),
-    // so prefer the mode the conversation is actually on.
-    const modelTurnTimeoutMs = !this.limits.modelTurnTimeoutExplicit
-      && (isProMode(activeMode) || isProMode(requestedMode))
-      ? PRO_MODEL_TURN_TIMEOUT_MS
-      : this.limits.modelTurnTimeoutMs;
+
+    const modelTurnTimeoutMs = this.limits.modelTurnTimeoutMs;
 
     await this.session.update({
       phase: "running",
       conversationUrl: await this.adapter.getConversationUrl(),
-      activeMode,
+      activeMode: null,
     });
     await this.emit("conversation.started", {
       url: this.session.state.conversationUrl,
-      mode: activeMode,
-      requestedMode,
     });
 
     let initialMessage;

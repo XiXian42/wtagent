@@ -11,7 +11,6 @@ import {
   getProviderProfileDir,
   isProviderProfileBasename,
   listActiveProviderIds,
-  resolveCliProviderSelection,
   resolveProvider,
 } from "../browser/provider-registry.js";
 import {
@@ -45,11 +44,7 @@ import {
   ShellChatInput,
 } from "./prompt-input.js";
 import { createRenderer } from "./render-events.js";
-import {
-  CHATGPT_MODE_CHOICES,
-  modeFromPromptChoice,
-  normalizeConfiguredMode,
-} from "./mode-choice.js";
+import { t } from "./i18n.js";
 import { runSelfUpdate } from "./self-update.js";
 import { runStartupChecks } from "./startup-notices.js";
 
@@ -58,10 +53,6 @@ import { runStartupChecks } from "./startup-notices.js";
 // (each provider logs in independently); an explicit `--profile-dir` still
 // overrides it. Defaults to the ChatGPT profile so callers that predate
 // multi-provider support are unaffected.
-function withResolvedProviderSelection(options) {
-  return { ...options, ...resolveCliProviderSelection(options) };
-}
-
 function resolveRuntimePaths(options, providerId = DEFAULT_PROVIDER) {
   const appDataDir = path.resolve(options.home ?? getAppDataDir());
   return {
@@ -83,12 +74,11 @@ async function assertDirectory(directory) {
 
 async function runLogin(options) {
   assertNativeRuntimeSupported();
-  options = withResolvedProviderSelection(options);
   const provider = resolveProvider(options.model ?? DEFAULT_PROVIDER);
   const { profileDir } = resolveRuntimePaths(options, provider.id);
   const { label, baseUrl } = provider;
   for (;;) {
-    console.log(`Opening native Chrome profile: ${profileDir}`);
+    console.log(t("login.openingProfile", { profileDir }));
     console.log(
       `This window has no CDP flags. Finish until ${label} shows your signed-in home/chat history and no Log in button.`,
     );
@@ -106,7 +96,7 @@ async function runLogin(options) {
       if (answer == null) {
         return;
       }
-      console.log("Closing native Chrome and saving the dedicated profile...");
+      console.log(t("login.savingProfile"));
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     } finally {
       await browser.close();
@@ -129,7 +119,7 @@ async function runLogin(options) {
         }
       }
       if (authenticated) {
-        console.log(`${label} login verified through a fresh CDP connection.`);
+        console.log(t("login.verified", { provider: label }));
         return;
       }
     } finally {
@@ -150,14 +140,13 @@ async function runLogout(options) {
   // `logout` targets one provider's profile; unknown ids are rejected but a
   // "planned" provider is still allowed (its profile may exist from a prior
   // login attempt), so use getProvider rather than resolveProvider.
-  options = withResolvedProviderSelection(options);
   const provider = getProvider(options.model ?? DEFAULT_PROVIDER);
   const { profileDir } = resolveRuntimePaths(options, provider.id);
   const exists = await fs.stat(profileDir)
     .then((stat) => stat.isDirectory())
     .catch(() => false);
   if (!exists) {
-    console.log(`No Chrome profile found at ${profileDir}; already logged out.`);
+    console.log(t("logout.none", { profileDir }));
     return;
   }
 
@@ -181,13 +170,13 @@ async function runLogout(options) {
       default: false,
     });
     if (!confirmed) {
-      console.log("Logout cancelled.");
+      console.log(t("logout.cancelled"));
       return;
     }
   }
 
   await fs.rm(profileDir, { recursive: true, force: true });
-  console.log(`Logged out. Removed ${profileDir}.`);
+  console.log(t("logout.done", { profileDir }));
   console.log(
     provider.id === DEFAULT_PROVIDER
       ? "Run `wtagent login` to sign in again."
@@ -231,6 +220,8 @@ class ConversationRunner {
     // The profile dir and adapter follow from it, so resumes reuse the right
     // login even when the CLI is invoked without --model.
     const provider = resolveProvider(session.state.provider ?? DEFAULT_PROVIDER);
+    this.provider = provider;
+    this.interactive = interactive;
     this.paths = resolveRuntimePaths(options, provider.id);
     this.limits = resolveLimits({
       modelTurnTimeoutMs: options.modelTurnTimeoutMs,
@@ -267,20 +258,45 @@ class ConversationRunner {
       policy: new PolicyEngine({ store: this.approvalStore }),
       session: this.session,
       limits: this.limits,
+      postAuthSetup: (
+        this.interactive
+          ? async ({ adapter }) => {
+            this.renderer.stopSpinner();
+            await adapter.restoreWindow?.();
+            try {
+              const answer = await promptForText({
+                message: t("model.chooseInBrowser", {
+                  provider: this.provider.label,
+                }),
+              });
+              if (answer == null) {
+                throw new Error(t("model.setupCancelled"));
+              }
+            } finally {
+              await adapter.minimizeWindow?.();
+            }
+          }
+          : null
+      ),
       approval: async ({ toolCall, reasons }) => {
         this.renderer.stopSpinner();
-        console.log(`\n${"\x1b[33m"}Approval required for ${toolCall.name}:${"\x1b[0m"}`);
+        console.log(
+          `\n${"\x1b[33m"}${t("approval.required", { tool: toolCall.name })}${"\x1b[0m"}`,
+        );
         for (const reason of reasons) {
           console.log(`- ${reason}`);
         }
         console.log(JSON.stringify(toolCall.args, null, 2));
         const choice = await select({
-          message: "How should this action be handled?",
+          message: t("approval.how"),
           choices: [
-            { name: "Allow once", value: "once" },
-            { name: `Always allow ${toolCall.name}`, value: "always-tool" },
-            { name: "Always allow everything", value: "always-all" },
-            { name: "Deny", value: "deny" },
+            { name: t("approval.once"), value: "once" },
+            {
+              name: t("approval.alwaysTool", { tool: toolCall.name }),
+              value: "always-tool",
+            },
+            { name: t("approval.alwaysAll"), value: "always-all" },
+            { name: t("approval.deny"), value: "deny" },
           ],
         });
         if (choice === "deny") {
@@ -289,17 +305,16 @@ class ConversationRunner {
         if (choice === "always-tool") {
           this.approvalStore.setAlwaysAllowedTool(toolCall.name);
           await this.approvalStore.save();
-          console.log(
-            `Saved for this session: ${toolCall.name} will always be allowed `
-            + `(${this.approvalStore.filePath}).`,
-          );
+          console.log(t("approval.savedTool", {
+            tool: toolCall.name,
+            file: this.approvalStore.filePath,
+          }));
         } else if (choice === "always-all") {
           this.approvalStore.setAlwaysAllowAll();
           await this.approvalStore.save();
-          console.log(
-            `Saved for this session: every tool will always be allowed `
-            + `(${this.approvalStore.filePath}).`,
-          );
+          console.log(t("approval.savedAll", {
+            file: this.approvalStore.filePath,
+          }));
         }
         return true;
       },
@@ -430,18 +445,18 @@ async function promptToResolveProfileLock(error) {
   const pid = Number(error.details?.pid);
   console.log(`\n${"\x1b[33m"}${error.message}${"\x1b[0m"}`);
   const choice = await promptForSelect({
-    message: "How should this be handled?",
+    message: t("profileLock.how"),
     choices: [
-      { name: "Kill that session and continue", value: "kill" },
-      { name: "I closed its Chrome window; retry", value: "retry" },
-      { name: "Quit", value: "quit" },
+      { name: t("profileLock.kill"), value: "kill" },
+      { name: t("profileLock.retry"), value: "retry" },
+      { name: t("profileLock.quit"), value: "quit" },
     ],
   });
   if (choice == null || choice === "quit") {
     return false;
   }
   if (choice === "kill" && Number.isSafeInteger(pid) && pid > 0) {
-    console.log(`Stopping pid=${pid}...`);
+    console.log(t("profileLock.stopping", { pid }));
     try {
       process.kill(pid, "SIGTERM");
     } catch {
@@ -477,17 +492,17 @@ async function executeSession({
 
   const onInterrupt = () => {
     if (runner.interrupted) {
-      console.log("\nForce quitting.");
+      console.log(`\n${t("session.forceQuit")}`);
       // process.exit skips the finally block, so repeat the session/resume
       // hint here — the user should always know how to continue.
-      console.log(`Session saved at: ${session.directory}`);
+      console.log(t("session.savedAt", { directory: session.directory }));
       printResumeHint(session.sessionId);
       process.exit(130);
     }
     runner.interrupted = true;
     runner.adapter.escCancelRequested = true;
     runner.renderer.stopSpinner();
-    console.log("\nCtrl+C — cancelling. Press again to force quit.");
+    console.log(`\n${t("session.ctrlC")}`);
     process.exitCode = 130;
   };
   process.on("SIGINT", onInterrupt);
@@ -535,7 +550,7 @@ async function executeSession({
         if (!interactive) {
           throw result.error;
         }
-        runner.renderer.hint("Turn cancelled. Type a new message or quit.");
+        runner.renderer.hint(t("session.cancelledHint"));
         turnResume = true;
         turnInPlaceRecovery = false;
         continue;
@@ -574,7 +589,7 @@ async function executeSession({
         (item) => item.status === "running",
       );
       if (running.length > 0) {
-        runner.renderer.hint("Managed processes still running:");
+        runner.renderer.hint(t("session.processesRunning"));
         for (const item of running) {
           runner.renderer.hint(
             `  ${item.processId} pid=${item.pid} ${item.detectedUrls.join(" ")}`,
@@ -599,7 +614,7 @@ async function executeSession({
     process.removeListener("SIGINT", onInterrupt);
     activeChatInput?.close();
     await runner.close({ keepBrowser: runFailed });
-    console.log(`Session saved at: ${session.directory}`);
+    console.log(t("session.savedAt", { directory: session.directory }));
     printResumeHint(session.sessionId);
   }
 }
@@ -610,7 +625,7 @@ function printResumeHint(sessionId) {
   const rule = "─".repeat(48);
   console.log("");
   console.log(rule);
-  console.log(`Resume this conversation with: wtagent resume ${sessionId}`);
+  console.log(t("session.resumeWith", { sessionId }));
   console.log(rule);
   console.log("");
 }
@@ -692,7 +707,6 @@ async function runUpdate() {
 
 async function runAgent(taskParts, options) {
   assertNativeRuntimeSupported();
-  options = withResolvedProviderSelection(options);
   const projectRoot = path.resolve(options.project ?? process.cwd());
   await assertDirectory(projectRoot);
 
@@ -711,35 +725,6 @@ async function runAgent(taskParts, options) {
     printChatBanner(projectRoot, provider);
   }
 
-  // Mode selection is abstracted per provider: some prompt (ChatGPT's
-  // Pro/Current), others silently apply their configured default at
-  // conversation start (DeepSeek → 专家模式 + 深度思考). The chosen value is
-  // handed to the adapter's selectMode() by the runtime.
-  let requestedMode;
-  if (!provider.promptsForMode) {
-    if (options.mode != null) {
-      console.log(`Note: --mode is ignored for ${provider.label}.`);
-    }
-    requestedMode = provider.defaultMode;
-  } else if (options.mode != null) {
-    requestedMode = normalizeConfiguredMode(options.mode);
-  } else if (interactive) {
-    const modeChoice = await promptForSelect({
-      message: `${provider.label} mode`,
-      choices: CHATGPT_MODE_CHOICES,
-    });
-    if (modeChoice == null) {
-      chatInput?.close();
-      console.log("");
-      return null;
-    }
-    requestedMode = modeFromPromptChoice(modeChoice);
-  } else {
-    // Non-interactive callers cannot answer a picker. Preserve the current web
-    // setting unless they explicitly opt into `--mode Pro`.
-    requestedMode = null;
-  }
-
   // In interactive mode an initial task is optional: the user can just start
   // typing at the prompt. In one-shot mode a task is required.
   let task = taskParts.join(" ").trim();
@@ -747,8 +732,8 @@ async function runAgent(taskParts, options) {
     const initialMessage = interactive
       ? await readChatMessage(() => chatInput.read())
       : await promptForText({
-        message: "Task",
-        validate: (value) => value.trim() ? true : "Please type a message.",
+        message: t("task.prompt"),
+        validate: (value) => value.trim() ? true : t("task.required"),
       });
     if (initialMessage == null) {
       chatInput?.close();
@@ -767,7 +752,7 @@ async function runAgent(taskParts, options) {
     task,
     projectRoot,
     provider: provider.id,
-    mode: requestedMode,
+    mode: null,
   });
 
   // Resolve @file attachments in the opening task, if any. The task itself is
@@ -778,12 +763,14 @@ async function runAgent(taskParts, options) {
     const { files: found, missing } = await extractAtMentions(task, projectRoot);
     files = found;
     if (found.length > 0) {
-      console.log(`Attaching: ${found.map((file) => file.name).join(", ")}`);
+      console.log(t("attachment.attaching", {
+        files: found.map((file) => file.name).join(", "),
+      }));
     }
     if (missing.length > 0) {
-      console.log(
-        `Not attached (${missing.map((m) => `${m.requested}: ${m.reason}`).join("; ")})`,
-      );
+      console.log(t("attachment.notAttached", {
+        details: missing.map((m) => `${m.requested}: ${m.reason}`).join("; "),
+      }));
     }
   }
 
@@ -796,7 +783,7 @@ function printChatBanner(projectRoot, provider) {
   const RESET = "\x1b[0m";
   console.log("");
   console.log(`${CYAN}WTAgent${RESET} ${DIM}· ${provider.label} · ${projectRoot}${RESET}`);
-  console.log(`${DIM}Enter sends · Shift+Enter or Ctrl+J newline · ESC cancels processing · multiline paste · ↑/↓ history · "exit", Ctrl+C, or Ctrl+D quits${RESET}`);
+  console.log(`${DIM}${t("banner.controls")}${RESET}`);
   console.log("");
 }
 
@@ -819,7 +806,6 @@ async function loadSession(paths, sessionId) {
 
 async function runResume(sessionId, instructionParts, options) {
   assertNativeRuntimeSupported();
-  options = withResolvedProviderSelection(options);
   // Loading only needs the sessions dir (provider-independent); the provider is
   // then read from the session so the run reuses the right adapter + profile.
   const paths = resolveRuntimePaths(options);
@@ -842,36 +828,6 @@ async function runResume(sessionId, instructionParts, options) {
     return null;
   }
 
-  // Like a fresh run, interactive resumes offer a mode choice (prompting
-  // providers only), defaulting to the mode the conversation is already on.
-  // `--mode` overrides it and also works non-interactively. This matters after
-  // a usage limit, where switching thinking levels can get past the block.
-  // Non-prompting providers (e.g. DeepSeek) keep the mode the existing
-  // conversation was created with — it does not need re-asserting on resume.
-  let requestedMode;
-  if (!provider.promptsForMode) {
-    requestedMode = null;
-  } else if (options.mode != null) {
-    requestedMode = normalizeConfiguredMode(options.mode);
-  } else if (
-    !options.once
-    && process.stdin.isTTY
-    && process.stdout.isTTY
-  ) {
-    const modeChoice = await promptForSelect({
-      message: `${provider.label} mode`,
-      choices: CHATGPT_MODE_CHOICES,
-      default: session.state.activeMode === "Pro" ? "pro" : "current",
-    });
-    if (modeChoice == null) {
-      console.log("");
-      return null;
-    }
-    requestedMode = modeFromPromptChoice(modeChoice);
-  } else {
-    requestedMode = null;
-  }
-
   const instruction = instructionParts.join(" ").trim();
   let files = [];
   if (instruction) {
@@ -879,12 +835,14 @@ async function runResume(sessionId, instructionParts, options) {
     const { files: found, missing } = await extractAtMentions(instruction, projectRoot);
     files = found;
     if (found.length > 0) {
-      console.log(`Attaching: ${found.map((file) => file.name).join(", ")}`);
+      console.log(t("attachment.attaching", {
+        files: found.map((file) => file.name).join(", "),
+      }));
     }
     if (missing.length > 0) {
-      console.log(
-        `Not attached (${missing.map((m) => `${m.requested}: ${m.reason}`).join("; ")})`,
-      );
+      console.log(t("attachment.notAttached", {
+        details: missing.map((m) => `${m.requested}: ${m.reason}`).join("; "),
+      }));
     }
     await session.appendInstruction(instruction, { files });
   }
@@ -895,7 +853,6 @@ async function runResume(sessionId, instructionParts, options) {
     resume: true,
     instruction: instruction || null,
     files,
-    mode: requestedMode,
   });
 }
 
@@ -923,7 +880,7 @@ async function runStatus(sessionId, options) {
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, 20);
   if (sessions.length === 0) {
-    console.log("No sessions found.");
+    console.log(t("status.none"));
     return;
   }
 
@@ -969,74 +926,56 @@ async function runExport(sessionId, options) {
 
 const program = new Command()
   .name("wtagent")
-  .description("Turn your web AI session into a local tool-using agent.")
+  .description(t("app.description"))
   .version(getPackageVersion())
-  .option("--home <path>", "Application data directory")
-  .option("--profile-dir <path>", "Dedicated Chrome profile directory")
-  .option("--chrome-path <path>", "Chrome/Chromium executable")
-  .option("-C, --project <path>", "Project directory", process.cwd())
+  .option("--home <path>", t("option.home"))
+  .option("--profile-dir <path>", t("option.profileDir"))
+  .option("--chrome-path <path>", t("option.chromePath"))
+  .option("-C, --project <path>", t("option.project"), process.cwd())
   .option(
     "--model <provider>",
-    `Web AI provider: ${listActiveProviderIds().join(", ")} (default: ${DEFAULT_PROVIDER})`,
+    t("option.model", {
+      providers: listActiveProviderIds().join(", "),
+      defaultProvider: DEFAULT_PROVIDER,
+    }),
   )
-  .option(
-    "--mode <name>",
-    "ChatGPT mode (Pro/Current), or a provider alias such as kimi",
-  )
-  .option(
-    "--once",
-    "Run a single request and exit instead of a conversation",
-    false,
-  )
-  .option(
-    "--model-turn-timeout-ms <milliseconds>",
-    "Maximum wait for one model response (default: 10 minutes; 16 minutes for ChatGPT Pro)",
-  )
-  .option(
-    "--no-minimize",
-    "Keep the Chrome window visible instead of minimizing it",
-  )
-  .option("--debug", "Write browser diagnostics", false)
-  .argument(
-    "[task...]",
-    "Initial request (optional; you can also type at the prompt)",
-  )
+  .option("--once", t("option.once"), false)
+  .option("--model-turn-timeout-ms <milliseconds>", t("option.timeout"))
+  .option("--no-minimize", t("option.noMinimize"))
+  .option("--debug", t("option.debug"), false)
+  .argument("[task...]", t("argument.task"))
   .action(async (task, _, command) => {
     await runAgent(task, command.optsWithGlobals());
   });
 
 program
   .command("update")
-  .description("Install the latest WTAgent from npm.")
+  .description(t("command.update"))
   .action(async () => runUpdate());
 
 program
   .command("doctor")
-  .description("Check Node, Chrome, and local data directories.")
+  .description(t("command.doctor"))
   .action(async (_, command) => runDoctor(command.optsWithGlobals()));
 
 program
   .command("login")
-  .description("Open the dedicated Chrome profile and wait for provider login (use --model to pick a provider).")
+  .description(t("command.login"))
   .action(async (_, command) => runLogin(command.optsWithGlobals()));
 
 program
   .command("logout")
-  .description("Delete the local Chrome profile to reset a provider session (use --model to pick a provider).")
-  .option("--yes", "Skip the confirmation prompt", false)
+  .description(t("command.logout"))
+  .option("--yes", t("option.yes"), false)
   .action(async (options, command) => {
     await runLogout({ ...command.optsWithGlobals(), ...options });
   });
 
 program
   .command("resume")
-  .description("Continue an existing session or recover an interrupted run.")
-  .argument("<session-id>", "Saved session ID")
-  .argument("[instruction...]", "Optional follow-up instruction")
-  .option(
-    "--mode <name>",
-    "ChatGPT mode (Pro/Current), or a provider alias such as kimi",
-  )
+  .description(t("command.resume"))
+  .argument("<session-id>", t("argument.sessionId"))
+  .argument("[instruction...]", t("argument.instruction"))
   .action(async (sessionId, instruction, _, command) => {
     await runResume(
       sessionId,
@@ -1047,18 +986,18 @@ program
 
 program
   .command("status")
-  .description("List saved sessions or show one session as JSON.")
-  .argument("[session-id]", "Saved session ID")
+  .description(t("command.status"))
+  .argument("[session-id]", t("argument.sessionId"))
   .action(async (sessionId, _, command) => {
     await runStatus(sessionId, command.optsWithGlobals());
   });
 
 program
   .command("export")
-  .description("Export a saved session to a Codex or Claude Code session.")
-  .argument("<session-id>", "Saved session ID")
-  .option("--format <name>", "codex or claude-code", "codex")
-  .option("-o, --output <path>", "Write to a file instead of stdout")
+  .description(t("command.export"))
+  .argument("<session-id>", t("argument.sessionId"))
+  .option("--format <name>", t("option.format"), "codex")
+  .option("-o, --output <path>", t("option.output"))
   .action(async (sessionId, options, command) => {
     await runExport(sessionId, { ...command.optsWithGlobals(), ...options });
   });

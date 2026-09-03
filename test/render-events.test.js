@@ -23,38 +23,31 @@ test("prints browser and conversation lifecycle status only once per CLI session
   renderer.handle({ type: "browser.started" });
   renderer.handle({
     type: "conversation.started",
-    payload: { mode: "Pro" },
+    payload: {},
   });
   renderer.handle({ type: "browser.started" });
   renderer.handle({
     type: "conversation.started",
-    payload: { mode: "Pro" },
+    payload: {},
   });
 
   const output = stream.output();
   assert.equal(output.match(/Chrome started\./g)?.length, 1);
-  assert.equal(output.match(/Conversation ready \(Pro\)\./g)?.length, 1);
+  assert.equal(output.match(/Conversation ready\./g)?.length, 1);
 });
 
 test("keeps non-lifecycle events visible on later turns", () => {
   const stream = captureStream();
-  const renderer = new Renderer({ stream });
+  const renderer = new Renderer({ stream, providerLabel: "Gemini" });
 
   renderer.handle({ type: "browser.started" });
   renderer.handle({ type: "browser.started" });
   renderer.handle({
-    type: "conversation.mode_selected",
-    payload: {
-      requested: "Pro",
-      status: "unavailable",
-      selectedLabel: null,
-    },
+    type: "model.limit_reached",
+    payload: {},
   });
 
-  assert.match(
-    stream.output(),
-    /Mode: could not select Pro; continuing on current mode\./,
-  );
+  assert.match(stream.output(), /Gemini usage limit reached/);
 });
 
 test("renders bounded empty-response recovery and preserved-session guidance", () => {

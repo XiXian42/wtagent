@@ -202,17 +202,7 @@ test("uploads attachments through Claude's file input", async () => {
   });
 });
 
-test("selectMode leaves Claude's browser-selected model untouched", async () => {
+test("Claude adapter never selects a model automatically", () => {
   const adapter = new ClaudeWebAdapter({ profileDir: "." });
-  let locatorCalls = 0;
-  adapter.page = {
-    locator() {
-      locatorCalls += 1;
-      return new EmptyLocator();
-    },
-  };
-
-  const result = await adapter.selectMode(null);
-  assert.equal(result.status, "skipped");
-  assert.equal(locatorCalls, 0);
+  assert.equal(typeof adapter.selectMode, "undefined");
 });

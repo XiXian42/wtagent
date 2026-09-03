@@ -19,9 +19,8 @@ const KIMI_URL = "https://www.kimi.com/";
 //   - assistant replies may include a `.thinking-container` reasoning block
 //     before the answer; assistantText reads the answer markdown outside it
 //   - a live conversation URL is /chat/<uuid>
-//   - a model switcher (`.current-model`) opens a Naive-UI popover
-//     (`.models-container .model-item`); WTAgent defaults it to K3 — see
-//     selectMode.
+// Model choice is intentionally left to the user on kimi.com; the adapter does
+// not inspect or change the site's current model selection.
 export class KimiWebAdapter extends BaseWebAdapter {
   constructor(options = {}) {
     super({
@@ -211,75 +210,4 @@ export class KimiWebAdapter extends BaseWebAdapter {
     return 5;
   }
 
-  // Kimi has a model switcher (快速 / K3 / K3 集群). The registry's defaultMode
-  // "k3" asks to switch to K3 ("擅长对话与 Agent 任务，全能旗舰") on every fresh
-  // conversation, silently. Any other value keeps the current model.
-  //
-  // The switcher is `.current-model`; it opens a Naive-UI popover whose rows are
-  // `.models-container .model-item`, the selected one carrying `checked`. After
-  // selecting, the switcher label starts with the model name (e.g. "K3 进阶").
-  // Best-effort and non-throwing, mirroring runModeSelection's contract.
-  async selectMode(mode) {
-    this.requirePage();
-    if (mode !== "k3") {
-      return { status: "skipped", requested: mode, attempts: 0 };
-    }
-
-    const switcher = this.page.locator(".current-model").first();
-    // The switcher can mount a beat after the composer on a fresh conversation;
-    // wait briefly before concluding it is absent.
-    await switcher.waitFor({ state: "visible", timeout: 10_000 }).catch(() => null);
-    if (await switcher.count().catch(() => 0) === 0) {
-      await this.writeDiagnostics("kimi-model-switcher-not-found");
-      return {
-        status: "switcher_not_found",
-        requested: mode,
-        attempts: 0,
-        reason: "Model switcher was not found.",
-      };
-    }
-
-    // Already on K3? The switcher label starts with "K3" (but not "K3 集群").
-    const label = (await switcher.innerText().catch(() => "")).trim();
-    if (/^K3(?!\s*集群)/.test(label)) {
-      return {
-        status: "already",
-        requested: mode,
-        selectedLabel: "K3",
-        attempts: 0,
-        reason: "Already using K3.",
-      };
-    }
-
-    await switcher.click({ timeout: 5_000 }).catch(() => null);
-    await this.page.locator(".models-container .model-item")
-      .first().waitFor({ state: "visible", timeout: 5_000 }).catch(() => null);
-
-    // Click the row whose title line is exactly "K3" (not "快速" / "K3 集群").
-    const k3 = this.page.locator(".models-container .model-item").filter({
-      hasText: /^K3(?!\s*集群)/,
-    }).first();
-    const clicked = await k3.count().catch(() => 0) > 0
-      && await k3.click({ timeout: 5_000 }).then(() => true).catch(() => false);
-    await this.page.waitForTimeout(500);
-
-    const after = (await switcher.innerText().catch(() => "")).trim();
-    if (clicked && /^K3(?!\s*集群)/.test(after)) {
-      return {
-        status: "select",
-        requested: mode,
-        selectedLabel: "K3",
-        attempts: 1,
-        reason: "Selected K3.",
-      };
-    }
-    await this.page.keyboard.press("Escape").catch(() => null);
-    await this.writeDiagnostics("kimi-mode-k3-unresolved");
-    return {
-      status: "unresolved",
-      requested: mode,
-      attempts: 1,
-      reason: "Could not confirm K3 was selected.",
-    };
-  }
 }
