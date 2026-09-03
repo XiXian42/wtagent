@@ -79,9 +79,7 @@ async function runLogin(options) {
   const { label, baseUrl } = provider;
   for (;;) {
     console.log(t("login.openingProfile", { profileDir }));
-    console.log(
-      `This window has no CDP flags. Finish until ${label} shows your signed-in home/chat history and no Log in button.`,
-    );
+    console.log(t("login.finishSignIn", { provider: label }));
     const browser = await launchNativeLoginBrowser({
       profileDir,
       chromePath: options.chromePath,
@@ -90,8 +88,7 @@ async function runLogin(options) {
 
     try {
       const answer = await promptForText({
-        message:
-          `After the signed-in ${label} home is visible, press Enter here to save and verify`,
+        message: t("login.pressEnterVerify", { provider: label }),
       });
       if (answer == null) {
         return;
@@ -126,9 +123,7 @@ async function runLogin(options) {
       await verifier.close();
     }
 
-    console.log(
-      `${label} is still in guest mode. Reopening native Chrome; complete the final ${label} sign-in/continue step.`,
-    );
+    console.log(t("login.stillGuest", { provider: label }));
   }
 }
 
@@ -157,16 +152,15 @@ async function runLogout(options) {
     .then((stat) => stat.isDirectory())
     .catch(() => false);
   if (!looksLikeProfile && !isProviderProfileBasename(path.basename(profileDir))) {
-    throw new Error(
-      `Refusing to delete ${profileDir}: it does not look like a wtagent Chrome profile.`,
-    );
+    throw new Error(t("logout.refuse", { profileDir }));
   }
 
   if (!options.yes) {
     const confirmed = await confirm({
-      message:
-        `This deletes the local ${provider.label} session (Chrome profile at ${profileDir}) `
-        + "and requires a new login. Continue?",
+      message: t("logout.confirm", {
+        provider: provider.label,
+        profileDir,
+      }),
       default: false,
     });
     if (!confirmed) {
@@ -179,8 +173,8 @@ async function runLogout(options) {
   console.log(t("logout.done", { profileDir }));
   console.log(
     provider.id === DEFAULT_PROVIDER
-      ? "Run `wtagent login` to sign in again."
-      : `Run \`wtagent login --model ${provider.id}\` to sign in again.`,
+      ? t("logout.loginAgainDefault")
+      : t("logout.loginAgainProvider", { provider: provider.id }),
   );
 }
 
@@ -560,7 +554,9 @@ async function executeSession({
           throw result.error;
         }
         runner.renderer.hint(
-          `Type /retry to ask ${runner.renderer.providerLabel} to continue again, enter a new instruction, or quit`,
+          t("session.recoveryHint", {
+            provider: runner.renderer.providerLabel,
+          }),
         );
         const next = await promptForNextMessage(runner, activeChatInput);
         if (next == null) {
@@ -639,7 +635,7 @@ async function promptForNextMessage(runner, chatInput) {
     const answer = chatInput
       ? await chatInput.read()
       : await promptForText({
-        message: "you ›",
+        message: t("task.youPrompt"),
         theme: { prefix: "" },
       });
     if (answer == null) {
@@ -667,12 +663,16 @@ async function resolveMessageAttachments(runner, text) {
   const { files, missing } = await extractAtMentions(text, projectRoot);
   if (files.length > 0) {
     runner.renderer.hint(
-      `Attaching: ${files.map((file) => file.name).join(", ")}`,
+      t("attachment.attaching", {
+        files: files.map((file) => file.name).join(", "),
+      }),
     );
   }
   if (missing.length > 0) {
     runner.renderer.hint(
-      `Not attached (${missing.map((m) => `${m.requested}: ${m.reason}`).join("; ")})`,
+      t("attachment.notAttached", {
+        details: missing.map((m) => `${m.requested}: ${m.reason}`).join("; "),
+      }),
     );
   }
   return files;
@@ -684,7 +684,7 @@ function isInteractiveSession(options) {
 
 async function promptForUpdate({ currentVersion, latest }) {
   return await promptForConfirm({
-    message: `Update WTAgent from ${currentVersion} to ${latest} now?`,
+    message: t("update.prompt", { currentVersion, latest }),
     default: true,
   });
 }

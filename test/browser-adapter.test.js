@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { ChatGPTWebAdapter, isConnectionLostError } from "../src/browser/chatgpt-web-adapter.js";
 
+test("ChatGPT leaves model selection entirely to the website/user", () => {
+  const adapter = new ChatGPTWebAdapter({ profileDir: "." });
+  assert.equal(typeof adapter.selectMode, "undefined");
+});
+
 class EmptyLocator {
   async count() {
     return 0;
