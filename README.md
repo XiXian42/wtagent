@@ -1,8 +1,13 @@
 # WTAgent
 
-Use your web AI account as a local CLI agent.
+Turn ChatGPT Web (including Pro) into Codex.
+Turn Claude Web into Claude Code.
 
-WTAgent connects ChatGPT, Claude, DeepSeek, Gemini, Grok, Kimi, or GLM Web to your local project: the model reasons in the browser while WTAgent reads and writes local files and runs commands on your machine.
+Also DeepSeek, Gemini, Grok, Kimi, GLM.
+
+No API key. No MCP. No tunnel. No plugin.
+
+https://xixian42.github.io/wtagent/
 
 [中文](#中文)
 
@@ -57,7 +62,14 @@ Multiline paste and `↑` / `↓` input history are supported. Press `Ctrl+C` or
 
 ## 中文
 
-WTAgent 将 ChatGPT、Claude、DeepSeek、Gemini、Grok、Kimi 或 GLM 网页聊天连接到本地项目：模型在浏览器中思考，WTAgent 在你的电脑上读写本地文件并运行命令。
+把 ChatGPT 网页版（含 Pro）变成 Codex。
+把 Claude 网页版变成 Claude Code。
+
+同时支持 DeepSeek、Gemini、Grok、Kimi、GLM。
+
+无需 API Key，无需 MCP，无需隧道，无需插件。
+
+https://xixian42.github.io/wtagent/
 
 ### 快速开始
 

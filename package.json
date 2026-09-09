@@ -1,7 +1,7 @@
 {
   "name": "wtagent",
   "version": "0.4.0",
-  "description": "Turn your own web AI session into a local tool-using agent.",
+  "description": "Turn ChatGPT Web (including Pro) into Codex. Turn Claude Web into Claude Code. Also DeepSeek, Gemini, Grok, Kimi, GLM. No API key, no MCP, no tunnel, no plugin.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/XiXian42/wtagent.git"
