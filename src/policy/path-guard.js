@@ -73,7 +73,11 @@ export function isPathInside(rootPath, candidatePath, options = {}) {
     };
     const root = normalize(rootPath);
     const candidate = normalize(candidatePath);
-    return candidate === root || candidate.startsWith(`${root}\\`);
+    const relative = path.win32.relative(root, candidate);
+    return relative === ""
+      || (relative !== ".."
+        && !relative.startsWith("..\\")
+        && !path.win32.isAbsolute(relative));
   }
   const relative = path.relative(rootPath, candidatePath);
   return relative === ""

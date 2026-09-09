@@ -402,7 +402,7 @@ export function createDefaultToolRegistry({
         }
         next = edit.replace_all
           ? next.split(matchedOld).join(edit.new_text)
-          : next.replace(matchedOld, edit.new_text);
+          : next.replace(matchedOld, () => edit.new_text);
       }
 
       await writeTextAtomic(target, next, context);

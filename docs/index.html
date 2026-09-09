@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Turn ChatGPT Web into a Codex-style coding agent. Turn Claude Web into a Claude Code-style coding agent. Also supports DeepSeek, Gemini, Grok, Kimi and GLM. Independent CLI; no API key required." />
+  <meta name="theme-color" content="#f7f8fb" />
+  <link rel="canonical" href="https://xixian42.github.io/wtagent/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="WTAgent — Turn web chats into coding agents" />
+  <meta property="og:description" content="Turn ChatGPT Web into a Codex-style coding agent. Turn Claude Web into a Claude Code-style coding agent. Also supports DeepSeek, Gemini, Grok, Kimi and GLM. Independent CLI; no API key required." />
+  <meta property="og:url" content="https://xixian42.github.io/wtagent/" />
+  <meta property="og:image" content="https://xixian42.github.io/wtagent/assets/social-card.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="WTAgent: ChatGPT Web to Codex-style coding; Claude Web to Claude Code-style coding. Also supports DeepSeek, Gemini, Grok, Kimi and GLM. Independent CLI, no API key." />
+  <meta name="twitter:card" content="summary_large_image" />
+  <title>WTAgent — ChatGPT, Claude &amp; more web AIs for local coding</title>
+  <link rel="icon" href="./assets/mark.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="./site.css" />
+  <script src="./site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main" data-i18n="skip">Skip to content</a>
+  <header class="site-header">
+    <div class="shell nav-wrap">
+      <a class="brand" href="#top" aria-label="WTAgent home">
+        <img src="./assets/mark.svg" alt="" width="32" height="32" />
+        <span>WTAgent</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a class="nav-detail" href="#quickstart" data-i18n="nav.how">How to use</a>
+        <a class="nav-detail" href="#notes" data-i18n="nav.faq">Usage notes</a>
+        <button class="language-button" type="button" data-language hidden aria-label="切换到中文">中文</button>
+        <a class="nav-github" href="https://github.com/XiXian42/wtagent">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero shell" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span><span data-i18n="hero.eyebrow">Open-source local coding agent</span></p>
+        <h1><span data-i18n="hero.title1">Turn web chats into</span><br /><span class="accent" data-i18n="hero.title2">coding agents.</span></h1>
+        <div class="product-mapping" aria-label="Workflow comparison">
+          <p><span data-i18n="hero.turn">Turn</span> <strong>ChatGPT Web</strong> <span data-i18n="hero.chatgpt">into a Codex-style coding agent.</span></p>
+          <p><span data-i18n="hero.turn">Turn</span> <strong>Claude Web</strong> <span data-i18n="hero.claude">into a Claude Code-style coding agent.</span></p>
+        </div>
+        <div class="hero-provider-support" id="hero-providers" role="group" aria-labelledby="hero-provider-label">
+          <p class="hero-provider-label" id="hero-provider-label" data-i18n="hero.also">Also supports</p>
+          <p class="hero-provider-list"><strong>DeepSeek</strong> <strong>Gemini</strong> <strong>Grok</strong> <strong>Kimi</strong> <strong>GLM</strong></p>
+        </div>
+        <p class="lede" data-i18n="hero.lede">WTAgent lets your web AI read local files, edit code and run tests—from your terminal.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#quickstart"><span data-i18n="hero.start">Try it locally</span><span aria-hidden="true">→</span></a>
+          <a class="button button-secondary" href="#demo"><span aria-hidden="true">▷</span><span data-i18n="hero.watch">See it work</span></a>
+        </div>
+        <div class="install-block">
+          <code>npm install -g wtagent</code>
+          <button class="copy-button" type="button" data-copy="npm install -g wtagent" aria-label="Copy install command" hidden><span class="copy-label" data-i18n="copy">Copy</span></button>
+        </div>
+        <p class="hero-facts"><span data-i18n="hero.fact1">No API key</span><span data-i18n="hero.fact2">Your account &amp; quota</span><span data-i18n="hero.fact3">Open source · MIT</span></p>
+        <p class="qualification" data-i18n="hero.note">Independent CLI; not the official Codex or Claude Code client.</p>
+      </div>
+
+      <figure class="demo-frame hero-demo" id="demo" aria-labelledby="demo-task">
+        <p class="demo-task" id="demo-task">create /tmp/helloworld.c and run it.</p>
+        <img id="demo-image" src="./assets/chatgpt-live-poster.png" data-demo-still="./assets/chatgpt-live-poster.png" data-demo-motion="./assets/chatgpt-live.gif" data-demo-autoplay width="718" height="480" alt="Real WTAgent terminal recording using ChatGPT Web." loading="eager" decoding="async" fetchpriority="high" />
+      </figure>
+    </section>
+
+    <section class="section shell" id="quickstart">
+      <div class="quickstart-layout">
+        <div class="quickstart-copy">
+          <h2 data-i18n="start.title">How to use</h2>
+          <p data-i18n="start.requirements">Requires Node.js 20.x ≥20.17, 22.x ≥22.13, or ≥23.5, and Chrome/Chromium.</p>
+          <p class="platform-note" data-i18n="start.platforms">macOS · Linux · Windows. WSL2 + WSLg: preview support.</p>
+          <a class="text-link" href="https://github.com/XiXian42/wtagent#quick-start" data-i18n="start.guide">Full setup guide ↗</a>
+        </div>
+        <div class="setup-card">
+          <div class="setup-step"><span class="setup-number">1</span><div><h3 data-i18n="start.install">Install WTAgent</h3><div class="command-line"><code>npm install -g wtagent</code><button class="copy-button" type="button" data-copy="npm install -g wtagent" aria-label="Copy install command" hidden><span class="copy-label" data-i18n="copy">Copy</span></button></div></div></div>
+          <div class="setup-step"><span class="setup-number">2</span><div><h3 data-i18n="start.project">Open a test project and start</h3><pre><code>mkdir wtagent-demo
+cd wtagent-demo
+wtagent</code></pre><p data-i18n="start.login">A dedicated Chrome profile opens. Sign in with your own web AI account when prompted. ChatGPT is the default provider.</p></div></div>
+          <div class="setup-step"><span class="setup-number">3</span><div><h3 data-i18n="start.task">Type a task in the terminal</h3><p class="example-prompt">create /tmp/helloworld.c and run it.</p></div></div>
+          <div class="provider-command"><span data-i18n="start.claude">Choose your web AI</span><code>wtagent --model claude</code><button class="copy-button" type="button" data-copy="wtagent --model claude" aria-label="Copy Claude command" hidden><span class="copy-label" data-i18n="copy">Copy</span></button></div>
+          <p class="provider-options"><span data-i18n="start.providers">Replace claude with:</span> <code>chatgpt · deepseek · gemini · grok · kimi · glm</code></p>
+        </div>
+      </div>
+    </section>
+
+    <aside class="usage-notes shell" id="notes" aria-labelledby="notes-title">
+      <h2 id="notes-title" data-i18n="notes.title">Usage notes</h2>
+      <p data-i18n="notes.account">Use your own account and follow your provider’s terms and limits. Browser changes or access restrictions can interrupt use; account safety is not guaranteed.</p>
+      <p data-i18n="notes.data">Files and commands run locally, but code and output returned to the chat are sent to your web AI provider. Do not share secrets or unauthorized data.</p>
+      <p data-i18n="notes.local">Local policy checks are not an operating-system sandbox. Review commands and changes, keep backups, and start with a disposable project.</p>
+    </aside>
+  </main>
+
+  <footer>
+    <div class="shell footer-inner">
+      <a class="brand" href="#top"><img src="./assets/mark.svg" alt="" width="26" height="26" /><span>WTAgent</span></a>
+      <p data-i18n="footer.note">Independent open-source software. Not affiliated with or endorsed by any AI provider.</p>
+      <div><a href="https://www.npmjs.com/package/wtagent">npm</a><a href="https://github.com/XiXian42/wtagent/issues" data-i18n="footer.issues">Issues</a><a href="https://github.com/XiXian42/wtagent/blob/main/LICENSE">MIT</a></div>
+    </div>
+  </footer>
+  <p class="sr-only" id="site-status" role="status" aria-live="polite" aria-atomic="true"></p>
+</body>
+</html>

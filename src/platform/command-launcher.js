@@ -178,7 +178,7 @@ function buildBatchCommand(scriptPath, argv, {
 export function resolveLaunchPlan({
   program,
   argv = [],
-  cwd,
+  cwd = process.cwd(),
   env = process.env,
   platform = process.platform,
   existsSync = fs.existsSync,

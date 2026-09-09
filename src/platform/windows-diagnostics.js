@@ -8,11 +8,12 @@ import { promisify } from "node:util";
 import { discoverChromeExecutable } from "./chrome-discovery.js";
 import { resolveLaunchPlan } from "./command-launcher.js";
 import { inspectCdpProfileState } from "../browser/cdp-state.js";
+import { getPackageInfo } from "../shared/package-info.js";
 
 const execFileAsync = promisify(execFile);
 
 function parseMajorMinorPatch(version) {
-  const match = String(version ?? "").replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  const match = String(version ?? "").replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)$/);
   if (!match) {
     return null;
   }
@@ -24,20 +25,12 @@ export function isSupportedNodeVersion(version = process.version) {
   if (!parsed) {
     return false;
   }
-  const [major, minor, patch] = parsed;
-  if (major > 20) {
-    return true;
-  }
-  if (major < 20) {
-    return false;
-  }
-  if (minor > 17) {
-    return true;
-  }
-  if (minor < 17) {
-    return false;
-  }
-  return patch >= 0;
+  const [major, minor] = parsed;
+  // Keep aligned with package.json and Inquirer's supported Node releases.
+  return (major === 20 && minor >= 17)
+    || (major === 22 && minor >= 13)
+    || (major === 23 && minor >= 5)
+    || major >= 24;
 }
 
 export function detectWsl({
@@ -126,7 +119,7 @@ export function assertNativeRuntimeSupported(context = {}) {
   const version = context.version ?? process.version;
   if (!isSupportedNodeVersion(version)) {
     throw new Error(
-      `WTAgent requires Node.js 20.17.0 or newer; current runtime is ${version}.`,
+      `WTAgent requires Node.js ${getPackageInfo().engines.node}; current runtime is ${version}.`,
     );
   }
 

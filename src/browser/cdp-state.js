@@ -545,7 +545,7 @@ export async function inspectCdpProfileState(profileDir, {
 // live lock-holder pid from a recycled one: a process that started after the
 // lock file was written cannot own it. Returns null when it cannot be
 // determined (unknown process, platform tool unavailable).
-async function processStartTimeMs(pid, { execFileImpl = execFileAsync } = {}) {
+export async function processStartTimeMs(pid, { execFileImpl = execFileAsync } = {}) {
   if (process.platform === "win32") {
     const { stdout } = await execFileImpl(
       "powershell.exe",
@@ -555,7 +555,7 @@ async function processStartTimeMs(pid, { execFileImpl = execFileAsync } = {}) {
         "-Command",
         `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`,
       ],
-      { windowsHide: true },
+      { windowsHide: true, timeout: 1_500 },
     );
     const parsed = Date.parse(String(stdout).trim());
     return Number.isFinite(parsed) ? parsed : null;
@@ -563,10 +563,13 @@ async function processStartTimeMs(pid, { execFileImpl = execFileAsync } = {}) {
 
   const { stdout } = await execFileImpl(
     "ps",
-    ["-p", String(pid), "-o", "etimes="],
+    ["-p", String(pid), "-o", "lstart="],
+    {
+      env: { ...process.env, LANG: "C", LC_ALL: "C" },
+    },
   );
-  const seconds = Number.parseInt(String(stdout), 10);
-  return Number.isFinite(seconds) ? Date.now() - seconds * 1_000 : null;
+  const parsed = Date.parse(String(stdout).trim());
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export async function acquireCdpProfileLock(profileDir, {

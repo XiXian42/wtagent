@@ -91,6 +91,8 @@ test("exposes Claude's base URL and conversation URL pattern", () => {
   assert.equal(adapter.baseUrl, "https://claude.ai/");
   assert.ok(adapter.conversationUrlPattern().test("/chat/abc-123"));
   assert.equal(adapter.conversationUrlPattern().test("/new"), false);
+  assert.equal(adapter.classifyConversationUrl("https://claude.ai/new"), "fresh");
+  assert.equal(adapter.classifyConversationUrl("https://claude.ai/settings"), "unknown");
 });
 
 test("uses role-scoped counts as Claude message identities", async () => {

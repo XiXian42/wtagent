@@ -7,6 +7,25 @@ import { getEnvCaseInsensitive } from "./command-launcher.js";
 const APP_NAME = "wtagent";
 const LEGACY_APP_NAME = "webagent";
 
+export function formatHomePath(filePath, {
+  platform = process.platform,
+  homeDir = os.homedir(),
+} = {}) {
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  if (!pathApi.isAbsolute(filePath)) {
+    return filePath;
+  }
+  const relative = pathApi.relative(homeDir, filePath);
+  if (relative === "") {
+    return "~";
+  }
+  if (relative === ".." || relative.startsWith(`..${pathApi.sep}`)
+    || pathApi.isAbsolute(relative)) {
+    return filePath;
+  }
+  return `~${pathApi.sep}${relative}`;
+}
+
 function platformAppDataDir(appName, {
   env,
   platform,

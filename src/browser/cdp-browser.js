@@ -59,6 +59,12 @@ class CdpTimeoutError extends Error {
   }
 }
 
+function recoveryTargetUnavailable(message, cause = null) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = "RECOVERY_TARGET_UNAVAILABLE";
+  return error;
+}
+
 async function withTimeout(promise, timeoutMs, message) {
   let timer;
   try {
@@ -192,12 +198,49 @@ function sameOriginPath(left, right) {
   }
 }
 
+async function getPageTargetId(context, page, { timeoutMs = 1_500 } = {}) {
+  if (!page || typeof context?.newCDPSession !== "function") {
+    return null;
+  }
+  let session = null;
+  const probe = (async () => {
+    session = await context.newCDPSession(page).catch(() => null);
+    if (!session) {
+      return null;
+    }
+    try {
+      const { targetInfo } = await session.send("Target.getTargetInfo");
+      return targetInfo?.targetId ?? null;
+    } catch {
+      return null;
+    } finally {
+      await settleWithin(
+        Promise.resolve().then(() => session.detach()),
+        500,
+      );
+    }
+  })();
+  try {
+    return await withTimeout(
+      probe,
+      timeoutMs,
+      `Timed out reading the Chrome target identity after ${timeoutMs}ms.`,
+    );
+  } catch {
+    // A target that cannot prove its identity is never eligible for selection.
+    // The still-running probe owns eventual session cleanup through its finally.
+    return null;
+  }
+}
+
 export async function launchAndConnectCdpChrome({
   executablePath,
   profileDir,
   url = "about:blank",
   minimized = false,
   preferredUrl = null,
+  preferredTargetId = null,
+  exactTargetOnly = false,
 }, {
   acquireProfileLock = acquireCdpProfileLock,
   connectOverCDP = (endpoint) => chromium.connectOverCDP(endpoint),
@@ -214,7 +257,19 @@ export async function launchAndConnectCdpChrome({
   waitForExit = waitForProcessExit,
   waitForReady = waitForCdp,
   connectTimeoutMs = 20_000,
+  transportCloseTimeoutMs = 1_500,
 } = {}) {
+  if (
+    exactTargetOnly
+    && (
+      typeof preferredTargetId !== "string"
+      || preferredTargetId.trim().length === 0
+    )
+  ) {
+    throw recoveryTargetUnavailable(
+      "Exact-target recovery requires a saved Chrome target ID.",
+    );
+  }
   const releaseProfileLock = await acquireProfileLock(profileDir);
   let child = null;
   let state = null;
@@ -227,9 +282,23 @@ export async function launchAndConnectCdpChrome({
   }
 
   try {
-    state = await findReusable();
+    try {
+      state = await findReusable();
+    } catch (error) {
+      if (exactTargetOnly) {
+        throw recoveryTargetUnavailable(
+          "The saved Chrome instance could not be inspected for recovery.",
+          error,
+        );
+      }
+      throw error;
+    }
     if (state) {
       reused = true;
+    } else if (exactTargetOnly) {
+      throw recoveryTargetUnavailable(
+        "The saved Chrome instance is not available for exact-target recovery.",
+      );
     } else {
       await removeState(profileDir);
       // A prior instance may have died leaving renderer children (and Chrome's
@@ -294,14 +363,28 @@ export async function launchAndConnectCdpChrome({
     // without this guard Playwright hangs ~30s and leaves a dirty CDP state.
     let context;
     try {
-      if (reused) {
+      if (reused && !exactTargetOnly) {
         await ensurePageTarget(state.endpoint);
       }
-      browser = await withTimeout(
-        connectOverCDP(state.endpoint),
-        connectTimeoutMs,
-        `Timed out connecting to Chrome CDP at ${state.endpoint} after ${connectTimeoutMs}ms.`,
-      );
+      const connectPromise = Promise.resolve().then(() => (
+        connectOverCDP(state.endpoint)
+      ));
+      try {
+        browser = await withTimeout(
+          connectPromise,
+          connectTimeoutMs,
+          `Timed out connecting to Chrome CDP at ${state.endpoint} after ${connectTimeoutMs}ms.`,
+        );
+      } catch (error) {
+        if (error instanceof CdpTimeoutError) {
+          // connectOverCDP is not cancellable. If it completes after our timeout,
+          // disconnect that late transport instead of leaking ownership of Chrome.
+          void connectPromise.then((lateBrowser) => (
+            settleWithin(lateBrowser?.close?.(), transportCloseTimeoutMs)
+          )).catch(() => null);
+        }
+        throw error;
+      }
       // contexts() forces a real protocol round-trip, so it hangs too when the
       // browser main thread is stuck — keep it inside the timeout budget.
       const contexts = await withTimeout(
@@ -311,11 +394,25 @@ export async function launchAndConnectCdpChrome({
       );
       context = contexts[0];
     } catch (error) {
+      if (exactTargetOnly) {
+        await settleWithin(
+          Promise.resolve().then(() => browser?.close()),
+          transportCloseTimeoutMs,
+        );
+        browser = null;
+        throw recoveryTargetUnavailable(
+          "The saved Chrome instance could not be attached for exact-target recovery.",
+          error,
+        );
+      }
       if (error instanceof CdpTimeoutError) {
         // The verified-but-unusable instance we launched is a dead end. Kill it
         // (only if we own it) and drop its CDP state so the next run starts
         // clean instead of trying to reuse a hung endpoint.
-        await browser?.close().catch(() => null);
+        await settleWithin(
+          Promise.resolve().then(() => browser?.close()),
+          transportCloseTimeoutMs,
+        );
         if (!reused && child?.pid) {
           await killTree(child.pid).catch(() => null);
         }
@@ -328,25 +425,85 @@ export async function launchAndConnectCdpChrome({
       throw error;
     }
     if (!context) {
-      throw new Error("Chrome CDP connection did not expose a browser context.");
+      throw exactTargetOnly
+        ? recoveryTargetUnavailable(
+          "The saved Chrome instance has no reusable browser context.",
+        )
+        : new Error("Chrome CDP connection did not expose a browser context.");
     }
 
     // A reused browser may still contain the previous conversation. Keep it
     // intact and, when a preferred URL is given, reuse an existing tab already
     // showing that conversation (origin + path) so resumed runs do not pile up
     // tabs; otherwise create a fresh target for this CLI session.
+    const targetProbeDeadline = Date.now() + connectTimeoutMs;
+    const probeTargetId = async (candidate) => {
+      const remaining = targetProbeDeadline - Date.now();
+      if (remaining <= 0) {
+        return null;
+      }
+      return await getPageTargetId(context, candidate, {
+        timeoutMs: Math.min(1_500, remaining),
+      });
+    };
+    const pages = context.pages();
+    const existingPageUrls = pages.map((candidate) => (
+      candidate.url?.() ?? ""
+    ));
     let page;
-    if (reused) {
-      const matchingTab = preferredUrl
-        ? context.pages().find((candidate) =>
+    let preferredTabMatched = false;
+    let preferredTargetMatched = false;
+    let preferredTabAmbiguous = false;
+    let targetId = null;
+    if (exactTargetOnly) {
+      const matchingTargets = [];
+      for (const candidate of pages) {
+        const candidateTargetId = await probeTargetId(candidate);
+        if (candidateTargetId === preferredTargetId) {
+          matchingTargets.push({ page: candidate, targetId: candidateTargetId });
+        }
+      }
+      if (matchingTargets.length !== 1) {
+        throw recoveryTargetUnavailable(
+          matchingTargets.length === 0
+            ? "The exact saved Chrome target is no longer available."
+            : "The saved Chrome target identity is ambiguous.",
+        );
+      }
+      page = matchingTargets[0].page;
+      targetId = matchingTargets[0].targetId;
+      preferredTargetMatched = true;
+    } else if (reused) {
+      if (preferredTargetId) {
+        for (const candidate of pages) {
+          const candidateTargetId = await probeTargetId(candidate);
+          if (candidateTargetId === preferredTargetId) {
+            page = candidate;
+            targetId = candidateTargetId;
+            preferredTargetMatched = true;
+            break;
+          }
+        }
+      }
+      if (!page && preferredUrl) {
+        const matchingTabs = pages.filter((candidate) =>
           sameOriginPath(candidate.url?.() ?? "", preferredUrl)
-        ) ?? null
-        : null;
-      page = matchingTab ?? await context.newPage();
+        );
+        // Duplicate exact-URL tabs are ambiguous. Opening a fresh page is safer
+        // than attaching a pending result or follow-up to an arbitrary copy.
+        if (matchingTabs.length === 1) {
+          page = matchingTabs[0];
+          preferredTabMatched = true;
+        } else if (matchingTabs.length > 1) {
+          preferredTabAmbiguous = true;
+        }
+      }
+      page ??= await context.newPage();
     } else {
-      page = context.pages()[0] ?? await context.newPage();
+      page = pages[0] ?? await context.newPage();
     }
-    if (minimized) {
+    targetId ??= await probeTargetId(page);
+    if (minimized && !exactTargetOnly) {
       await setWindowState(context, page, "minimized");
     }
 
@@ -358,33 +515,65 @@ export async function launchAndConnectCdpChrome({
       page,
       pid: state.pid,
       reused,
+      targetId,
+      existingPageUrls,
+      exactTargetOnly,
+      preferredTabMatched,
+      preferredTargetMatched,
+      preferredTabAmbiguous,
       // Minimize / restore the visible window on demand. The runtime restores
       // the window when it needs the user (manual login, CAPTCHA) and
       // re-minimizes afterward. Uses the live current page each time so it
       // targets the window the user is actually looking at.
       async minimize() {
-        return await setWindowState(context, page, "minimized");
+        return exactTargetOnly
+          ? false
+          : await setWindowState(context, page, "minimized");
       },
       async restore() {
-        return await setWindowState(context, page, "normal");
+        return exactTargetOnly
+          ? false
+          : await setWindowState(context, page, "normal");
       },
       // Drops only the Playwright transport. Unlike close(), never asks Chrome
       // to exit and never kills the process: used to recover from a dead CDP
       // connection (e.g. after the Mac slept) while Chrome itself is alive.
       // The profile lock stays held because the same CLI session will reconnect.
       async disconnect() {
-        await settleWithin(browser.close(), 1_500);
+        await settleWithin(
+          Promise.resolve().then(() => browser.close()),
+          transportCloseTimeoutMs,
+        );
       },
       // Leaves Chrome running (and its saved CDP state intact) but drops the
       // Playwright transport and the profile lock so a later WTAgent process
       // can reuse the window. Used after a failed run that wants the page
       // left open for inspection without blocking the next launch.
       async detach() {
-        await settleWithin(browser.close(), 1_500);
-        await releaseProfileLock();
+        try {
+          await settleWithin(
+            Promise.resolve().then(() => browser.close()),
+            transportCloseTimeoutMs,
+          );
+        } finally {
+          await releaseProfileLock();
+        }
       },
       async close() {
         if (closePromise) {
+          return await closePromise;
+        }
+        if (exactTargetOnly) {
+          closePromise = (async () => {
+            try {
+              await settleWithin(
+                Promise.resolve().then(() => browser.close()),
+                transportCloseTimeoutMs,
+              );
+            } finally {
+              await releaseProfileLock();
+            }
+          })();
           return await closePromise;
         }
         closePromise = (async () => {
@@ -396,10 +585,16 @@ export async function launchAndConnectCdpChrome({
               .catch(() => null);
             if (session) {
               await settleWithin(session.send("Browser.close"), 1_500);
-              await settleWithin(session.detach(), 500);
+              await settleWithin(
+                Promise.resolve().then(() => session.detach()),
+                500,
+              );
             }
             exited = await waitForExit(state.pid, 3_000);
-            await settleWithin(browser.close(), 1_500);
+            await settleWithin(
+              Promise.resolve().then(() => browser.close()),
+              transportCloseTimeoutMs,
+            );
 
             if (!exited) {
               const childStillOwnsPid = child?.pid === state.pid
@@ -429,7 +624,10 @@ export async function launchAndConnectCdpChrome({
       },
     };
   } catch (error) {
-    await browser?.close().catch(() => null);
+    await settleWithin(
+      Promise.resolve().then(() => browser?.close()),
+      transportCloseTimeoutMs,
+    );
     if (
       child
       && child.exitCode == null

@@ -152,8 +152,8 @@ export class GLMWebAdapter extends BaseWebAdapter {
     return 5;
   }
 
-  sentUserWaitAttempts() {
-    return 120;
+  sendConfirmationTimeoutMs() {
+    return 30_000;
   }
 
 }

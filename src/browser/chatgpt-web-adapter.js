@@ -1,4 +1,11 @@
-import { BaseWebAdapter, firstVisible, hasCompleteAgentEnvelope } from "./base-web-adapter.js";
+import { createHash } from "node:crypto";
+import {
+  BaseWebAdapter,
+  firstVisible,
+  hasCompleteAgentEnvelope,
+  isValidOutboundCorrelationId,
+  renderedMessageContainsOutboundMarker,
+} from "./base-web-adapter.js";
 import { BrowserAdapterError } from "../shared/errors.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
 
@@ -12,6 +19,60 @@ const CHATGPT_URL = "https://chatgpt.com/";
 function parseConversationTurn(value) {
   const match = String(value ?? "").match(/^conversation-turn-(\d+)$/);
   return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function normalizedConversationUrl(value) {
+  try {
+    const parsed = value instanceof URL ? value : new URL(value);
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.origin}${pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function validatedOrderedSnapshot(snapshot) {
+  const url = normalizedConversationUrl(snapshot?.url);
+  if (!url || !Array.isArray(snapshot?.entries)) {
+    return null;
+  }
+  const ids = new Set();
+  const turns = new Set();
+  const entries = [];
+  let previousDomIndex = -1;
+  let previousTurn = -1;
+  for (const entry of snapshot.entries) {
+    const id = typeof entry?.id === "string" ? entry.id.trim() : "";
+    if (
+      !["user", "assistant"].includes(entry?.role)
+      || !id
+      || !Number.isSafeInteger(entry.turn)
+      || entry.turn < 0
+      || !Number.isSafeInteger(entry.domIndex)
+      || entry.domIndex <= previousDomIndex
+      || entry.turn <= previousTurn
+      || ids.has(id)
+      || turns.has(entry.turn)
+    ) {
+      return null;
+    }
+    ids.add(id);
+    turns.add(entry.turn);
+    previousDomIndex = entry.domIndex;
+    previousTurn = entry.turn;
+    entries.push({
+      domIndex: entry.domIndex,
+      role: entry.role,
+      id,
+      turn: entry.turn,
+      renderedText: String(entry.renderedText ?? ""),
+    });
+  }
+  return { url, entries };
+}
+
+function sameIdentity(entry, { id, turn }) {
+  return entry?.id === id && entry?.turn === turn;
 }
 
 // ChatGPT-specific implementation of the WebModelAdapter contract. Only the
@@ -32,6 +93,28 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
 
   conversationUrlPattern() {
     return /^\/c\//;
+  }
+
+  classifyConversationUrl(value) {
+    const kind = super.classifyConversationUrl(value);
+    if (kind !== "restorable") {
+      return kind;
+    }
+    const parsed = value instanceof URL ? value : new URL(value);
+    return /^\/c\/WEB:/.test(parsed.pathname)
+      ? "provisional"
+      : "restorable";
+  }
+
+  pendingAttachmentLocators() {
+    return [
+      this.page.locator(
+        'form [data-testid$="-file-thumbnail"], '
+          + 'form [data-testid^="file-thumbnail"], '
+          + 'form button[aria-label*="remove file" i], '
+          + 'form button[aria-label*="删除文件"]',
+      ),
+    ];
   }
 
   composerLocators() {
@@ -114,6 +197,712 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     );
   }
 
+  requiresOrderedConversationSnapshotForFreshSend() {
+    return true;
+  }
+
+  async orderedConversationSnapshot() {
+    if (typeof this.page?.evaluate !== "function") {
+      return null;
+    }
+    return await this.page.evaluate(() => {
+      const entries = [
+        ...document.querySelectorAll(
+          '[data-message-author-role="user"], [data-message-author-role="assistant"]',
+        ),
+      ].filter((element) => {
+        const role = element.getAttribute("data-message-author-role");
+        return role === "user"
+          || (role === "assistant" && !element.id.startsWith("request-placeholder-"));
+      }).map((element, domIndex) => {
+        const role = element.getAttribute("data-message-author-role");
+        const wrapper = element.closest('[data-testid^="conversation-turn-"]');
+        const turnMatch = wrapper?.getAttribute("data-testid")
+          ?.match(/^conversation-turn-(\d+)$/);
+        let renderedText = element.innerText ?? element.textContent ?? "";
+        if (role === "assistant" && !renderedText.includes("<agent_response")) {
+          const codeTexts = [...element.querySelectorAll("pre code")]
+            .map((code) => code.innerText ?? code.textContent ?? "");
+          const completeEnvelope = codeTexts.find((text) => {
+            const start = text.trim().indexOf("<agent_response");
+            const end = text.trim().lastIndexOf("</agent_response>");
+            return start >= 0 && end >= start;
+          });
+          const partialEnvelope = codeTexts.find(
+            (text) => text.includes("<agent_response"),
+          );
+          if (completeEnvelope) {
+            renderedText = completeEnvelope;
+          } else if (partialEnvelope) {
+            renderedText = partialEnvelope;
+          } else {
+            const markdown = [...element.querySelectorAll(".markdown")];
+            if (markdown.length > 0) {
+              const last = markdown.at(-1);
+              renderedText = last.innerText ?? last.textContent ?? "";
+            }
+          }
+        }
+        return {
+          domIndex,
+          role,
+          id: element.getAttribute("data-message-id"),
+          turn: turnMatch ? Number.parseInt(turnMatch[1], 10) : null,
+          renderedText,
+        };
+      });
+      return { url: window.location.href, entries };
+    }).catch(() => null);
+  }
+
+  async assertRecoveredTurnTopology({
+    assistantPresent = false,
+    assistantMessageId = null,
+    assistantTurn = null,
+  } = {}) {
+    if (!this.recoveredTurnTopologyRequired) {
+      return;
+    }
+    const snapshot = validatedOrderedSnapshot(
+      await this.orderedConversationSnapshot(),
+    );
+    const currentUrl = normalizedConversationUrl(this.page?.url?.());
+    if (!snapshot || !currentUrl || snapshot.url !== currentUrl) {
+      throw this.#pendingOutboundUncertain(
+        "ChatGPT could not atomically revalidate the recovered conversation boundary.",
+      );
+    }
+    if (
+      typeof this.lastUserMessageId !== "string"
+      || !this.lastUserMessageId
+      || !Number.isSafeInteger(this.sentUserTurn)
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The recovered ChatGPT user-turn identity is incomplete.",
+      );
+    }
+
+    const matchingUsers = snapshot.entries.filter((entry) => (
+      entry.role === "user"
+      && sameIdentity(entry, {
+        id: this.lastUserMessageId,
+        turn: this.sentUserTurn,
+      })
+    ));
+    if (matchingUsers.length !== 1) {
+      throw this.#pendingOutboundUncertain(
+        "The correlated ChatGPT user turn disappeared or changed after recovery.",
+      );
+    }
+    const user = matchingUsers[0];
+    const suffix = snapshot.entries.slice(snapshot.entries.indexOf(user) + 1);
+    if (suffix.some((entry) => entry.role === "user")) {
+      throw this.#pendingOutboundUncertain(
+        "A later ChatGPT user turn invalidated the recovered assistant boundary.",
+      );
+    }
+    if (suffix.length > 1 || suffix.some((entry) => entry.role !== "assistant")) {
+      throw this.#pendingOutboundUncertain(
+        "ChatGPT assistant chronology changed after recovery.",
+      );
+    }
+
+    const assistant = suffix[0] ?? null;
+    if (assistant && assistant.turn !== user.turn + 1) {
+      throw this.#pendingOutboundUncertain(
+        "The recovered ChatGPT assistant successor is no longer adjacent.",
+      );
+    }
+    if (
+      (this.expectedAssistantCandidateId != null
+        || this.expectedAssistantCandidateTurn != null)
+      && (
+        !assistant
+        || (
+          this.expectedAssistantCandidateId != null
+          && assistant.id !== this.expectedAssistantCandidateId
+        )
+        || (
+          this.expectedAssistantCandidateTurn != null
+          && assistant.turn !== this.expectedAssistantCandidateTurn
+        )
+      )
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The persisted ChatGPT assistant successor changed after recovery.",
+      );
+    }
+    if (
+      assistantPresent
+      && (
+        !assistant
+        || assistant.id !== assistantMessageId
+        || assistant.turn !== assistantTurn
+      )
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The ChatGPT assistant node being processed is outside the recovered boundary.",
+      );
+    }
+  }
+
+  supportsPendingOutboundRecovery() {
+    return true;
+  }
+
+  #pendingOutboundUncertain(message, details = {}) {
+    return new BrowserAdapterError(message, {
+      code: "OUTBOUND_COMMIT_UNCERTAIN",
+      recoverable: false,
+      details,
+    });
+  }
+
+  #assertRecoveryTarget({ page, mainFrame, targetId, initialUrl, navigated }) {
+    if (
+      navigated
+      || this.page !== page
+      || (typeof page.mainFrame === "function" && page.mainFrame() !== mainFrame)
+      || !this.hasExactRecoveryTarget(targetId)
+      || normalizedConversationUrl(page.url()) !== initialUrl
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The exact ChatGPT target changed while reconciling the pending outbound.",
+      );
+    }
+  }
+
+  #recoveryDeadlineError() {
+    return this.#pendingOutboundUncertain(
+      "ChatGPT could not reconcile the pending outbound before the recovery deadline.",
+    );
+  }
+
+  async #awaitWithinRecoveryDeadline(operation, deadline) {
+    const remaining = deadline - this.monotonicNow();
+    if (remaining <= 0) {
+      throw this.#recoveryDeadlineError();
+    }
+    let timer;
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(operation),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(this.#recoveryDeadlineError()),
+            remaining,
+          );
+        }),
+      ]);
+      if (this.monotonicNow() >= deadline) {
+        throw this.#recoveryDeadlineError();
+      }
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async #waitRecoveryPoll(deadline) {
+    const remaining = deadline - this.monotonicNow();
+    await this.#awaitWithinRecoveryDeadline(
+      () => this.waitForPoll(Math.min(100, Math.max(1, remaining))),
+      deadline,
+    );
+  }
+
+  #recoveryBoundary(snapshot, {
+    initialUrl,
+    outboundId,
+    observedUser,
+    expectedUser,
+    requiresEmptyPrefix,
+    expectedPreOutboundIds,
+    expectedWaitingAssistant,
+  }) {
+    if (snapshot.url !== initialUrl) {
+      throw this.#pendingOutboundUncertain(
+        "ChatGPT returned a mixed-URL conversation snapshot during recovery.",
+      );
+    }
+    const matchingEntries = snapshot.entries.filter((entry) => (
+      renderedMessageContainsOutboundMarker(entry.renderedText, outboundId)
+    ));
+    if (
+      matchingEntries.length !== 1
+      || matchingEntries[0].role !== "user"
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The pending outbound marker is not unique to one ChatGPT user turn.",
+      );
+    }
+
+    const user = matchingEntries[0];
+    if (
+      (observedUser && !sameIdentity(user, observedUser))
+      || (expectedUser && !sameIdentity(user, expectedUser))
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The correlated ChatGPT user-turn identity changed during recovery.",
+      );
+    }
+    const userIndex = snapshot.entries.indexOf(user);
+    const prefix = snapshot.entries.slice(0, userIndex);
+    const suffix = snapshot.entries.slice(userIndex + 1);
+    if (suffix.some((entry) => entry.role === "user")) {
+      throw this.#pendingOutboundUncertain(
+        "A later ChatGPT user turn exists after the pending outbound.",
+      );
+    }
+    if (requiresEmptyPrefix) {
+      if (prefix.length !== 0 || user.turn !== 1) {
+        throw this.#pendingOutboundUncertain(
+          "Fresh pending outbound recovery found unexpected conversation history.",
+        );
+      }
+    } else if (
+      expectedPreOutboundIds.size === 0
+      || !prefix.some((entry) => expectedPreOutboundIds.has(entry.id))
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "Existing-conversation recovery could not verify a pre-outbound marker.",
+      );
+    }
+
+    const successors = suffix.filter((entry) => entry.role === "assistant");
+    if (successors.length > 1 || successors.length !== suffix.length) {
+      throw this.#pendingOutboundUncertain(
+        "ChatGPT assistant chronology is ambiguous after the pending outbound.",
+      );
+    }
+    const assistant = successors[0] ?? null;
+    if (assistant && assistant.turn !== user.turn + 1) {
+      throw this.#pendingOutboundUncertain(
+        "Pending outbound recovery found a discontinuous assistant turn.",
+      );
+    }
+    if (
+      expectedWaitingAssistant
+      && assistant
+      && !sameIdentity(assistant, expectedWaitingAssistant)
+    ) {
+      throw this.#pendingOutboundUncertain(
+        "The assistant successor changed after the recovery handoff.",
+      );
+    }
+
+    const assistantBaselineEntries = prefix.filter(
+      (entry) => entry.role === "assistant",
+    );
+    const preOutboundMarkerIds = prefix
+      .filter((entry) => expectedPreOutboundIds.has(entry.id))
+      .map((entry) => entry.id);
+    return {
+      user,
+      assistant,
+      assistantBaselineEntries,
+      preOutboundMarkerIds,
+    };
+  }
+
+  async #assistantLocatorFor(entry) {
+    const messages = this.assistantMessages();
+    const count = await messages.count().catch(() => 0);
+    let found = null;
+    for (let index = 0; index < count; index += 1) {
+      const message = messages.nth(index);
+      const identity = await this.messageIdentity(message);
+      if (!sameIdentity(entry, identity)) {
+        continue;
+      }
+      if (found) {
+        return null;
+      }
+      found = message;
+    }
+    return found;
+  }
+
+  async reconcilePendingOutbound({
+    pendingOutbound = null,
+    conversationTargetId = null,
+    lastUserMessageId = null,
+    lastAssistantMessageId = null,
+    priorHandoff = null,
+    timeoutMs = this.sendConfirmationTimeoutMs(),
+    stableWindowMs = this.restorationCorrelationWindowMs(),
+  } = {}) {
+    this.requirePage();
+    const outboundId = pendingOutbound?.outboundId
+      ?? priorHandoff?.sourceOutboundId
+      ?? null;
+    if (!isValidOutboundCorrelationId(outboundId)) {
+      throw this.#pendingOutboundUncertain(
+        "The pending outbound has no valid transport correlation ID.",
+      );
+    }
+    if (
+      typeof conversationTargetId !== "string"
+      || conversationTargetId.length === 0
+      || !this.hasExactRecoveryTarget(conversationTargetId)
+    ) {
+      throw new BrowserAdapterError(
+        "The exact saved ChatGPT target is unavailable for pending outbound recovery.",
+        { code: "RECOVERY_TARGET_UNAVAILABLE", recoverable: false },
+      );
+    }
+
+    const page = this.page;
+    const mainFrame = typeof page.mainFrame === "function"
+      ? page.mainFrame()
+      : null;
+    const initialUrl = normalizedConversationUrl(page.url());
+    const initialKind = initialUrl
+      ? this.classifyConversationUrl(initialUrl)
+      : "invalid";
+    if (!["restorable", "provisional"].includes(initialKind)) {
+      throw this.#pendingOutboundUncertain(
+        "The exact ChatGPT target is not on a recognized conversation route.",
+        { currentUrl: initialUrl },
+      );
+    }
+
+    let navigated = false;
+    const navigationListener = (frame) => {
+      if (
+        !mainFrame
+        || frame === mainFrame
+        || (typeof page.mainFrame === "function" && frame === page.mainFrame())
+      ) {
+        navigated = true;
+      }
+    };
+    page.on?.("framenavigated", navigationListener);
+
+    const outboundKind = pendingOutbound?.kind
+      ?? priorHandoff?.outboundKind
+      ?? "runtime_message";
+    const requiresEmptyPrefix = ["bootstrap", "fresh_rebuild"]
+      .includes(outboundKind);
+    const expectedPreOutboundIds = new Set([
+      lastUserMessageId,
+      lastAssistantMessageId,
+      ...(priorHandoff?.preOutboundMarkerIds ?? []),
+      ...(priorHandoff?.assistantBaseline?.ids ?? []),
+    ].filter(Boolean));
+    const expectedUser = priorHandoff
+      ? {
+        id: priorHandoff.userMessageId ?? null,
+        turn: priorHandoff.userTurn ?? null,
+      }
+      : null;
+    const expectedAssistant = priorHandoff?.status === "complete"
+      ? {
+        id: priorHandoff.assistantMessageId ?? null,
+        turn: priorHandoff.assistantTurn ?? null,
+        responseHash: priorHandoff.responseHash ?? null,
+      }
+      : null;
+    const expectedWaitingAssistant = priorHandoff?.status === "waiting"
+      && priorHandoff.assistantCandidateMessageId
+      ? {
+        id: priorHandoff.assistantCandidateMessageId,
+        turn: priorHandoff.assistantCandidateTurn ?? null,
+      }
+      : null;
+    const deadline = this.monotonicNow() + timeoutMs;
+    let stableSignature = null;
+    let stableSince = 0;
+    let observedUser = null;
+    let observedAssistant = expectedWaitingAssistant ?? expectedAssistant ?? null;
+
+    try {
+      while (this.monotonicNow() < deadline) {
+        this.#assertRecoveryTarget({
+          page,
+          mainFrame,
+          targetId: conversationTargetId,
+          initialUrl,
+          navigated,
+        });
+        const snapshot = validatedOrderedSnapshot(
+          await this.#awaitWithinRecoveryDeadline(
+            () => this.orderedConversationSnapshot().catch(() => null),
+            deadline,
+          ),
+        );
+        if (!snapshot) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        this.#assertRecoveryTarget({
+          page,
+          mainFrame,
+          targetId: conversationTargetId,
+          initialUrl,
+          navigated,
+        });
+        const hasOutboundMarker = snapshot.entries.some((entry) => (
+          renderedMessageContainsOutboundMarker(entry.renderedText, outboundId)
+        ));
+        if (!hasOutboundMarker) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        const {
+          user,
+          assistant,
+          assistantBaselineEntries,
+          preOutboundMarkerIds,
+        } = this.#recoveryBoundary(snapshot, {
+          initialUrl,
+          outboundId,
+          observedUser,
+          expectedUser,
+          requiresEmptyPrefix,
+          expectedPreOutboundIds,
+          expectedWaitingAssistant,
+        });
+        observedUser = { id: user.id, turn: user.turn };
+        if (
+          assistant
+          && observedAssistant
+          && !sameIdentity(assistant, observedAssistant)
+        ) {
+          throw this.#pendingOutboundUncertain(
+            "The ChatGPT assistant successor changed during recovery.",
+          );
+        }
+        if (assistant && !observedAssistant) {
+          observedAssistant = { id: assistant.id, turn: assistant.turn };
+        }
+        if (observedAssistant && !assistant) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        let status = "waiting";
+        let rawResponse = null;
+        let responseHash = null;
+        if (assistant) {
+          const locator = await this.#awaitWithinRecoveryDeadline(
+            () => this.#assistantLocatorFor(assistant),
+            deadline,
+          );
+          if (!locator) {
+            stableSignature = null;
+            stableSince = 0;
+            await this.#waitRecoveryPoll(deadline);
+            continue;
+          }
+          const stopVisible = Boolean(await this.#awaitWithinRecoveryDeadline(
+            () => firstVisible(this.stopButtonLocators()),
+            deadline,
+          ));
+          const generating = stopVisible || await this.#awaitWithinRecoveryDeadline(
+            () => this.isAssistantGenerating(locator),
+            deadline,
+          );
+          if (!generating) {
+            const [generationError, usageLimit] = await this.#awaitWithinRecoveryDeadline(
+              () => Promise.all([
+                this.findGenerationErrorMarker(locator),
+                this.findUsageLimitMarker(locator),
+              ]),
+              deadline,
+            );
+            if (!generationError && !usageLimit) {
+              rawResponse = assistant.renderedText;
+              if (rawResponse.trim()) {
+                responseHash = createHash("sha256")
+                  .update(rawResponse)
+                  .digest("hex");
+                status = "complete";
+              }
+            }
+          }
+        }
+        if (expectedAssistant) {
+          if (
+            status !== "complete"
+            || !sameIdentity(assistant, expectedAssistant)
+            || responseHash !== expectedAssistant.responseHash
+          ) {
+            throw this.#pendingOutboundUncertain(
+              "The completed assistant handoff no longer matches the browser reply.",
+            );
+          }
+        }
+
+        const signature = [
+          initialUrl,
+          conversationTargetId,
+          user.id,
+          user.turn,
+          preOutboundMarkerIds.join(","),
+          assistant?.id ?? "",
+          assistant?.turn ?? "",
+          status,
+          responseHash ?? "",
+        ].join(":");
+        const observedAt = this.monotonicNow();
+        if (signature !== stableSignature) {
+          stableSignature = signature;
+          stableSince = observedAt;
+        }
+        if (observedAt - stableSince < stableWindowMs) {
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        if (this.monotonicNow() >= deadline) {
+          throw this.#recoveryDeadlineError();
+        }
+
+        const finalSnapshot = validatedOrderedSnapshot(
+          await this.#awaitWithinRecoveryDeadline(
+            () => this.orderedConversationSnapshot().catch(() => null),
+            deadline,
+          ),
+        );
+        if (
+          !finalSnapshot
+          || !finalSnapshot.entries.some((entry) => (
+            renderedMessageContainsOutboundMarker(entry.renderedText, outboundId)
+          ))
+        ) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        this.#assertRecoveryTarget({
+          page,
+          mainFrame,
+          targetId: conversationTargetId,
+          initialUrl,
+          navigated,
+        });
+        const finalBoundary = this.#recoveryBoundary(finalSnapshot, {
+          initialUrl,
+          outboundId,
+          observedUser,
+          expectedUser,
+          requiresEmptyPrefix,
+          expectedPreOutboundIds,
+          expectedWaitingAssistant,
+        });
+        if (expectedWaitingAssistant && !finalBoundary.assistant) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        if (
+          Boolean(finalBoundary.assistant) !== Boolean(assistant)
+          || (
+            assistant
+            && !sameIdentity(finalBoundary.assistant, assistant)
+          )
+        ) {
+          if (!assistant && finalBoundary.assistant) {
+            stableSignature = null;
+            stableSince = 0;
+            await this.#waitRecoveryPoll(deadline);
+            continue;
+          }
+          throw this.#pendingOutboundUncertain(
+            "The ChatGPT assistant boundary changed during recovery verification.",
+          );
+        }
+        if (
+          finalBoundary.preOutboundMarkerIds.join(",")
+          !== preOutboundMarkerIds.join(",")
+        ) {
+          stableSignature = null;
+          stableSince = 0;
+          await this.#waitRecoveryPoll(deadline);
+          continue;
+        }
+        if (status === "complete") {
+          const finalRawResponse = finalBoundary.assistant?.renderedText ?? "";
+          const finalResponseHash = createHash("sha256")
+            .update(finalRawResponse)
+            .digest("hex");
+          if (finalResponseHash !== responseHash) {
+            stableSignature = null;
+            stableSince = 0;
+            await this.#waitRecoveryPoll(deadline);
+            continue;
+          }
+          rawResponse = finalRawResponse;
+        }
+
+        const assistantBaseline = {
+          ids: assistantBaselineEntries.map((entry) => entry.id),
+          count: assistantBaselineEntries.length,
+          maxTurn: assistantBaselineEntries.at(-1)?.turn ?? null,
+          lastText: assistantBaselineEntries.at(-1)?.renderedText ?? "",
+        };
+        this.acceptRecoveredOutboundAnchor({
+          conversationUrl: initialUrl,
+          conversationTargetId,
+          userMessageId: user.id,
+          userTurn: user.turn,
+          assistantBaseline,
+          assistantCandidateMessageId: assistant?.id ?? null,
+          assistantCandidateTurn: assistant?.turn ?? null,
+        });
+        if (status === "complete") {
+          this.lastAssistantMessageId = assistant.id;
+          this.lastAssistantTurn = assistant.turn;
+        }
+        if (this.monotonicNow() >= deadline) {
+          throw this.#recoveryDeadlineError();
+        }
+        this.#assertRecoveryTarget({
+          page,
+          mainFrame,
+          targetId: conversationTargetId,
+          initialUrl,
+          navigated,
+        });
+        return {
+          status,
+          conversationUrl: initialUrl,
+          conversationTargetId,
+          userMessageId: user.id,
+          userTurn: user.turn,
+          preOutboundMarkerIds,
+          assistantBaseline,
+          ...(assistant
+            ? {
+              assistantCandidateMessageId: assistant.id,
+              assistantCandidateTurn: assistant.turn,
+            }
+            : {}),
+          ...(status === "complete"
+            ? {
+              assistantMessageId: assistant.id,
+              assistantTurn: assistant.turn,
+              rawResponse,
+              responseHash,
+            }
+            : {}),
+        };
+      }
+      throw this.#pendingOutboundUncertain(
+        "ChatGPT could not stably reconcile the pending outbound on its exact target.",
+      );
+    } finally {
+      page.off?.("framenavigated", navigationListener);
+    }
+  }
+
   async messageIdentity(message) {
     const [id, turn] = await Promise.all([
       message.getAttribute("data-message-id").catch(() => null),
@@ -153,6 +942,15 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   isNewAssistantIdentity({ id, turn, text }) {
     if (super.isNewAssistantIdentity({ id, turn })) {
       return true;
+    }
+    if (
+      !this.allowInPlaceAssistantContinuation
+      || !this.inPlaceAssistantGenerationObserved
+      || this.sentUserTurn == null
+      || !id
+      || !this.assistantIdsBeforeSend.has(id)
+    ) {
+      return false;
     }
     const previous = String(this.lastAssistantTextBeforeSend ?? "");
     return previous !== "" && String(text ?? "") !== previous;

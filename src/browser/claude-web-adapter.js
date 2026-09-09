@@ -22,6 +22,19 @@ export class ClaudeWebAdapter extends BaseWebAdapter {
     return /^\/chat\//;
   }
 
+  freshConversationUrlPattern() {
+    return /^\/new\/?$/;
+  }
+
+  pendingAttachmentLocators() {
+    return [
+      this.page.locator(
+        'form [data-testid="file-thumbnail"], '
+          + 'form button[aria-label*="remove file" i]',
+      ),
+    ];
+  }
+
   composerLocators() {
     return [
       this.page.locator('[data-testid="chat-input"]'),

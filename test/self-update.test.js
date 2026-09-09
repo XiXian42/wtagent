@@ -11,6 +11,53 @@ import {
   runSelfUpdate,
 } from "../src/cli/self-update.js";
 import { fetchJson } from "../src/shared/fetch-json.js";
+import path from "node:path";
+import { resolveLaunchPlan } from "../src/platform/command-launcher.js";
+
+test("self-update resolves Windows npm without an explicit cwd", async () => {
+  const npmPath = "C:\\Program Files\\nodejs\\npm.cmd";
+  let spawned;
+  const result = await installLatest({
+    planCommandImpl: (program, argv) => resolveLaunchPlan({
+      program,
+      argv,
+      platform: "win32",
+      env: { Path: "C:\\Program Files\\nodejs", PATHEXT: ".CMD" },
+      existsSync: (candidate) => candidate === npmPath,
+      statSync: () => ({ isFile: () => true }),
+      readBatchPrefixImpl: () => "node npm-cli.js %*",
+    }),
+    spawnImpl: (command, args, options) => {
+      spawned = { command, args, options };
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0));
+      return child;
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(spawned.command, "cmd.exe");
+  assert.match(spawned.args[3], /npm\.cmd/);
+  assert.equal(spawned.options.windowsVerbatimArguments, true);
+});
+
+test("self-update uses the host's real default planner before spawning", async () => {
+  let spawned;
+  const result = await installLatest({
+    spawnImpl: (command, args, options) => {
+      spawned = { command, args, options };
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0));
+      return child;
+    },
+  });
+  assert.equal(result.ok, true);
+  if (process.platform === "win32") {
+    assert.equal(path.win32.basename(spawned.command).toLowerCase(), "cmd.exe");
+    assert.equal(spawned.options.windowsVerbatimArguments, true);
+  } else {
+    assert.equal(spawned.command, "npm");
+  }
+});
 
 test("npm registry URL targets the published latest document", () => {
   assert.equal(

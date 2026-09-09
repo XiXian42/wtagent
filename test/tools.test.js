@@ -15,6 +15,30 @@ function context(root) {
   };
 }
 
+test("fs.edit preserves literal dollar sequences for single and all replacements", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-edit-literal-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const registry = createDefaultToolRegistry();
+  const replacement = "$& / $$ / $` / $' / $1\r\n中文";
+  for (const replaceAll of [false, true]) {
+    const original = replaceAll ? "prefix OLD middle OLD suffix" : "prefix OLD suffix";
+    const expected = replaceAll
+      ? `prefix ${replacement} middle ${replacement} suffix`
+      : `prefix ${replacement} suffix`;
+    await fs.writeFile(path.join(root, "literal.txt"), original);
+    const result = await registry.execute(registry.validate({
+      id: "literal",
+      name: "fs.edit",
+      args: {
+        path: "literal.txt",
+        edits: [{ old_text: "OLD", new_text: replacement, replace_all: replaceAll }],
+      },
+    }), context(root));
+    assert.equal(result.ok, true, result.message);
+    assert.equal(await fs.readFile(path.join(root, "literal.txt"), "utf8"), expected);
+  }
+});
+
 test("writes, reads, and atomically edits a file", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-tools-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

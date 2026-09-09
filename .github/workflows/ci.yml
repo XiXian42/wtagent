@@ -18,6 +18,7 @@ jobs:
           - windows-latest
         node-version:
           - 20.17.0
+          - 22.13.0
           - lts/*
 
     steps:
@@ -31,7 +32,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --engine-strict
 
       - name: Syntax check
         run: npm run check

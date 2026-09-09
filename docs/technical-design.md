@@ -24,7 +24,7 @@
 
 | 领域 | 选择 |
 | --- | --- |
-| 运行时 | Node.js 20.17+，JavaScript ESM |
+| 运行时 | Node.js `^20.17.0 \|\| ^22.13.0 \|\| >=23.5.0`，JavaScript ESM |
 | CLI | `commander` + `@inquirer/prompts`，终端渲染可选 `ink` |
 | 浏览器控制 | `playwright-core`，使用用户已安装的 Chrome，非 headless |
 | XML | `saxes` 或 `fast-xml-parser`；工具参数按注册 Schema 二次校验 |
@@ -252,7 +252,7 @@ CLI 可以显示增量文本，但 V1 必须等本轮完整结束后才解析并
 ### 5.1 设计原则
 
 - 使用自定义 XML，避免与网页原生工具调用表示冲突。
-- 不使用随机 nonce。
+- 模型输出协议本身不要求模型生成或回放随机 nonce；transport 会由 Runtime 为每个 outbound 追加一个不透明 correlation UUID，只用于在网页 DOM 中确认该次发送。
 - 每轮最多一个本地工具调用；V1 不做并行工具。
 - 只有完整结束的 assistant 回复才进入解析器。
 - XML 格式错误只能触发“请求重发”或安全失败，不能直接执行猜测出的命令。
@@ -615,9 +615,9 @@ sessions/<session-id>/
   tool-output.jsonl
 ```
 
-`session.json` 保存项目根目录、ChatGPT 会话 URL、最近确认的 assistant message ID、最近确认的实际模式、当前 run phase、最近 turn、等待回填的工具结果和副作用恢复日志。它没有不可继续的 `completed task` 状态；`done=true` 只结束当前 run，Session 回到 `idle`。
+`session.json` 保存项目根目录、provider 会话 URL、对应 Chrome Page target ID、最近确认的 user/assistant message ID、当前 run phase、最近 turn、等待确认的 `pendingOutbound`、已经确认 user 边界但尚未安全消费 assistant 的 `pendingAssistantTurn`、等待回填的工具结果和副作用恢复日志。`pendingAssistantTurn` 分为 `waiting` / `complete`；complete 状态在 XML 解析或工具执行前持久化原始 assistant 文本、SHA-256、message ID、turn 以及原始 Runtime turn。状态还包含单调递增的 `stateRevision`：owner-only 的 Session 文件锁把磁盘 revision 校验和原子替换串行化，独立加载的旧 `AgentSession` 不能覆盖较新的 outbound/handoff checkpoint。锁文件先在私有 candidate inode 中完整写入，再用 hard link 原子发布；每个活锁同时持有由 Session 路径确定的 5 个 loopback TCP mutex 中的多数（至少 3 个），并把完整集合和实际持有集合写入该 inode。任意两个多数集合必然相交，所以只有一个 contender 能进入“检查—回收—发布”区间；少量无关本地 listener 占用其中 1–2 个端口不会阻塞持锁。回收可验证的死 owner（包括没有 mutex 字段的旧格式锁）时，新 candidate 在多数 mutex 仍被占用期间原子替换旧 lock path，不给其它 stale reaper 留下路径空窗。正常释放先按 token 删除文件再关闭 listeners，进程崩溃则由 OS 自动释放全部端口。活 PID 还会用进程启动时间与锁创建时间排除 PID recycle，owner 正好释放导致 `EEXIST` 后文件消失则直接重试。发布后的文件锁和对应多数 listeners 继续覆盖整个状态/rollout 临界区。它没有不可继续的 `completed task` 状态；`done=true` 只结束当前 run，Session 回到 `idle`。
 
-`rollout-*.jsonl` 从创建时起直接使用 **Codex rollout 风格**：首行 `session_meta`，后续每行 `{timestamp, type: "response_item", payload}`，payload 采用 OpenAI Responses 形状（`message` / `function_call` / `function_call_output`）。
+`rollout-*.jsonl` 从创建时起直接使用 **Codex rollout 风格**：首行 `session_meta`，后续每行 `{timestamp, type: "response_item", payload}`，payload 采用 OpenAI Responses 形状（`message` / `function_call` / `function_call_output`）。恢复敏感条目额外携带顶层 `wtagent.idempotencyKey`；同 key + 同 payload 重试是 no-op，同 key + 不同 payload 是状态冲突。旧的无 key rollout 继续可读、可导出；读写与 Session 状态共用进程内队列和进程间锁，幂等写入可修复一次崩溃留下的末尾半行，但普通读取遇到末尾半行会以 `TRANSCRIPT_INCOMPLETE` fail closed，也不会忽略中间损坏。outbound 的 transcript append、磁盘 revision 校验和 handoff 状态交换位于同一锁事务中，失败的旧 CAS 不会把 transcript 条目混入较新的 outbound。
 
 - 网页 DOM 和 XML 只是 transport，不污染 portable rollout。
 - WTAgent 专属协议与工具目录只出现在 `<agent_protocol>` / `<system_reminder>` 标记中；文本明确说明这是用户请求的应用层格式，而不是伪装成 ChatGPT system/tool channel，也不作为 developer message 写入 rollout。
@@ -648,14 +648,21 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 
 ### 9.3 浏览器恢复
 
-- Chrome 仍在：根据专用 Profile、PID、CDP 端口和健康检查验证身份，复用浏览器并创建新的 Page。
-- Chrome 崩溃：用相同 Profile 重启并打开会话 URL。
-- 同一 CLI 进程中的 follow-up 保持在当前会话 Page，不重复导航；跨进程恢复需要等待本地记录的最近 assistant message ID 出现在 DOM 后才能发送。
-- 每次发送记录已有消息 ID 和新 user turn，只接受位于该 user turn 之后的新 assistant turn；无法建立可靠消息身份时超时并保存诊断，禁止退化为基于数量或文本变化猜测。
-- 新 assistant 节点在停止生成后持续 10 秒仍为空时，Runtime 只发送“继续上一轮”的短提示，不重发原任务、附件或工具结果；自动恢复最多 3 次。仍为空时保留 Chrome、Session 和待确认工具结果并回到 CLI，允许用户输入 `/retry` 或新的指令。
+- Chrome 仍在：根据专用 Profile、PID、CDP 端口和健康检查验证身份；Session 同时保存 Page target ID 与已验证 URL。target ID 可在 provisional URL 已变成 canonical URL 后继续定位同一个标签页；没有 target ID 时才退回到唯一的 origin/path 精确匹配。重复匹配或存在无法归属的候选会话标签页时 fail closed，不任意选择。
+- Chrome 崩溃：用相同 Profile 重启；只有 provider 判定为 durable/restorable 的会话 URL 才允许导航打开。ChatGPT `/c/WEB:...` 等 provisional URL 只用于定位仍然存活的精确标签页，标签页丢失后不得重新导航到该地址。
+- URL 分类同时验证 HTTPS 与完整 origin。只有 provider 明确声明的首页/新会话路径可归类为 fresh；settings、project、error 等其它同域路径属于 unknown，不能接收 prompt。
+- Adapter 的会话初始化必须返回结构化结果：`restored-existing` 表示 URL 身份和稳定非空 DOM 历史均已验证，`verified-fresh` 表示 composer 可用且 URL/空 DOM 连续稳定数秒。Runtime 不得把 `resume=true` 本身或一次瞬时空 DOM 当成历史已恢复/丢失。
+- 同一 CLI 进程中的 follow-up 保持在当前会话 Page，不重复导航；跨进程恢复需同时验证目标 URL 与稳定的非空历史。provisional/fresh target 变成 canonical URL 时，候选页面还必须在真实经过的多秒稳定窗口内持续包含 Session 已保存的 user 或 assistant message ID；验证调用次数不能缩短该时间。target ID 和 top-frame navigation 只能证明 Page 连续性，不能证明会话身份。单帧残留的旧 React DOM、没有消息标记的跳转或任意其它 `/c/...` 页面，即使随后出现稳定历史也都拒绝。
+- Adapter 监听 top-frame navigation，但先把 fresh → conversation 或 provisional → canonical 转换保留为候选。已有对话的候选必须先用跳转前的消息 ID 稳定关联，禁止拿候选页面自己的 user bubble 反向证明候选身份；`verified-fresh` 会先清除旧对话的恢复标记。若 fresh Page 在提交前切到候选路由，该路由必须在真实经过的完整稳定窗口内保持空白才允许提交；若路由由提交本身产生，提交、URL 分配、user bubble 发现和稳定确认共享同一个 monotonic deadline。ChatGPT 用一次原子的有序 DOM snapshot 同时读取 user/assistant role、message ID、`conversation-turn-*`、DOM 位置和 assistant raw 文本；同一个 page evaluation 内也会从嵌套 `pre code` 恢复父节点遗漏的完整协议 envelope。DOM/turn 顺序及 ID/turn 唯一性必须一致，带 correlation ID 的 user 必须是第一条真实消息且之后不能再有 user。稳定签名只包含 Page/frame/target、send/navigation epoch、URL、user ID/turn 和 correlation ID，不包含长消息的展开/收起文案、完整 `innerText`、assistant 文本/数量或总消息数，因此正常的折叠控件变化和 assistant 到达不会制造假阴性。
+- 每次发送记录已有消息 ID 和新 user turn，只接受位于该 user turn 之后的新 assistant turn；从提交后等待 user bubble 开始，到 assistant reply 完整结束为止，保留不可变的 Page/main-frame/target/scope turn proof，并在每轮读取前验证。显式恢复另一个会话会清空上一个会话的 URL alias scope；中途切到其它对话或替换 Page/frame/target 时不接受该页面的 user/assistant 节点。ChatGPT 只有在 continuation outbound 明确允许、且确实观察到 live stop/generating 结构信号后，才允许把同 ID assistant 的重写视作新回复；单纯的文本或展开控件变化不能充当消息身份。无法建立可靠身份时保存诊断并 fail closed。复用标签页若残留附件 chip，也在提交前拒绝发送，防止夹带旧草稿文件。
+- 每个 outbound（首次任务、follow-up、continuation、协议纠正和工具结果）在 Send 动作开始前都生成唯一 correlation ID 并将 checkpoint 写入 Session；每一种路径都必须在最新 user turn 的最终 `<system_reminder>` 边界确认该 ID，不能用“出现一个新 ID/turn”代替。提交后断线、换页或消息气泡无法确认属于 `SEND_COMMIT_UNKNOWN`，不得自动重发。ChatGPT 的 bare resume 可在普通恢复逻辑之前进入只读 reconciliation：必须有保存的 target ID，只连接已存在的健康 Chrome，只选择该精确 target；普通连接必须先只断开 transport/锁，再以 strict 模式重新连接，后续 close 也不得终止 Chrome。该路径禁止 URL fallback、创建 Page/target、启动/回收/杀死 Chrome、删除 CDP state、导航或点击 new-chat。然后在同一个 monotonic deadline 内要求连续稳定地验证唯一 marker、user/assistant chronology 及 fresh 空前缀或已有对话的旧 marker；无效 DOM 样本不会计入稳定时间。fresh user 必须是 turn 1，assistant 若已出现必须是相邻 turn；准备返回 complete 时还会重取最后一个原子 snapshot，并要求 user/assistant identity、顺序和 raw response hash 与稳定样本一致，防止 DOM 在文本读取期间被替换。已锚定的 waiting assistant ID/turn 在后续 wait 中也不能被替换。reconciliation 返回 waiting 后，ChatGPT 在普通 completion loop 的每次轮询及接受文本前都重新读取原子的有序 snapshot：correlated user 必须仍是最后一个 user，其后只能为空或保留同一个相邻 assistant；人工插入的后续 user、assistant 替换或顺序变化立即以 `OUTBOUND_COMMIT_UNCERTAIN` fail closed，相关文本和工具请求不会进入 Runtime。停止生成的错误卡、空回复和 usage-limit 卡不会被误存为正常 complete raw。其它 provider 的 commit-unknown outbound、替代/冲突 target、缺失/重复 marker、后续 user、导航或顺序歧义仍 fail closed，且不会发送任何内容；其它 provider 已确认并形成 `pendingAssistantTurn` 的旧式恢复仍可在 `restored-existing` 验证后继续等待，避免引入恢复回归。
+- reconciliation 在一个 Session 锁事务内先确认磁盘 revision 与同一个 `outboundId`，再把已确认 outbound 的 rollout 条目按 deterministic key 幂等写入，并将 `pendingOutbound` 替换为 `pendingAssistantTurn`。`waiting` handoff 锚定相邻 assistant；`complete` handoff 在解析前保存 raw/hash/identity/runtime turn。崩溃后先重验同一浏览器边界，再等待锚定 successor 或复用已保存 raw；工具请求仍经过 XML 校验、policy、approval、side-effect claim、执行/复用和工具结果发送。创建 child outbound 时保留 complete parent，直到 child 的 user 边界已确认并以新 handoff 安全取代它。带 instruction 或附件的 resume 在 `@file` 解析和 follow-up 写入之前拒绝，交互恢复也必须先输入 `/retry` 完成 bare recovery。Session 的 root target 与当前 pending outbound/handoff target 必须一致；重连期间暂停独立 URL callback 写入，并在恢复验证后把新 target 与 pending record 原子更新，冲突时不猜测任意一边。
+- 新 assistant 节点在停止生成后持续 10 秒仍为空时，Runtime 只发送“继续上一轮”的短提示，不重发原任务、附件或工具结果；自动恢复最多 3 次。仍为空时保留 Chrome、Session 和待确认工具结果并回到 CLI；存在 pending handoff 时只接受 `/retry`（或退出），恢复完成前不解析附件、不记录新的 follow-up。
 - 同一 Profile 同时只允许一个 WTAgent CLI Session；启动和接管过程使用 Profile 级互斥锁。
 - 登录失效或出现验证：进入 `AUTH_REQUIRED`/`PAUSED`，让用户接管。
-- 会话页面丢失：从本地记录打开原会话；无法恢复时创建新的本地 Session 和新的网页对话，不向旧 rollout 继续追加。
+- 保存的会话 URL 若重定向到稳定空白页，Adapter 返回 `verified-fresh`。Runtime 仅在 canonical rollout **恰好**含一个与初始任务完全相同且未带附件的 user message，并且没有 assistant、已完成 assistant 的 message ID/event、tool call/output、pending outbound、pending assistant handoff、pending/completed tool 或 side-effect 记录时，允许在同一个本地 Session 中发送完整 resume scaffold 重建网页上下文。新 Session 会在浏览器操作前记录初始 user message 与附件元数据，所以空 rollout 的旧 Session 不作安全猜测。任何更丰富、不完整或仅完成了 assistant checkpoint 但尚未写入 rollout 的历史，都在发送前失败并原样保留账本。
+- `verified-fresh` rebuild 是新的网页对话，交互模式会重新给用户一次浏览器侧模型选择机会；setup 返回后必须再次打开并验证稳定空白对话，防止用户在模型选择期间切到历史 chat 后把 bootstrap 发入旧上下文。真正的 `restored-existing` 不打断原会话模型。
+- 已发送消息后的中途 CDP 重连必须恢复 `restored-existing`；落到 fresh Page 时禁止发送 continuation、follow-up 或工具结果，交由下一次顶层 resume 执行上述安全判断。ChatGPT 的 waiting handoff 在 transport 丢失后只允许 strict exact-target reconciliation；不具备 marker reconciliation 的其它 provider 才使用原有的已验证 history restore，并把替换 target 与 handoff 原子更新。
 
 ## 10. Prompt 设计
 
@@ -665,7 +672,7 @@ sessionId + assistantMessageIdentity + normalizedToolCall
 2. 当前可用工具及参数 Schema。
 3. 用户任务、项目根目录语义和执行边界。
 
-同一网页会话中的普通 follow-up 只发送新的用户输入，并在末尾追加短 `<system_reminder>`；不得重复发送完整 `<agent_protocol>`、工具目录或初始任务。只有没有新用户输入的中断恢复流程可以发送完整 resume scaffold。
+确认恢复到同一网页历史后的普通 follow-up 只发送新的用户输入，并在末尾追加短 `<system_reminder>`；不得重复发送完整 `<agent_protocol>`、工具目录或初始任务。没有新用户输入的中断恢复，以及 9.3 定义的安全 fresh rebuild，发送完整 resume scaffold；fresh rebuild 即使带新的 instruction，也必须把它放入完整 scaffold，禁止把裸 follow-up 发到空白对话。
 
 关键规则：
 

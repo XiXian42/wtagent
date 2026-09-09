@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { confirm, select } from "@inquirer/prompts";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
@@ -15,6 +16,7 @@ import {
 } from "../browser/provider-registry.js";
 import {
   ensureDirectory,
+  formatHomePath,
   getAppDataDir,
   getSessionsDir,
   getTasksDir,
@@ -32,6 +34,7 @@ import { ApprovalStore } from "../policy/approval-store.js";
 import { createDefaultToolRegistry } from "../tools/default-tools.js";
 import { ProcessManager } from "../tools/process-manager.js";
 import { resolveLimits } from "../shared/limits.js";
+import { BrowserAdapterError } from "../shared/errors.js";
 import { EXPORTERS } from "../session/session-export.js";
 import { getPackageVersion } from "../shared/package-info.js";
 import { extractAtMentions } from "./at-files.js";
@@ -301,13 +304,13 @@ class ConversationRunner {
           await this.approvalStore.save();
           console.log(t("approval.savedTool", {
             tool: toolCall.name,
-            file: this.approvalStore.filePath,
+            file: formatHomePath(this.approvalStore.filePath),
           }));
         } else if (choice === "always-all") {
           this.approvalStore.setAlwaysAllowAll();
           await this.approvalStore.save();
           console.log(t("approval.savedAll", {
-            file: this.approvalStore.filePath,
+            file: formatHomePath(this.approvalStore.filePath),
           }));
         }
         return true;
@@ -435,8 +438,14 @@ async function waitForProcessToExit(pid, timeoutMs = 60_000) {
 // session, ask the user how to proceed instead of failing outright: kill the
 // other session, or have the user close its Chrome window so that session
 // fails and releases the profile. Returns true when the turn should be retried.
-async function promptToResolveProfileLock(error) {
+export async function promptToResolveProfileLock(error) {
   const pid = Number(error.details?.pid);
+  if (pid === process.pid) {
+    throw new Error(
+      "The current WTAgent process still holds its browser profile lock. Refusing to terminate itself.",
+      { cause: error },
+    );
+  }
   console.log(`\n${"\x1b[33m"}${error.message}${"\x1b[0m"}`);
   const choice = await promptForSelect({
     message: t("profileLock.how"),
@@ -470,7 +479,7 @@ async function promptToResolveProfileLock(error) {
   return true;
 }
 
-async function executeSession({
+export async function executeSession({
   session,
   options,
   resume = false,
@@ -478,11 +487,14 @@ async function executeSession({
   files = [],
   chatInput = null,
   mode = null,
-}) {
+}, {
+  interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY,
+  createRunner = (config) => new ConversationRunner(config),
+  readNextMessage = promptForNextMessage,
+} = {}) {
   const paths = resolveRuntimePaths(options);
   await ensureDirectory(paths.sessionsDir);
-  const interactive = !options.once && process.stdin.isTTY && process.stdout.isTTY;
-  const runner = new ConversationRunner({ session, options, interactive });
+  const runner = createRunner({ session, options, interactive });
 
   const onInterrupt = () => {
     if (runner.interrupted) {
@@ -545,9 +557,8 @@ async function executeSession({
           throw result.error;
         }
         runner.renderer.hint(t("session.cancelledHint"));
-        turnResume = true;
-        turnInPlaceRecovery = false;
-        continue;
+        // Fall through to the same input prompt as a completed turn. Never
+        // resume automatically or reuse the cancelled instruction/attachments.
       }
       if (result?.recoveryRequired) {
         if (!interactive) {
@@ -558,11 +569,30 @@ async function executeSession({
             provider: runner.renderer.providerLabel,
           }),
         );
-        const next = await promptForNextMessage(runner, activeChatInput);
+        const pendingRecovery = session.state.pendingOutbound != null
+          || session.state.pendingAssistantTurn != null;
+        let next;
+        let retryOnly = false;
+        for (;;) {
+          next = await readNextMessage(runner, activeChatInput, {
+            resolveAttachments: !pendingRecovery,
+          });
+          if (next == null) {
+            break;
+          }
+          retryOnly = next.text.trim().toLowerCase() === "/retry";
+          if (!pendingRecovery || retryOnly) {
+            break;
+          }
+          runner.renderer.hint(
+            t("session.recoveryHint", {
+              provider: runner.renderer.providerLabel,
+            }),
+          );
+        }
         if (next == null) {
           break;
         }
-        const retryOnly = next.text.trim().toLowerCase() === "/retry";
         if (!retryOnly) {
           await session.appendInstruction(next.text, { files: next.files });
         }
@@ -593,7 +623,7 @@ async function executeSession({
         }
       }
 
-      const next = await promptForNextMessage(runner, activeChatInput);
+      const next = await readNextMessage(runner, activeChatInput);
       if (next == null) {
         break;
       }
@@ -630,7 +660,11 @@ function printResumeHint(sessionId) {
 // re-prompts. Returns null for an explicit exit command, Ctrl+C, Ctrl+D, or EOF;
 // otherwise returns
 // { text, files } where files are resolved @file attachments.
-async function promptForNextMessage(runner, chatInput) {
+async function promptForNextMessage(
+  runner,
+  chatInput,
+  { resolveAttachments = true } = {},
+) {
   for (;;) {
     const answer = chatInput
       ? await chatInput.read()
@@ -651,7 +685,9 @@ async function promptForNextMessage(runner, chatInput) {
       return null;
     }
     const { text } = classified;
-    const files = await resolveMessageAttachments(runner, text);
+    const files = resolveAttachments
+      ? await resolveMessageAttachments(runner, text)
+      : [];
     return { text, files };
   }
 }
@@ -782,7 +818,7 @@ function printChatBanner(projectRoot, provider) {
   const DIM = "\x1b[2m";
   const RESET = "\x1b[0m";
   console.log("");
-  console.log(`${CYAN}WTAgent${RESET} ${DIM}· ${provider.label} · ${projectRoot}${RESET}`);
+  console.log(`${CYAN}WTAgent${RESET} ${DIM}· ${provider.label} · ${formatHomePath(projectRoot)}${RESET}`);
   console.log(`${DIM}${t("banner.controls")}${RESET}`);
   console.log("");
 }
@@ -812,6 +848,19 @@ async function runResume(sessionId, instructionParts, options) {
   await ensureDirectory(paths.sessionsDir);
   const session = await loadSession(paths, sessionId);
   await assertDirectory(session.state.projectRoot);
+  const instruction = instructionParts.join(" ").trim();
+  if (
+    instruction
+    && (
+      session.state.pendingOutbound != null
+      || session.state.pendingAssistantTurn != null
+    )
+  ) {
+    throw new BrowserAdapterError(
+      "This session has a pending browser handoff. Resume it without an instruction or attachment first.",
+      { code: "RECOVERY_REQUIRES_BARE_RESUME", recoverable: false },
+    );
+  }
 
   const provider = resolveProvider(session.state.provider ?? DEFAULT_PROVIDER);
   // A conversation belongs to one provider. --model on resume is only allowed
@@ -828,7 +877,6 @@ async function runResume(sessionId, instructionParts, options) {
     return null;
   }
 
-  const instruction = instructionParts.join(" ").trim();
   let files = [];
   if (instruction) {
     const projectRoot = session.state.projectRoot;
@@ -1002,26 +1050,33 @@ program
     await runExport(sessionId, { ...command.optsWithGlobals(), ...options });
   });
 
-program.parseAsync().catch((error) => {
-  // Expected, actionable failures carry a plain message instead of a stack
-  // trace (e.g. the provider's Chrome profile is locked by another session).
-  if (error?.code === "PROFILE_LOCKED") {
-    console.error(`Error: ${error.message}`);
+// Resolve npm's executable symlink as well as direct `node main.js` invocations.
+// Importing the session runner in tests must not start the CLI.
+const entryPath = process.argv[1]
+  ? await fs.realpath(process.argv[1]).catch(() => null)
+  : null;
+if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
+  await program.parseAsync().catch((error) => {
+    // Expected, actionable failures carry a plain message instead of a stack
+    // trace (e.g. the provider's Chrome profile is locked by another session).
+    if (error?.code === "PROFILE_LOCKED") {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.error(error.stack ?? error.message);
     process.exitCode = 1;
-    return;
-  }
-  console.error(error.stack ?? error.message);
-  process.exitCode = 1;
-}).finally(() => {
-  // By the time every command finishes, all per-command cleanup (browser
-  // detach/close, stdin raw-mode restore, process stop) has already run. A
-  // stray tty handle (e.g. a keypress-machinery listener left behind on a
-  // failed turn) can still pin the event loop, leaving a dead prompt that
-  // never returns to the shell — exit hard instead of relying on the loop
-  // to drain naturally.
-  if (process.exitCode != null && process.exitCode !== 0) {
-    process.stdin.setRawMode?.(false);
-    process.stdin.pause?.();
-    process.exit(process.exitCode);
-  }
-});
+  }).finally(() => {
+    // By the time every command finishes, all per-command cleanup (browser
+    // detach/close, stdin raw-mode restore, process stop) has already run. A
+    // stray tty handle (e.g. a keypress-machinery listener left behind on a
+    // failed turn) can still pin the event loop, leaving a dead prompt that
+    // never returns to the shell — exit hard instead of relying on the loop
+    // to drain naturally.
+    if (process.exitCode != null && process.exitCode !== 0) {
+      process.stdin.setRawMode?.(false);
+      process.stdin.pause?.();
+      process.exit(process.exitCode);
+    }
+  });
+}

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AgentRuntime } from "../src/runtime/agent-runtime.js";
 import { FakeWebModelAdapter } from "../src/browser/fake-web-model-adapter.js";
@@ -16,6 +17,12 @@ import {
 } from "../src/shared/limits.js";
 import { BrowserAdapterError } from "../src/shared/errors.js";
 
+function outboundCorrelationId(message) {
+  return String(message).match(
+    /Opaque WTAgent transport correlation ID \(do not repeat\): ([0-9a-f-]{36})\./,
+  )?.[1] ?? null;
+}
+
 function assertOneTrailingReminder(message) {
   assert.equal(
     [...message.matchAll(/<system_reminder>/g)].length,
@@ -28,6 +35,132 @@ function assertOneTrailingReminder(message) {
     "the system reminder must be the final outbound block",
   );
 }
+
+function transcriptUser(text, { attachments = [] } = {}) {
+  const item = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text }],
+  };
+  if (attachments.length > 0) {
+    item.attachments = attachments;
+  }
+  return item;
+}
+
+async function createInterruptedResumeSession(t, {
+  task = "Recover the original task",
+  state = {},
+  transcriptItems = [transcriptUser(task)],
+} = {}) {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-resume-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const session = await TaskSession.create({
+    sessionsDir,
+    task,
+    projectRoot,
+    mode: null,
+  });
+  for (const item of transcriptItems) {
+    await session.appendTranscriptItem(item);
+  }
+  await session.update({
+    phase: "interrupted",
+    turn: 1,
+    runCount: 1,
+    conversationUrl: "https://chatgpt.com/c/WEB:expired",
+    ...state,
+  });
+  return { base, projectRoot, sessionsDir, session };
+}
+
+function runtimeForResume(session, adapter, { events = [] } = {}) {
+  return new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    onEvent: (event) => events.push(event),
+  });
+}
+
+function fakeReconciliationOutcome(handoff) {
+  return {
+    status: handoff.status,
+    conversationUrl: handoff.conversationUrl,
+    conversationTargetId: handoff.conversationTargetId,
+    userMessageId: handoff.userMessageId,
+    userTurn: handoff.userTurn,
+    preOutboundMarkerIds: handoff.preOutboundMarkerIds ?? [],
+    assistantBaseline: handoff.assistantBaseline ?? null,
+    assistantCandidateMessageId:
+      handoff.assistantCandidateMessageId ?? handoff.assistantMessageId ?? null,
+    assistantCandidateTurn:
+      handoff.assistantCandidateTurn ?? handoff.assistantTurn ?? null,
+    ...(handoff.status === "complete"
+      ? {
+        assistantMessageId: handoff.assistantMessageId,
+        assistantTurn: handoff.assistantTurn,
+        rawResponse: handoff.rawResponse,
+        responseHash: handoff.responseHash,
+      }
+      : {}),
+  };
+}
+
+const invalidDoneMessage = '<agent_response><done>true</done><message><![CDATA[<invoke name="fs.write" />]]></message></agent_response>';
+const emptyDoneMessage = "<agent_response><done>true</done><message> </message></agent_response>";
+const invalidEnvelope = "<agent_response><done>true</done><message>unclosed";
+
+for (const [name, responses] of [
+  ["tool requests inside final messages", [invalidDoneMessage, invalidDoneMessage]],
+  ["empty final messages", [emptyDoneMessage, emptyDoneMessage]],
+  ["mixed syntax and semantic errors", [invalidEnvelope, invalidDoneMessage]],
+]) {
+  test(`protocol retry budget terminates repeated ${name}`, async (t) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-protocol-budget-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const session = await TaskSession.create({ sessionsDir: path.join(root, "sessions"), projectRoot: root, task: "test" });
+    const adapter = new FakeWebModelAdapter([...responses, "must not be read"]);
+    const events = [];
+    const runtime = new AgentRuntime({
+      session, adapter, registry: createDefaultToolRegistry(), policy: new PolicyEngine(),
+      approval: async () => false, onEvent: (event) => events.push(event),
+      limits: { ...DEFAULT_LIMITS, maxProtocolErrors: 2 },
+    });
+    await assert.rejects(runtime.run(), /Protocol failed 2 consecutive times/);
+    assert.deepEqual(events.filter((e) => e.type === "protocol.invalid").map((e) => e.payload.count), [1, 2]);
+    assert.equal(adapter.responseNumber, 2);
+    assert.equal(adapter.sentMessages.length, 2);
+    assert.equal(session.state.lastMessage, null);
+    const transcript = await session.readTranscript();
+    assert.equal(transcript.items.filter(({ item }) => item.role === "assistant").length, 0);
+  });
+}
+
+test("a fully valid tool turn resets the consecutive protocol retry budget", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-protocol-reset-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, "input.txt"), "test");
+  const session = await TaskSession.create({ sessionsDir: path.join(root, "sessions"), projectRoot: root, task: "read" });
+  const adapter = new FakeWebModelAdapter([
+    invalidDoneMessage,
+    '<agent_response><done>false</done><message>Read</message><tool_call name="fs.read"><args><path>input.txt</path></args></tool_call></agent_response>',
+    emptyDoneMessage,
+    '<agent_response><done>true</done><message>Done</message></agent_response>',
+  ]);
+  const events = [];
+  const runtime = new AgentRuntime({
+    session, adapter, registry: createDefaultToolRegistry(), policy: new PolicyEngine(), approval: async () => false,
+    onEvent: (event) => events.push(event), limits: { ...DEFAULT_LIMITS, maxProtocolErrors: 2 },
+  });
+  assert.equal((await runtime.run()).message, "Done");
+  assert.deepEqual(events.filter((e) => e.type === "protocol.invalid").map((e) => e.payload.count), [1, 1]);
+});
 
 test("runs a full model-tool-model loop", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
@@ -82,6 +215,10 @@ test("runs a full model-tool-model loop", async (t) => {
   for (const message of adapter.sentMessages) {
     assertOneTrailingReminder(message);
   }
+  const outboundIds = adapter.sentMessages.map(outboundCorrelationId);
+  assert.equal(outboundIds.every(Boolean), true);
+  assert.equal(new Set(outboundIds).size, adapter.sentMessages.length);
+  assert.deepEqual(adapter.sentOutboundIds, outboundIds);
 
   // The opening web message wraps scaffolding in a strippable marker, with the
   // user task outside it.
@@ -737,6 +874,412 @@ test("resumes the saved conversation with a follow-up instruction", async (t) =>
   assert.equal(session.state.turn, 6);
 });
 
+test("rebuilds the reported provisional-URL session on a verified fresh page", async (t) => {
+  const task = "Research an AI fiction platform";
+  const { session } = await createInterruptedResumeSession(t, { task });
+  const events = [];
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Recovered safely.</message></agent_response>",
+  ]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  const result = await runtimeForResume(session, adapter, { events }).run({
+    resume: true,
+  });
+
+  assert.equal(result.message, "Recovered safely.");
+  assert.equal(adapter.sentMessages.length, 1);
+  assert.match(adapter.sentMessages[0], /<agent_protocol>/);
+  assert.match(adapter.sentMessages[0], /<resume_context>/);
+  assert.match(adapter.sentMessages[0], /Research an AI fiction platform/);
+  assert.match(adapter.sentMessages[0], new RegExp(session.sessionId));
+  assert.equal(
+    events.some((event) => event.type === "conversation.rebuilding_fresh"),
+    true,
+  );
+  assert.equal(
+    events.find((event) => event.type === "model.message_sent")?.payload.kind,
+    "fresh_rebuild",
+  );
+  const transcript = await session.readTranscript();
+  assert.equal(transcript.items.length, 2);
+  assert.equal(
+    transcript.items.filter((entry) => entry.item.role === "user").length,
+    1,
+    "rebuilding transport must not duplicate the original canonical user item",
+  );
+});
+
+test("fresh fallback refuses an ambiguous saved assistant marker", async (t) => {
+  const { session } = await createInterruptedResumeSession(t, {
+    state: { lastAssistantMessageId: "assistant-unrecorded" },
+  });
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => {
+      assert.equal(error.code, "CONVERSATION_REBUILD_UNSAFE");
+      assert.match(error.message, /assistant response/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(adapter.sentMessages, []);
+  assert.equal(session.state.lastAssistantMessageId, "assistant-unrecorded");
+});
+
+test("fresh fallback refuses an incomplete canonical transcript tail", async (t) => {
+  const { session } = await createInterruptedResumeSession(t);
+  const transcriptPath = path.join(
+    session.directory,
+    session.state.rolloutFile,
+  );
+  await fs.appendFile(transcriptPath, '{"timestamp":"partial', "utf8");
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "TRANSCRIPT_INCOMPLETE",
+  );
+
+  assert.deepEqual(adapter.sentMessages, []);
+});
+
+test("fresh fallback wraps a new instruction in the full resume context", async (t) => {
+  const task = "Build the original project";
+  const { session } = await createInterruptedResumeSession(t, { task });
+  await session.appendInstruction("Now add a search page");
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Instruction recovered.</message></agent_response>",
+  ]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await runtimeForResume(session, adapter).run({
+    resume: true,
+    instruction: "Now add a search page",
+  });
+
+  assert.match(adapter.sentMessages[0], /<agent_protocol>/);
+  assert.match(adapter.sentMessages[0], /<initial_request><!\[CDATA\[Build the original project\]\]>/);
+  assert.match(adapter.sentMessages[0], /<latest_instruction><!\[CDATA\[Now add a search page\]\]>/);
+  assert.doesNotMatch(adapter.sentMessages[0], /^Now add a search page\n/);
+  const transcript = await session.readTranscript();
+  assert.equal(
+    transcript.items.filter((entry) => entry.item.role === "user").length,
+    2,
+  );
+});
+
+test("fresh fallback never uses the context-only in-place continuation", async (t) => {
+  const { session } = await createInterruptedResumeSession(t);
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Rebuilt.</message></agent_response>",
+  ]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await runtimeForResume(session, adapter).run({
+    resume: true,
+    inPlaceRecovery: true,
+  });
+
+  assert.match(adapter.sentMessages[0], /<resume_context>/);
+  assert.doesNotMatch(
+    adapter.sentMessages[0],
+    /previous assistant response was empty/i,
+  );
+});
+
+test("fresh fallback runs browser-side model setup for the new chat", async (t) => {
+  const { session } = await createInterruptedResumeSession(t);
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Rebuilt.</message></agent_response>",
+  ]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+  let setupCalls = 0;
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    postAuthSetup: async () => {
+      setupCalls += 1;
+    },
+  });
+
+  await runtime.run({ resume: true });
+
+  assert.equal(setupCalls, 1);
+  assert.equal(adapter.startConversationCalls.length, 2);
+});
+
+test("browser-side setup is revalidated before a fresh bootstrap is sent", async (t) => {
+  const { session } = await createInterruptedResumeSession(t);
+  const adapter = new FakeWebModelAdapter([]);
+  let restorationCalls = 0;
+  adapter.startConversationOutcome = () => {
+    restorationCalls += 1;
+    return restorationCalls === 1
+      ? {
+        status: "verified-fresh",
+        conversationUrl: "https://chatgpt.com/",
+        targetId: "fake-target",
+      }
+      : {
+        status: "restored-existing",
+        conversationUrl: "https://chatgpt.com/c/user-selected-history",
+        targetId: "fake-target",
+      };
+  };
+  const runtime = new AgentRuntime({
+    adapter,
+    registry: createDefaultToolRegistry(),
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => false,
+    postAuthSetup: async () => {
+      adapter.conversationUrl = "https://chatgpt.com/c/user-selected-history";
+    },
+  });
+
+  await assert.rejects(
+    runtime.run({ resume: true }),
+    (error) => error.code === "CONVERSATION_NOT_FRESH",
+  );
+
+  assert.equal(restorationCalls, 2);
+  assert.deepEqual(adapter.sentMessages, []);
+});
+
+test("a pre-submit rebuild failure does not commit its instruction", async (t) => {
+  const instruction = "Add the unsent search page";
+  const { session } = await createInterruptedResumeSession(t);
+  await session.appendInstruction(instruction);
+  const firstAdapter = new FakeWebModelAdapter([]);
+  firstAdapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+  firstAdapter.sendMessage = async () => {
+    firstAdapter.lastSendStatus = "not-submitted";
+    throw new Error("composer failed before submission");
+  };
+
+  await assert.rejects(
+    runtimeForResume(session, firstAdapter).run({
+      resume: true,
+      instruction,
+    }),
+    /composer failed before submission/,
+  );
+  let transcript = await session.readTranscript();
+  assert.equal(transcript.items.length, 1);
+  assert.equal(session.state.pendingOutbound, null);
+
+  // A normal CLI retry records the same instruction again. Identical unsent
+  // follow-up records are deduplicated by the rebuild safety gate.
+  await session.appendInstruction(instruction);
+  const retryAdapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Recovered.</message></agent_response>",
+  ]);
+  retryAdapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await runtimeForResume(session, retryAdapter).run({
+    resume: true,
+    instruction,
+  });
+
+  assert.match(retryAdapter.sentMessages[0], /Add the unsent search page/);
+  transcript = await session.readTranscript();
+  assert.equal(
+    transcript.items.filter((entry) => entry.item.role === "user").length,
+    2,
+  );
+});
+
+test("fresh fallback refuses an earlier commit-unknown outbound message", async (t) => {
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      conversationTargetId: "target-uncertain",
+      pendingOutbound: {
+        kind: "fresh_rebuild",
+        status: "commit-unknown",
+      },
+    },
+  });
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.startConversationOutcome = {
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  };
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN",
+  );
+  assert.deepEqual(adapter.sentMessages, []);
+  assert.equal(adapter.launched, false);
+  assert.equal(
+    session.state.conversationUrl,
+    "https://chatgpt.com/c/WEB:expired",
+  );
+  assert.equal(session.state.conversationTargetId, "target-uncertain");
+});
+
+test("fresh fallback fails closed for any committed model or tool history", async (t) => {
+  const task = "Do not replay progressed work";
+  const pending = {
+    callId: "call_pending",
+    name: "fs.write",
+    ok: true,
+    message: "already wrote",
+  };
+  const cases = [
+    {
+      name: "missing opening transcript",
+      transcriptItems: [],
+    },
+    {
+      name: "pending result",
+      state: { pendingToolResult: pending },
+    },
+    {
+      name: "completed tool",
+      state: { completedTools: { fingerprint: { result: pending } } },
+    },
+    {
+      name: "side effect",
+      state: {
+        sideEffectTools: {
+          operation: { status: "running", name: "fs.write" },
+        },
+      },
+    },
+    {
+      name: "completed assistant event without transcript",
+      event: {
+        type: "model.message_complete",
+        payload: {
+          assistantMessageId: null,
+          raw: "unrecorded assistant reply",
+        },
+      },
+    },
+    {
+      name: "assistant transcript",
+      transcriptItems: [
+        transcriptUser(task),
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "progress" }],
+        },
+      ],
+    },
+    {
+      name: "tool call transcript",
+      transcriptItems: [
+        transcriptUser(task),
+        {
+          type: "function_call",
+          name: "fs.read",
+          arguments: "{}",
+          call_id: "call_existing",
+        },
+      ],
+    },
+    {
+      name: "tool output transcript",
+      transcriptItems: [
+        transcriptUser(task),
+        {
+          type: "function_call_output",
+          call_id: "call_existing",
+          output: "status: ok",
+        },
+      ],
+    },
+    {
+      name: "opening attachment",
+      transcriptItems: [transcriptUser(task, {
+        attachments: [{ name: "brief.pdf", path: "/tmp/brief.pdf" }],
+      })],
+    },
+    {
+      name: "malformed attachment metadata",
+      transcriptItems: [{
+        ...transcriptUser(task),
+        attachments: { name: "brief.pdf", path: "/tmp/brief.pdf" },
+      }],
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      const { session } = await createInterruptedResumeSession(t, {
+        task,
+        state: scenario.state,
+        transcriptItems: scenario.transcriptItems,
+      });
+      if (scenario.event) {
+        await session.appendEvent(scenario.event.type, scenario.event.payload);
+      }
+      const before = structuredClone({
+        pendingToolResult: session.state.pendingToolResult,
+        completedTools: session.state.completedTools,
+        sideEffectTools: session.state.sideEffectTools,
+      });
+      const adapter = new FakeWebModelAdapter([]);
+      adapter.startConversationOutcome = {
+        status: "verified-fresh",
+        conversationUrl: "https://chatgpt.com/",
+      };
+
+      await assert.rejects(
+        runtimeForResume(session, adapter).run({ resume: true }),
+        (error) => {
+          assert.equal(error.code, "CONVERSATION_REBUILD_UNSAFE");
+          return true;
+        },
+      );
+      assert.deepEqual(adapter.sentMessages, []);
+      assert.deepEqual(
+        {
+          pendingToolResult: session.state.pendingToolResult,
+          completedTools: session.state.completedTools,
+          sideEffectTools: session.state.sideEffectTools,
+        },
+        before,
+        "unsafe fallback must preserve recovery ledgers",
+      );
+    });
+  }
+});
+
 test("resends a pending tool result before continuing a recovered task", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
@@ -1156,6 +1699,10 @@ test("done ends the current run but the same session accepts a follow-up", async
     followUpAdapter.startConversationOptions[0].expectedAssistantMessageId,
     "assistant-1",
   );
+  assert.equal(
+    followUpAdapter.startConversationOptions[0].expectedUserMessageId,
+    "user-1",
+  );
   assert.doesNotMatch(followUpAdapter.sentMessages[0], /<agent_protocol>/);
   assert.match(followUpAdapter.sentMessages[0], /^Now answer again\n/);
   assert.equal(session.state.phase, "idle");
@@ -1270,6 +1817,7 @@ test("keeps a completed tool result pending when sending it crashes", async (t) 
   class CrashOnToolResultSendAdapter extends FakeWebModelAdapter {
     async sendMessage(text) {
       if (this.sentMessages.length === 1) {
+        this.lastSendStatus = "not-submitted";
         throw new Error("simulated send crash");
       }
       await super.sendMessage(text);
@@ -1311,16 +1859,13 @@ test("keeps a completed tool result pending when sending it crashes", async (t) 
   });
   const recoveryAdapter = new FakeWebModelAdapter([
     `<agent_response>
-      <done>false</done>
-      <tool_call name="fs.write">
-        <args><content>once</content><path>send-crash.txt</path></args>
-      </tool_call>
-    </agent_response>`,
-    `<agent_response>
       <done>true</done>
       <message>Recovered without replaying the write.</message>
     </agent_response>`,
   ]);
+  recoveryAdapter.reconciliationOutcome = fakeReconciliationOutcome(
+    recovered.state.pendingAssistantTurn,
+  );
   const recoveryRuntime = new AgentRuntime({
     adapter: recoveryAdapter,
     registry: createDefaultToolRegistry(),
@@ -1338,6 +1883,452 @@ test("keeps a completed tool result pending when sending it crashes", async (t) 
     "once",
   );
   assert.equal(recovered.state.pendingToolResult, null);
+});
+
+test("recovers the reported committed bootstrap and executes its fs.write once", async (t) => {
+  const task = "write a qsort.c and test it";
+  const { projectRoot, session } = await createInterruptedResumeSession(t, {
+    task,
+    state: {
+      turn: 0,
+      conversationUrl: "https://chatgpt.com/",
+      conversationTargetId: "fake-target",
+      lastUserMessageId: null,
+      lastAssistantMessageId: null,
+      pendingOutbound: {
+        kind: "bootstrap",
+        outboundId: "a31ab6af-d043-493b-9344-fe4fac5e3219",
+        messageHash: "legacy-checkpoint-hash",
+        preparedAt: "2026-09-08T05:49:51.000Z",
+        transcriptItems: [],
+        status: "commit-unknown",
+      },
+    },
+  });
+  const recoveredAssistant = `<agent_response>
+    <done>false</done>
+    <message>Writing qsort.c.</message>
+    <tool_call name="fs.write">
+      <args>
+        <path>qsort.c</path>
+        <content><![CDATA[int main(void) { return 0; }\n]]></content>
+      </args>
+    </tool_call>
+  </agent_response>`;
+  const adapter = new FakeWebModelAdapter([
+    `<agent_response>
+      <done>true</done>
+      <message>qsort.c was written.</message>
+    </agent_response>`,
+  ]);
+  adapter.conversationUrl =
+    "https://chatgpt.com/c/6a9fa20c-7094-83e8-a36e-be919fe3021a";
+  adapter.reconciliationOutcome = {
+    status: "complete",
+    conversationUrl: adapter.conversationUrl,
+    conversationTargetId: "fake-target",
+    userMessageId: "5e5e5412-6805-42cf-8f13-4e14e4340d26",
+    userTurn: 1,
+    preOutboundMarkerIds: [],
+    assistantBaseline: { ids: [], count: 0, maxTurn: null, lastText: "" },
+    assistantCandidateMessageId: "837c170f-b89e-447c-ada8-0a55ec23456f",
+    assistantCandidateTurn: 2,
+    assistantMessageId: "837c170f-b89e-447c-ada8-0a55ec23456f",
+    assistantTurn: 2,
+    rawResponse: recoveredAssistant,
+    responseHash: createHash("sha256").update(recoveredAssistant).digest("hex"),
+  };
+  const events = [];
+
+  const result = await runtimeForResume(session, adapter, { events }).run({
+    resume: true,
+  });
+
+  assert.equal(result.message, "qsort.c was written.");
+  assert.equal(
+    await fs.readFile(path.join(projectRoot, "qsort.c"), "utf8"),
+    "int main(void) { return 0; }\n",
+  );
+  assert.deepEqual(adapter.recoveryTargetCalls, ["fake-target"]);
+  assert.equal(adapter.startConversationCalls.length, 0);
+  assert.equal(adapter.sentMessages.length, 1);
+  assert.match(adapter.sentMessages[0], /<tool_result name="fs\.write"/);
+  assert.doesNotMatch(adapter.sentMessages[0], /## User task/);
+  assert.equal(
+    events.filter((event) => event.type === "outbound.reconciled").length,
+    1,
+  );
+  assert.equal(
+    events.filter((event) => event.type === "model.message_sent").length,
+    0,
+  );
+  assert.equal(
+    events.filter((event) => event.type === "tool.started").length,
+    1,
+  );
+  assert.equal(Object.keys(session.state.sideEffectTools).length, 1);
+  assert.equal(
+    Object.values(session.state.sideEffectTools)[0].status,
+    "completed",
+  );
+  assert.equal(session.state.pendingOutbound, null);
+  assert.equal(session.state.pendingAssistantTurn, null);
+  const transcript = await session.readTranscript();
+  assert.equal(
+    transcript.items.filter((entry) => entry.item.role === "user").length,
+    1,
+  );
+});
+
+for (const recoveryInput of ["instruction", "files"]) {
+  test(`pending recovery rejects ${recoveryInput} before browser launch`, async (t) => {
+    const { session } = await createInterruptedResumeSession(t, {
+      state: {
+        conversationTargetId: "fake-target",
+        pendingOutbound: {
+          kind: "bootstrap",
+          outboundId: "11111111-1111-4111-8111-111111111111",
+          transcriptItems: [],
+          status: "commit-unknown",
+        },
+      },
+    });
+    const adapter = new FakeWebModelAdapter([]);
+    const pendingBefore = structuredClone(session.state.pendingOutbound);
+
+    await assert.rejects(
+      runtimeForResume(session, adapter).run({
+        resume: true,
+        instruction: recoveryInput === "instruction" ? "do something else" : null,
+        files: recoveryInput === "files"
+          ? [{ name: "extra.txt", path: "/tmp/extra.txt" }]
+          : [],
+      }),
+      (error) => error.code === "RECOVERY_REQUIRES_BARE_RESUME",
+    );
+    assert.equal(adapter.launched, false);
+    assert.deepEqual(session.state.pendingOutbound, pendingBefore);
+  });
+}
+
+test("unsupported providers reject pending recovery before browser launch", async (t) => {
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      conversationTargetId: "fake-target",
+      pendingOutbound: {
+        kind: "bootstrap",
+        outboundId: "11111111-1111-4111-8111-111111111111",
+        transcriptItems: [],
+        status: "commit-unknown",
+      },
+    },
+  });
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.pendingOutboundRecoverySupported = false;
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "OUTBOUND_RECOVERY_UNSUPPORTED",
+  );
+  assert.equal(adapter.launched, false);
+  assert.deepEqual(adapter.sentMessages, []);
+  assert.notEqual(session.state.pendingOutbound, null);
+});
+
+test("providers without marker reconciliation resume a confirmed assistant handoff", async (t) => {
+  const conversationUrl = "https://gemini.google.com/app/confirmed";
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      provider: "gemini",
+      conversationUrl,
+      conversationTargetId: "fake-target",
+      pendingAssistantTurn: {
+        version: 1,
+        handoffId: "outbound:11111111-1111-4111-8111-111111111111",
+        sourceOutboundId: "11111111-1111-4111-8111-111111111111",
+        outboundKind: "bootstrap",
+        runtimeTurn: 1,
+        status: "waiting",
+        conversationUrl,
+        conversationTargetId: "fake-target",
+        userMessageId: "user-confirmed",
+        userTurn: 1,
+        assistantBaseline: { ids: [], count: 0, maxTurn: null },
+        pendingToolAcknowledgement: null,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      },
+    },
+  });
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Legacy provider recovered.</message></agent_response>",
+  ]);
+  adapter.pendingOutboundRecoverySupported = false;
+  adapter.classifyConversationUrl = (value) => (
+    String(value).includes("/app/") ? "restorable" : "fresh"
+  );
+  adapter.conversationUrl = conversationUrl;
+  adapter.startConversationOutcome = {
+    status: "restored-existing",
+    conversationUrl,
+    targetId: "fake-target",
+  };
+
+  const result = await runtimeForResume(session, adapter).run({ resume: true });
+
+  assert.equal(result.message, "Legacy provider recovered.");
+  assert.deepEqual(adapter.recoveryTargetCalls, []);
+  assert.deepEqual(adapter.sentMessages, []);
+  assert.equal(adapter.startConversationCalls[0], conversationUrl);
+  assert.equal(session.state.pendingAssistantTurn, null);
+});
+
+test("pending child recovery prefers its target over an older parent handoff", async (t) => {
+  const childOutboundId = "22222222-2222-4222-8222-222222222222";
+  const parentRaw = "<agent_response><done>false</done><message>parent</message></agent_response>";
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      conversationUrl: "https://chatgpt.com/c/child",
+      conversationTargetId: "target-child",
+      pendingOutbound: {
+        kind: "tool_result",
+        outboundId: childOutboundId,
+        transcriptItems: [],
+        conversationUrl: "https://chatgpt.com/c/child",
+        conversationTargetId: "target-child",
+        status: "commit-unknown",
+      },
+      pendingAssistantTurn: {
+        version: 1,
+        handoffId: "outbound:11111111-1111-4111-8111-111111111111",
+        sourceOutboundId: "11111111-1111-4111-8111-111111111111",
+        outboundKind: "runtime_message",
+        runtimeTurn: 1,
+        status: "complete",
+        conversationUrl: "https://chatgpt.com/c/parent",
+        conversationTargetId: "target-parent",
+        userMessageId: "user-parent",
+        userTurn: 1,
+        assistantMessageId: "assistant-parent",
+        assistantTurn: 2,
+        rawResponse: parentRaw,
+        responseHash: createHash("sha256").update(parentRaw).digest("hex"),
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+      },
+    },
+  });
+  const childRaw = "<agent_response><done>true</done><message>Child recovered.</message></agent_response>";
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.targetId = "target-child";
+  adapter.conversationUrl = "https://chatgpt.com/c/child";
+  adapter.reconciliationOutcome = {
+    status: "complete",
+    conversationUrl: adapter.conversationUrl,
+    conversationTargetId: adapter.targetId,
+    userMessageId: "user-child",
+    userTurn: 3,
+    preOutboundMarkerIds: ["assistant-parent"],
+    assistantBaseline: {
+      ids: ["assistant-parent"],
+      count: 1,
+      maxTurn: 2,
+      lastText: parentRaw,
+    },
+    assistantCandidateMessageId: "assistant-child",
+    assistantCandidateTurn: 4,
+    assistantMessageId: "assistant-child",
+    assistantTurn: 4,
+    rawResponse: childRaw,
+    responseHash: createHash("sha256").update(childRaw).digest("hex"),
+  };
+
+  const result = await runtimeForResume(session, adapter).run({ resume: true });
+
+  assert.equal(result.message, "Child recovered.");
+  assert.deepEqual(adapter.recoveryTargetCalls, ["target-child"]);
+  assert.equal(
+    adapter.reconciliationCalls[0].priorHandoff,
+    null,
+  );
+});
+
+test("recovery rejects a root target that conflicts with its pending outbound", async (t) => {
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      conversationTargetId: "target-root",
+      pendingOutbound: {
+        kind: "bootstrap",
+        outboundId: "11111111-1111-4111-8111-111111111111",
+        transcriptItems: [],
+        conversationTargetId: "target-outbound",
+        status: "commit-unknown",
+      },
+    },
+  });
+  const adapter = new FakeWebModelAdapter([]);
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN",
+  );
+  assert.equal(adapter.launched, false);
+  assert.deepEqual(adapter.recoveryTargetCalls, []);
+});
+
+test("recovery rejects an outcome labeled with a substitute target", async (t) => {
+  const targetId = "target-attached";
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      conversationUrl: "https://chatgpt.com/c/attached",
+      conversationTargetId: targetId,
+      pendingOutbound: {
+        kind: "bootstrap",
+        outboundId: "11111111-1111-4111-8111-111111111111",
+        transcriptItems: [],
+        conversationTargetId: targetId,
+        status: "commit-unknown",
+      },
+    },
+  });
+  const rawResponse = "<agent_response><done>true</done><message>substitute</message></agent_response>";
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.targetId = targetId;
+  adapter.conversationUrl = "https://chatgpt.com/c/attached";
+  adapter.reconciliationOutcome = {
+    status: "complete",
+    conversationUrl: "https://chatgpt.com/c/substitute",
+    conversationTargetId: "target-substitute",
+    userMessageId: "user-substitute",
+    userTurn: 1,
+    assistantBaseline: { ids: [], count: 0, maxTurn: null },
+    assistantMessageId: "assistant-substitute",
+    assistantTurn: 2,
+    rawResponse,
+    responseHash: createHash("sha256").update(rawResponse).digest("hex"),
+  };
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN",
+  );
+
+  assert.deepEqual(adapter.recoveryTargetCalls, [targetId]);
+  assert.notEqual(session.state.pendingOutbound, null);
+  assert.equal(session.state.conversationTargetId, targetId);
+});
+
+test("a crash after assistant receipt resumes from the durable raw response", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-handoff-crash-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const rawResponse = [
+    "<agent_response>",
+    "<done>true</done>",
+    "<message>Durably recovered.</message>",
+    "</agent_response>",
+  ].join("");
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "checkpoint assistant raw",
+    projectRoot,
+    mode: null,
+  });
+  const originalComplete = session.completePendingAssistantTurn.bind(session);
+  let injected = false;
+  session.completePendingAssistantTurn = async (options) => {
+    const completed = await originalComplete(options);
+    if (!injected) {
+      injected = true;
+      throw new Error("crash after assistant checkpoint");
+    }
+    return completed;
+  };
+  const firstAdapter = new FakeWebModelAdapter([rawResponse]);
+
+  await assert.rejects(
+    runtimeForResume(session, firstAdapter).run(),
+    /crash after assistant checkpoint/,
+  );
+  assert.equal(session.state.pendingAssistantTurn.status, "complete");
+  assert.equal(session.state.pendingAssistantTurn.rawResponse, rawResponse);
+
+  const recovered = await TaskSession.load({
+    sessionsDir,
+    taskId: session.taskId,
+  });
+  const recoveryAdapter = new FakeWebModelAdapter([]);
+  recoveryAdapter.conversationUrl = recovered.state.conversationUrl;
+  recoveryAdapter.reconciliationOutcome = fakeReconciliationOutcome(
+    recovered.state.pendingAssistantTurn,
+  );
+  const result = await runtimeForResume(recovered, recoveryAdapter).run({
+    resume: true,
+  });
+
+  assert.equal(result.message, "Durably recovered.");
+  assert.deepEqual(recoveryAdapter.sentMessages, []);
+  assert.equal(recovered.state.pendingAssistantTurn, null);
+  const transcript = await recovered.readTranscript();
+  assert.equal(
+    transcript.items.filter((entry) => entry.item.role === "assistant").length,
+    1,
+  );
+});
+
+test("commit-unknown tool results are checkpointed and never replayed", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  class AmbiguousToolResultAdapter extends FakeWebModelAdapter {
+    async sendMessage(text, options = {}) {
+      if (
+        this.sentMessages.length > 0
+        && String(text).includes("<tool_result")
+      ) {
+        this.lastSendStatus = "commit-unknown";
+        this.sentMessages.push(text);
+        throw new Error("Connection closed after tool result submission");
+      }
+      return await super.sendMessage(text, options);
+    }
+  }
+
+  const adapter = new AmbiguousToolResultAdapter([
+    `<agent_response>
+      <done>false</done>
+      <tool_call name="missing.tool"><args/></tool_call>
+    </agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Do not duplicate a tool result",
+    projectRoot,
+    mode: null,
+  });
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run(),
+    (error) => error.code === "SEND_COMMIT_UNKNOWN",
+  );
+  assert.equal(session.state.pendingOutbound.kind, "tool_result");
+  assert.equal(session.state.pendingOutbound.status, "commit-unknown");
+  assert.notEqual(session.state.pendingToolResult, null);
+
+  const retryAdapter = new FakeWebModelAdapter([]);
+  await assert.rejects(
+    runtimeForResume(session, retryAdapter).run({ resume: true }),
+    (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN",
+  );
+  assert.deepEqual(retryAdapter.sentMessages, []);
+  assert.equal(retryAdapter.launched, true);
+  assert.deepEqual(retryAdapter.recoveryTargetCalls, ["fake-target"]);
+  assert.notEqual(session.state.pendingOutbound, null);
 });
 
 test("persists the concrete conversation URL when the first send crashes", async (t) => {
@@ -1371,6 +2362,226 @@ test("persists the concrete conversation URL when the first send crashes", async
 
   await assert.rejects(runtime.run(), /crashed after browser submission/);
   assert.equal(session.state.conversationUrl, "https://chatgpt.com/c/fake");
+});
+
+test("persists a late canonical URL even when the model turn times out", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const provisionalUrl = "https://chatgpt.com/c/WEB:waiting";
+  const canonicalUrl = "https://chatgpt.com/c/canonical-after-timeout";
+  const adapter = new FakeWebModelAdapter([]);
+  const originalSend = adapter.sendMessage.bind(adapter);
+  adapter.sendMessage = async (text, options) => {
+    await originalSend(text, options);
+    adapter.conversationUrl = provisionalUrl;
+    await adapter.conversationIdentityListener?.({
+      conversationUrl: provisionalUrl,
+      targetId: adapter.targetId,
+      kind: "provisional",
+    });
+  };
+  adapter.waitForTurnComplete = async () => {
+    adapter.conversationUrl = canonicalUrl;
+    // Simulate the top-frame navigation callback firing before CDP dies. The
+    // final synchronous URL read then fails, but the eager checkpoint survives.
+    await adapter.conversationIdentityListener?.({
+      conversationUrl: canonicalUrl,
+      targetId: adapter.targetId,
+      kind: "restorable",
+    });
+    adapter.getConversationIdentity = () => {
+      throw new Error("Connection closed while reading URL");
+    };
+    throw new BrowserAdapterError("Turn timed out.", {
+      code: "TURN_TIMEOUT",
+    });
+  };
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Wait for canonicalization",
+    projectRoot,
+    mode: null,
+  });
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run(),
+    (error) => error.code === "TURN_TIMEOUT",
+  );
+
+  assert.equal(session.state.conversationUrl, canonicalUrl);
+  assert.equal(session.state.conversationTargetId, adapter.targetId);
+});
+
+test("a final assistant checkpoint cannot overwrite a newer canonical URL", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const provisionalUrl = "https://chatgpt.com/c/WEB:race";
+  const canonicalUrl = "https://chatgpt.com/c/canonical-race-winner";
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Done.</message></agent_response>",
+  ]);
+  const originalSend = adapter.sendMessage.bind(adapter);
+  adapter.sendMessage = async (text, options) => {
+    const result = await originalSend(text, options);
+    adapter.conversationUrl = provisionalUrl;
+    await adapter.conversationIdentityListener?.({
+      conversationUrl: provisionalUrl,
+      targetId: adapter.targetId,
+      kind: "provisional",
+    });
+    return result;
+  };
+  let canonicalPublished = false;
+  adapter.getLastAssistantMessageId = async () => {
+    if (!canonicalPublished) {
+      canonicalPublished = true;
+      adapter.conversationUrl = canonicalUrl;
+      await adapter.conversationIdentityListener?.({
+        conversationUrl: canonicalUrl,
+        targetId: adapter.targetId,
+        kind: "restorable",
+      });
+    }
+    return adapter.lastAssistantMessageId;
+  };
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Preserve the newest canonical identity",
+    projectRoot,
+    mode: null,
+  });
+
+  await runtimeForResume(session, adapter).run();
+
+  assert.equal(session.state.conversationUrl, canonicalUrl);
+  assert.equal(session.state.lastAssistantMessageId, "assistant-1");
+});
+
+test("a navigation callback stays newer than an in-flight stale identity read", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const provisionalUrl = "https://chatgpt.com/c/WEB:stale-read";
+  const canonicalUrl = "https://chatgpt.com/c/callback-wins";
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Done.</message></agent_response>",
+  ]);
+  let identityReads = 0;
+  adapter.getConversationIdentity = async () => {
+    identityReads += 1;
+    if (identityReads === 3) {
+      adapter.conversationUrl = canonicalUrl;
+      void adapter.conversationIdentityListener?.({
+        conversationUrl: canonicalUrl,
+        targetId: adapter.targetId,
+        kind: "restorable",
+      });
+      await Promise.resolve();
+      return {
+        conversationUrl: provisionalUrl,
+        targetId: adapter.targetId,
+        kind: "provisional",
+      };
+    }
+    return {
+      conversationUrl: identityReads === 1 ? provisionalUrl : canonicalUrl,
+      targetId: adapter.targetId,
+      kind: identityReads === 1 ? "provisional" : "restorable",
+    };
+  };
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Keep the navigation callback authoritative",
+    projectRoot,
+    mode: null,
+  });
+
+  await runtimeForResume(session, adapter).run();
+
+  assert.equal(identityReads, 3);
+  assert.equal(session.state.conversationUrl, canonicalUrl);
+});
+
+test("a failed URL observation does not discard a completed model reply", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Complete reply.</message></agent_response>",
+  ]);
+  const originalIdentity = adapter.getConversationIdentity.bind(adapter);
+  let identityReads = 0;
+  adapter.getConversationIdentity = () => {
+    identityReads += 1;
+    if (identityReads > 1) {
+      throw new Error("transient CDP URL read failed");
+    }
+    return originalIdentity();
+  };
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Keep the completed reply",
+    projectRoot,
+    mode: null,
+  });
+
+  const result = await runtimeForResume(session, adapter).run();
+
+  assert.equal(result.message, "Complete reply.");
+  assert.equal(session.state.lastMessage, "Complete reply.");
+});
+
+test("a transient non-conversation redirect cannot poison the saved URL", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const canonicalUrl = "https://chatgpt.com/c/trusted";
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.sendMessage = async (text, options) => {
+    await FakeWebModelAdapter.prototype.sendMessage.call(adapter, text, options);
+    adapter.conversationUrl = canonicalUrl;
+    await adapter.conversationIdentityListener?.({
+      conversationUrl: canonicalUrl,
+      targetId: adapter.targetId,
+      kind: "restorable",
+    });
+  };
+  adapter.waitForTurnComplete = async () => {
+    adapter.conversationUrl = "https://chatgpt.com/settings";
+    throw new BrowserAdapterError("Turn timed out.", {
+      code: "TURN_TIMEOUT",
+    });
+  };
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Keep the trusted URL",
+    projectRoot,
+    mode: null,
+  });
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run(),
+    (error) => error.code === "TURN_TIMEOUT",
+  );
+
+  assert.equal(session.state.conversationUrl, canonicalUrl);
 });
 
 test("keeps a sent tool result pending when waiting for the next turn crashes", async (t) => {
@@ -1412,9 +2623,12 @@ test("keeps a sent tool result pending when waiting for the next turn crashes", 
   const recoveryAdapter = new FakeWebModelAdapter([
     `<agent_response>
       <done>true</done>
-      <message>Recovered after resending the pending result.</message>
+      <message>Recovered after the pending result.</message>
     </agent_response>`,
   ]);
+  recoveryAdapter.reconciliationOutcome = fakeReconciliationOutcome(
+    recovered.state.pendingAssistantTurn,
+  );
   const recoveryRuntime = new AgentRuntime({
     adapter: recoveryAdapter,
     registry: createDefaultToolRegistry(),
@@ -1425,7 +2639,7 @@ test("keeps a sent tool result pending when waiting for the next turn crashes", 
 
   await recoveryRuntime.run({ resume: true });
 
-  assert.match(recoveryAdapter.sentMessages[0], /<tool_result name="fs\.write"/);
+  assert.deepEqual(recoveryAdapter.sentMessages, []);
   assert.equal(
     await fs.readFile(path.join(projectRoot, "wait-crash.txt"), "utf8"),
     "once",
@@ -1698,12 +2912,14 @@ class ConnectionDroppingAdapter extends FakeWebModelAdapter {
     super(responses);
     this.dropFirstSends = dropFirstSends;
     this.sendCalls = 0;
+    this.sendOptions = [];
     this.reconnectCalls = 0;
     this.restoreCalls = [];
   }
 
   async sendMessage(text, options = {}) {
     this.sendCalls += 1;
+    this.sendOptions.push(options);
     if (this.sendCalls <= this.dropFirstSends) {
       throw new Error("Target page, context or browser has been closed");
     }
@@ -1748,11 +2964,128 @@ test("reconnects and resends when the browser connection dies during send", asyn
 
   assert.equal(result.message, "Done after reconnect.");
   assert.equal(adapter.sendCalls, 2);
+  assert.match(adapter.sendOptions[0].outboundId, /^[0-9a-f-]{36}$/);
+  assert.equal(
+    adapter.sendOptions[1].outboundId,
+    adapter.sendOptions[0].outboundId,
+  );
   assert.equal(adapter.reconnectCalls, 1);
   assert.ok(
     adapter.restoreCalls.some((url) => url?.includes("chatgpt.com")),
     "the conversation was restored after reconnecting",
   );
+});
+
+test("a pre-submit reconnect checkpoints the replacement target for recovery", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  class TargetMovingAdapter extends FakeWebModelAdapter {
+    constructor() {
+      super([]);
+      this.sendCalls = 0;
+    }
+
+    async sendMessage(text) {
+      this.sendCalls += 1;
+      if (this.sendCalls === 1) {
+        this.lastSendStatus = "not-submitted";
+        throw new Error("Target page, context or browser has been closed");
+      }
+      this.lastSendStatus = "commit-unknown";
+      this.sentMessages.push(text);
+      throw new Error("Connection closed after Send was clicked");
+    }
+
+    async reconnect() {
+      this.targetId = "fake-target-after-reconnect";
+    }
+  }
+
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Checkpoint a reconnect target",
+    projectRoot,
+    mode: null,
+  });
+  const firstAdapter = new TargetMovingAdapter();
+
+  await assert.rejects(
+    runtimeForResume(session, firstAdapter).run(),
+    /Connection closed after Send was clicked/,
+  );
+  assert.equal(
+    session.state.pendingOutbound.conversationTargetId,
+    "fake-target-after-reconnect",
+  );
+
+  const recoveredRaw = "<agent_response><done>true</done><message>Recovered on T2.</message></agent_response>";
+  const recoveryAdapter = new FakeWebModelAdapter([]);
+  recoveryAdapter.targetId = "fake-target-after-reconnect";
+  recoveryAdapter.conversationUrl = "https://chatgpt.com/c/after-reconnect";
+  recoveryAdapter.reconciliationOutcome = {
+    status: "complete",
+    conversationUrl: recoveryAdapter.conversationUrl,
+    conversationTargetId: recoveryAdapter.targetId,
+    userMessageId: "user-after-reconnect",
+    userTurn: 1,
+    preOutboundMarkerIds: [],
+    assistantBaseline: { ids: [], count: 0, maxTurn: null, lastText: "" },
+    assistantCandidateMessageId: "assistant-after-reconnect",
+    assistantCandidateTurn: 2,
+    assistantMessageId: "assistant-after-reconnect",
+    assistantTurn: 2,
+    rawResponse: recoveredRaw,
+    responseHash: createHash("sha256").update(recoveredRaw).digest("hex"),
+  };
+
+  const result = await runtimeForResume(session, recoveryAdapter).run({
+    resume: true,
+  });
+  assert.equal(result.message, "Recovered on T2.");
+  assert.deepEqual(
+    recoveryAdapter.recoveryTargetCalls,
+    ["fake-target-after-reconnect"],
+  );
+});
+
+test("does not resend after a connection loss with unknown commit status", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([]);
+  let sendCalls = 0;
+  let reconnectCalls = 0;
+  adapter.sendMessage = async (text) => {
+    sendCalls += 1;
+    adapter.lastSendStatus = "commit-unknown";
+    adapter.sentMessages.push(text);
+    throw new Error("Connection closed after Send was clicked");
+  };
+  adapter.reconnect = async () => {
+    reconnectCalls += 1;
+  };
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Never duplicate an ambiguous submission",
+    projectRoot,
+    mode: null,
+  });
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run(),
+    (error) => error.code === "SEND_COMMIT_UNKNOWN",
+  );
+
+  assert.equal(sendCalls, 1);
+  assert.equal(reconnectCalls, 0);
+  assert.equal(session.state.pendingOutbound.status, "commit-unknown");
 });
 
 test("reconnects and resumes waiting when the connection dies mid-turn", async (t) => {
@@ -1767,6 +3100,7 @@ test("reconnects and resumes waiting when the connection dies mid-turn", async (
   const adapter = new FakeWebModelAdapter([
     "<agent_response><done>true</done><message>Recovered after reconnect.</message></agent_response>",
   ]);
+  adapter.pendingOutboundRecoverySupported = false;
   const originalWait = adapter.waitForTurnComplete.bind(adapter);
   adapter.waitForTurnComplete = async (options) => {
     waitCalls += 1;
@@ -1799,6 +3133,83 @@ test("reconnects and resumes waiting when the connection dies mid-turn", async (
   assert.equal(reconnectCalls, 1);
 });
 
+test("ChatGPT mid-turn connection loss reattaches the exact target", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  let waitCalls = 0;
+  let reconnectCalls = 0;
+  const adapter = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Exact target recovered.</message></agent_response>",
+  ]);
+  const originalWait = adapter.waitForTurnComplete.bind(adapter);
+  adapter.waitForTurnComplete = async (options) => {
+    waitCalls += 1;
+    if (waitCalls === 1) {
+      throw new Error("Connection closed");
+    }
+    return await originalWait(options);
+  };
+  adapter.reconnect = async () => {
+    reconnectCalls += 1;
+    adapter.targetId = "target-substitute";
+  };
+  adapter.reconciliationOutcome = ({ priorHandoff }) => (
+    fakeReconciliationOutcome(priorHandoff)
+  );
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Recover an exact ChatGPT wait target",
+    projectRoot,
+    mode: null,
+  });
+
+  const result = await runtimeForResume(session, adapter).run();
+
+  assert.equal(result.message, "Exact target recovered.");
+  assert.equal(waitCalls, 2);
+  assert.equal(reconnectCalls, 0);
+  assert.deepEqual(adapter.recoveryTargetCalls, ["fake-target"]);
+});
+
+test("mid-turn reconnect refuses to continue on a verified fresh page", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
+  const projectRoot = path.join(base, "project");
+  const tasksDir = path.join(base, "tasks");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([]);
+  adapter.pendingOutboundRecoverySupported = false;
+  adapter.waitForTurnComplete = async () => {
+    throw new Error("Connection closed");
+  };
+  adapter.reconnect = async () => {};
+  adapter.startConversationOutcome = () => ({
+    status: "verified-fresh",
+    conversationUrl: "https://chatgpt.com/",
+  });
+  const session = await TaskSession.create({
+    tasksDir,
+    task: "Do not continue on a blank reconnect",
+    projectRoot,
+    mode: null,
+  });
+  const runtime = runtimeForResume(session, adapter);
+
+  await assert.rejects(
+    runtime.run(),
+    (error) => {
+      assert.equal(error.code, "CONVERSATION_RESTORE_REQUIRED");
+      return true;
+    },
+  );
+  assert.equal(adapter.sentMessages.length, 1);
+});
+
 test("gives up after one reconnect attempt instead of looping forever", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
@@ -1810,11 +3221,13 @@ test("gives up after one reconnect attempt instead of looping forever", async (t
   const adapter = new FakeWebModelAdapter([
     "<agent_response><done>true</done><message>Never reached.</message></agent_response>",
   ]);
+  adapter.pendingOutboundRecoverySupported = false;
   adapter.waitForTurnComplete = async () => {
     throw new Error("Connection closed");
   };
   adapter.reconnect = async () => {
     reconnectCalls += 1;
+    adapter.targetId = "fake-target-after-wait-reconnect";
   };
   const session = await TaskSession.create({
     tasksDir,
@@ -1832,6 +3245,18 @@ test("gives up after one reconnect attempt instead of looping forever", async (t
 
   await assert.rejects(runtime.run(), /Connection closed/);
   assert.equal(reconnectCalls, 1);
+  assert.equal(
+    session.state.pendingAssistantTurn.conversationTargetId,
+    "fake-target-after-wait-reconnect",
+  );
+  const reloaded = await TaskSession.load({
+    tasksDir,
+    taskId: session.taskId,
+  });
+  assert.equal(
+    reloaded.state.pendingAssistantTurn.conversationTargetId,
+    "fake-target-after-wait-reconnect",
+  );
 });
 
 test("stops immediately when ChatGPT reports a usage limit instead of retrying the format", async (t) => {
@@ -1951,31 +3376,26 @@ test("resume ignores legacy mode overrides and keeps the browser-selected model"
   assert.equal(adapter.mode, null);
 });
 
-test("retries a send that ChatGPT never rendered", async (t) => {
+test("does not retry a submitted message whose DOM confirmation is missing", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
   await fs.mkdir(projectRoot);
   t.after(() => fs.rm(base, { recursive: true, force: true }));
 
-  const adapter = new FakeWebModelAdapter([
-    "<agent_response><done>true</done><message>Done after resend.</message></agent_response>",
-  ]);
+  const adapter = new FakeWebModelAdapter([]);
   let sendCalls = 0;
-  const originalSend = adapter.sendMessage.bind(adapter);
-  adapter.sendMessage = async (text, options = {}) => {
+  adapter.sendMessage = async () => {
     sendCalls += 1;
-    if (sendCalls === 1) {
-      throw new BrowserAdapterError(
-        "ChatGPT did not render the sent message; the send may have failed.",
-        { code: "SEND_NOT_DETECTED" },
-      );
-    }
-    return await originalSend(text, options);
+    adapter.lastSendStatus = "commit-unknown";
+    throw new BrowserAdapterError(
+      "ChatGPT did not confirm whether the sent message committed.",
+      { code: "SEND_COMMIT_UNKNOWN" },
+    );
   };
   const session = await TaskSession.create({
     tasksDir,
-    task: "Resend after a silent send failure",
+    task: "Do not duplicate an ambiguous send",
     projectRoot,
     mode: null,
   });
@@ -1987,10 +3407,13 @@ test("retries a send that ChatGPT never rendered", async (t) => {
     approval: async () => false,
   });
 
-  const result = await runtime.run();
+  await assert.rejects(
+    runtime.run(),
+    (error) => error.code === "SEND_COMMIT_UNKNOWN",
+  );
 
-  assert.equal(result.message, "Done after resend.");
-  assert.equal(sendCalls, 2);
+  assert.equal(sendCalls, 1);
+  assert.equal(session.state.pendingOutbound.status, "commit-unknown");
 });
 
 test("resume launches with the conversation URL so an existing tab can be reused", async (t) => {
@@ -2023,6 +3446,7 @@ test("resume launches with the conversation URL so an existing tab can be reused
 
   await runtime.run({ resume: true, instruction: "Continue" });
   assert.equal(adapter.lastLaunchUrl, "https://chatgpt.com/c/fake");
+  assert.equal(adapter.lastLaunchOptions.preferredTargetId, "fake-target");
 });
 
 test("uses the same default timeout regardless of legacy session mode", async (t) => {

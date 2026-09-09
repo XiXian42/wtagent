@@ -25,6 +25,16 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     return /^\/app\/[^/]+/;
   }
 
+  pendingAttachmentLocators() {
+    return [
+      this.page.locator(
+        '[data-test-id="textarea-wrapper"] .attachment-container, '
+          + '[data-test-id="textarea-wrapper"] '
+          + 'button[aria-label*="remove" i]',
+      ),
+    ];
+  }
+
   composerLocators() {
     return [
       this.page.locator(

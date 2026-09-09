@@ -6,6 +6,164 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { executeSession, promptToResolveProfileLock } from "../src/cli/main.js";
+import { AgentSession } from "../src/session/agent-session.js";
+
+async function sessionHarness(t) {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-cli-session-"));
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const session = await AgentSession.create({ sessionsDir: path.join(home, "sessions"), projectRoot: home, task: "original" });
+  return { home, session };
+}
+
+for (const followUp of [false, true]) {
+  test(`ESC waits for a new instruction after cancelling ${followUp ? "a follow-up" : "the opening turn"}`, async (t) => {
+    const { home, session } = await sessionHarness(t);
+    const trace = [];
+    const calls = [];
+    const freshFiles = [{ name: "fresh.txt", path: path.join(home, "fresh.txt") }];
+    let prompts = 0;
+    let closed = false;
+    const runner = {
+      renderer: { hint() {} },
+      processManager: { list: () => [] },
+      async runTurn(args) {
+        trace.push("run");
+        calls.push(args);
+        return calls.length === 1 ? { cancelled: true } : { message: "done" };
+      },
+      async close() { closed = true; },
+    };
+    await executeSession({
+      session, options: { home }, resume: followUp,
+      instruction: followUp ? "cancelled instruction" : null,
+      files: [{ name: "old.txt", path: path.join(home, "old.txt") }],
+      chatInput: { remember() {}, close() {} },
+    }, {
+      interactive: true,
+      createRunner: () => runner,
+      readNextMessage: async () => {
+        trace.push("prompt");
+        return prompts++ === 0 ? { text: "new instruction", files: freshFiles } : null;
+      },
+    });
+    assert.deepEqual(trace, ["run", "prompt", "run", "prompt"]);
+    assert.equal(calls[1].resume, true);
+    assert.equal(calls[1].instruction, "new instruction");
+    assert.deepEqual(calls[1].files, freshFiles);
+    assert.equal(calls[1].inPlaceRecovery, false);
+    assert.equal(session.state.followUps.at(-1).instruction, "new instruction");
+    assert.equal(closed, true);
+  });
+}
+
+test("quitting the prompt after ESC does not run another turn", async (t) => {
+  const { home, session } = await sessionHarness(t);
+  let runs = 0;
+  let closed = false;
+  await executeSession({ session, options: { home }, chatInput: { close() {} } }, {
+    interactive: true,
+    createRunner: () => ({
+      renderer: { hint() {} }, processManager: { list: () => [] },
+      async runTurn() { runs += 1; return { cancelled: true }; },
+      async close() { closed = true; },
+    }),
+    readNextMessage: async () => null,
+  });
+  assert.equal(runs, 1);
+  assert.equal(closed, true);
+});
+
+test("interactive pending recovery ignores instructions until bare retry", async (t) => {
+  const { home, session } = await sessionHarness(t);
+  const outboundId = "11111111-1111-4111-8111-111111111111";
+  const calls = [];
+  const promptOptions = [];
+  let prompts = 0;
+  const runner = {
+    renderer: { hint() {}, providerLabel: "ChatGPT" },
+    processManager: { list: () => [] },
+    async runTurn(args) {
+      calls.push(args);
+      if (calls.length === 1) {
+        await session.update({
+          pendingAssistantTurn: {
+            version: 1,
+            handoffId: `outbound:${outboundId}`,
+            sourceOutboundId: outboundId,
+            outboundKind: "bootstrap",
+            runtimeTurn: 1,
+            status: "waiting",
+            conversationTargetId: "target-pending",
+          },
+        });
+        return { recoveryRequired: true, error: new Error("retry") };
+      }
+      await session.update({ pendingAssistantTurn: null });
+      return { message: "recovered" };
+    },
+    async close() {},
+  };
+
+  await executeSession({
+    session,
+    options: { home },
+    chatInput: { close() {} },
+  }, {
+    interactive: true,
+    createRunner: () => runner,
+    readNextMessage: async (_runner, _input, options) => {
+      promptOptions.push(options);
+      prompts += 1;
+      if (prompts === 1) {
+        return {
+          text: "inspect @secret.txt",
+          files: [{ name: "secret.txt", path: path.join(home, "secret.txt") }],
+        };
+      }
+      if (prompts === 2) {
+        return { text: "/retry", files: [] };
+      }
+      return null;
+    },
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].resume, true);
+  assert.equal(calls[1].instruction, null);
+  assert.deepEqual(calls[1].files, []);
+  assert.equal(calls[1].inPlaceRecovery, true);
+  assert.equal(promptOptions[0].resolveAttachments, false);
+  assert.equal(promptOptions[1].resolveAttachments, false);
+  assert.deepEqual(session.state.followUps, []);
+});
+
+test("internal SIGINT reaches CLI cleanup without a second turn", async (t) => {
+  const { home, session } = await sessionHarness(t);
+  const originalExitCode = process.exitCode;
+  t.after(() => { process.exitCode = originalExitCode; });
+  let closed = false;
+  const runner = {
+    adapter: {}, renderer: { hint() {}, stopSpinner() {} },
+    async runTurn() { process.emit("SIGINT", "SIGINT"); return { cancelled: true }; },
+    async close() { closed = true; },
+  };
+  await executeSession({ session, options: { home }, chatInput: { close() {} } }, {
+    interactive: true,
+    createRunner: () => runner,
+    readNextMessage: async () => { throw new Error("interruption must exit"); },
+  });
+  assert.equal(runner.interrupted, true);
+  assert.equal(runner.adapter.escCancelRequested, true);
+  assert.equal(process.exitCode, 130);
+  assert.equal(closed, true);
+});
+
+test("profile lock recovery refuses to terminate the current process", async (t) => {
+  const kill = t.mock.method(process, "kill", () => { throw new Error("must not terminate"); });
+  await assert.rejects(promptToResolveProfileLock({ details: { pid: process.pid } }), /Refusing to terminate itself/);
+  assert.equal(kill.mock.callCount(), 0);
+});
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = path.resolve(
@@ -28,6 +186,56 @@ test("package exposes only the wtagent executable", async () => {
     wtagent: "src/cli/main.js",
   });
 });
+
+for (const stateField of ["pendingOutbound", "pendingAssistantTurn"]) {
+  test(`resume rejects instruction text before mutating ${stateField}`, async (t) => {
+    const { home, session } = await sessionHarness(t);
+    const outboundId = "11111111-1111-4111-8111-111111111111";
+    await fs.writeFile(path.join(home, "secret.txt"), "not attached", "utf8");
+    await session.update({
+      [stateField]: stateField === "pendingOutbound"
+        ? {
+          outboundId,
+          kind: "bootstrap",
+          transcriptItems: [],
+          status: "commit-unknown",
+        }
+        : {
+          version: 1,
+          handoffId: `outbound:${outboundId}`,
+          sourceOutboundId: outboundId,
+          outboundKind: "bootstrap",
+          status: "waiting",
+          conversationTargetId: "target-pending",
+        },
+    });
+    const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        entry,
+        "--home",
+        home,
+        "--once",
+        "resume",
+        session.sessionId,
+        "inspect",
+        "@secret.txt",
+      ]),
+      (error) => {
+        assert.match(error.stderr, /pending browser handoff/i);
+        assert.doesNotMatch(error.stdout, /secret\.txt|attach/i);
+        return true;
+      },
+    );
+
+    const reloaded = await AgentSession.load({
+      sessionsDir: path.join(home, "sessions"),
+      sessionId: session.sessionId,
+    });
+    assert.deepEqual(reloaded.state.followUps, []);
+  });
+}
 
 test("CLI help and version use the WTAgent package identity", async () => {
   const entry = path.join(repositoryRoot, "src", "cli", "main.js");

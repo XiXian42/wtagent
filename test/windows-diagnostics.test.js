@@ -11,10 +11,14 @@ import {
   isSupportedNodeVersion,
 } from "../src/platform/windows-diagnostics.js";
 
-test("node version support requires 20.17.0 or newer", () => {
-  assert.equal(isSupportedNodeVersion("v20.16.9"), false);
-  assert.equal(isSupportedNodeVersion("v20.17.0"), true);
-  assert.equal(isSupportedNodeVersion("v22.1.0"), true);
+test("node version support follows the dependency-compatible release ranges", () => {
+  for (const version of ["v18.20.0", "v20.16.9", "v21.7.0", "v22.1.0", "v22.12.0", "v23.4.0", "invalid", "v24.0.0-rc.1"]) {
+    assert.equal(isSupportedNodeVersion(version), false, version);
+    assert.throws(() => assertNativeRuntimeSupported({ version }), /requires Node.js/);
+  }
+  for (const version of ["v20.17.0", "v20.19.5", "v22.13.0", "v23.5.0", "v24.0.0", "v26.0.0"]) {
+    assert.equal(isSupportedNodeVersion(version), true, version);
+  }
 });
 
 test("detects WSL from environment and kernel release", () => {

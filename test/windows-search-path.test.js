@@ -11,6 +11,23 @@ import {
 import { fallbackSearch } from "../src/tools/search-fallback.js";
 import { createDefaultToolRegistry } from "../src/tools/default-tools.js";
 
+test("Windows containment handles drive roots without admitting other drives or siblings", () => {
+  const cases = [
+    ["C:\\", "C:\\", true],
+    ["C:\\", "c:\\repo\\a.js", true],
+    ["C:/", "C:/中文目录/a.js", true],
+    ["C:\\", "D:\\repo\\a.js", false],
+    ["C:\\repo", "c:\\REPO\\child", true],
+    ["C:\\repo", "C:\\repo-other\\child", false],
+    ["C:\\repo", "C:\\repo\\..\\outside", false],
+    ["\\\\server\\share\\", "\\\\SERVER\\share\\child", true],
+    ["\\\\server\\share", "\\\\server\\other\\child", false],
+  ];
+  for (const [root, candidate, expected] of cases) {
+    assert.equal(isPathInside(root, candidate, { platform: "win32" }), expected, `${root} -> ${candidate}`);
+  }
+});
+
 async function makeFixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-win-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

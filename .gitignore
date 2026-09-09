@@ -9,3 +9,5 @@ coverage/
 .env.*
 !.env.example
 test.md
+.claude/
+review/
