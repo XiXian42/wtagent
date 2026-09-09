@@ -170,7 +170,7 @@ function initialLanguage() {
   } catch {
     // Storage may be disabled; the page still works.
   }
-  return navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en";
+  return "en";
 }
 
 let language = initialLanguage();
