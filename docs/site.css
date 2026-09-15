@@ -230,6 +230,9 @@ footer { padding-block: 25px; border-top: 1px solid var(--line); background: var
 footer .brand { color: var(--ink); font-size: 17px; }
 .footer-inner p { max-width: 530px; }
 .footer-inner > div { display: flex; flex-shrink: 0; gap: 18px; }
+.footer-friends { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 14px; }
+.footer-friends span { color: var(--muted); }
+.footer-friends a { text-decoration: underline; text-underline-offset: 4px; }
 html[lang="zh-CN"] h1, html[lang="zh-CN"] h2 { letter-spacing: -.025em; line-height: 1.25; }
 html[lang="zh-CN"] .eyebrow, html[lang="zh-CN"] .kicker { letter-spacing: .035em; }
 

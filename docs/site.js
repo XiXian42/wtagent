@@ -106,6 +106,8 @@ const chinese = {
   "cta.source": "在 GitHub 查看源码 ↗",
   "footer.note": "独立开源软件，与各 AI 服务商无隶属关系，也未获其背书。",
   "footer.issues": "反馈问题",
+  "footer.friends": "友情链接",
+  "footer.ziwei": "紫微斗数",
 };
 
 const ui = {
