@@ -8,7 +8,7 @@ export const UPDATE_COMMAND_TIMEOUT_MS = 10_000;
 export const INSTALL_TIMEOUT_MS = 120_000;
 export const OFFICIAL_NPM_REGISTRY = "https://registry.npmjs.org/";
 export const MANUAL_INSTALL_COMMAND =
-  `npm install -g wtagent@latest --registry=${OFFICIAL_NPM_REGISTRY}`;
+  `npm install -g wtagent@latest --registry=${OFFICIAL_NPM_REGISTRY} --ignore-scripts`;
 
 const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
 
@@ -83,6 +83,7 @@ export async function installLatest({
     "-g",
     "wtagent@latest",
     `--registry=${OFFICIAL_NPM_REGISTRY}`,
+    "--ignore-scripts",
   ]);
   return await new Promise((resolve) => {
     let settled = false;
