@@ -1499,19 +1499,20 @@ test("merges the trailing markdown report into the done=true final answer", asyn
   assert.equal(adapter.sentMessages.length, 1);
 });
 
-test("treats a plain non-protocol reply as the final answer instead of retrying", async (t) => {
+test("requires an explicit completion envelope after a plain reply", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const tasksDir = path.join(base, "tasks");
   await fs.mkdir(projectRoot);
   t.after(() => fs.rm(base, { recursive: true, force: true }));
 
-  // The model answers in plain prose with no <agent_response> at all. There is
-  // no envelope, so no tool could ever be involved: the runtime must end the
-  // run and show the prose instead of burning protocol-error retries.
+  // Missing protocol is not an explicit completion decision.
   const adapter = new FakeWebModelAdapter([
     "思考过程\n跳过\n\n抱歉，我无法完成这个任务，因为项目缺少说明文件。",
+    "<agent_response><done>true</done><message>抱歉，我无法完成这个任务，因为项目缺少说明文件。</message></agent_response>",
   ]);
+  const diagnostics = [];
+  adapter.writeDiagnostics = async (label, details) => diagnostics.push({ label, details });
   const session = await TaskSession.create({
     tasksDir,
     task: "Deploy the site.",
@@ -1533,12 +1534,12 @@ test("treats a plain non-protocol reply as the final answer instead of retrying"
   assert.equal(result.message, "抱歉，我无法完成这个任务，因为项目缺少说明文件。");
   assert.equal(session.state.phase, "idle");
   assert.equal(session.state.lastMessage, result.message);
-  // No protocol-error was pushed back: exactly one outbound message.
-  assert.equal(adapter.sentMessages.length, 1);
-  const plainEvent = events.find((e) => e.type === "protocol.plain_answer");
-  assert.ok(plainEvent, "a protocol.plain_answer event is emitted");
+  assert.equal(adapter.sentMessages.length, 2);
+  assert.ok(events.some((event) => event.type === "protocol.invalid"));
+  assert.ok(!events.some((event) => event.type === "protocol.plain_answer"));
+  assert.equal(diagnostics[0].label, "protocol-invalid");
   const completed = events.find((e) => e.type === "run.completed");
-  assert.equal(completed.payload.plainAnswer, true);
+  assert.equal(completed.payload.plainAnswer, undefined);
 });
 
 test("a broken envelope still triggers a protocol retry (never guessed as done)", async (t) => {
@@ -2329,6 +2330,221 @@ test("commit-unknown tool results are checkpointed and never replayed", async (t
   assert.equal(retryAdapter.launched, true);
   assert.deepEqual(retryAdapter.recoveryTargetCalls, ["fake-target"]);
   assert.notEqual(session.state.pendingOutbound, null);
+});
+
+test("direct native text is returned to the agent without an auxiliary query", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-native-text-"));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const refusal = "I can't depict some public figures. Is there anyone else you'd like to try?";
+  const adapter = new FakeWebModelAdapter([
+    refusal,
+    '<agent_response><done>true</done><message>The provider declined. Would you like a fictional character?</message></agent_response>',
+  ]);
+  const session = await TaskSession.create({ sessionsDir: base, task: "Generate a portrait", projectRoot: base, mode: null });
+  const runtime = new AgentRuntime({
+    adapter, registry: createDefaultToolRegistry(), policy: new PolicyEngine(), session,
+    nativeImageReceiver: { read: async () => assert.fail("fake adapter does not inspect DOM"), save: async () => assert.fail("text has no image") },
+  });
+  assert.match((await runtime.run()).message, /provider declined/);
+  assert.equal(adapter.sentMessages.length, 2, "original request and receipt only");
+  assert.match(adapter.sentMessages[0], /generate and output the image directly/);
+  assert.doesNotMatch(adapter.sentMessages[0], /image\.generate/);
+  assert.ok(adapter.sentMessages[1].includes(refusal));
+  assert.match(adapter.sentMessages[1], /native_image_result type="text"/);
+  assert.equal(session.state.pendingAuxiliaryTurn, null);
+  assert.equal(session.state.pendingOutbound, null);
+});
+
+test("image generation uses an auxiliary turn and checkpoints it before the tool result", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-image-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  const adapter = new FakeWebModelAdapter([
+    `<agent_response><done>false</done><tool_call name="image.generate"><args><prompt>blue circle</prompt><output_path>blue.png</output_path></args></tool_call></agent_response>`,
+    `<agent_response><done>true</done><message>Saved.</message></agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Generate a blue circle",
+    projectRoot,
+    mode: null,
+  });
+  const registry = new ToolRegistry().register({
+    name: "image.generate",
+    risk: "write",
+    requiresVisibleBrowser: true,
+    inputSchema: z.object({
+      prompt: z.string(),
+      output_path: z.string(),
+    }),
+    execute: async (args, context) => {
+      const value = await context.runAuxiliaryTurn({
+        text: `${args.prompt}\n\nGenerate an image.`,
+        waitForCompletion: async () => ({ localPath: args.output_path }),
+      });
+      return { ok: true, message: `Generated ${value.localPath}.` };
+    },
+  });
+  const runtime = new AgentRuntime({
+    adapter,
+    registry,
+    policy: new PolicyEngine(),
+    session,
+    approval: async () => true,
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.message, "Saved.");
+  assert.equal(adapter.sentMessages.length, 3);
+  assert.match(adapter.sentMessages[1], /internal WTAgent provider operation/);
+  assert.match(adapter.sentMessages[2], /<tool_result/);
+  assert.equal(session.state.pendingAuxiliaryTurn, null);
+  assert.equal(session.state.lastUserMessageId, "user-3");
+  assert.equal(session.state.lastAssistantMessageId, "assistant-3");
+});
+
+for (const status of ["not-submitted", "commit-unknown"]) {
+  test(`auxiliary send failure preserves ${status} semantics`, async (t) => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-aux-send-"));
+    t.after(() => fs.rm(base, { recursive: true, force: true }));
+    class FailedSubmitAdapter extends FakeWebModelAdapter {
+      async sendMessage(text, options) {
+        if (text.includes("internal WTAgent provider operation")) {
+          this.lastSendStatus = status;
+          throw new BrowserAdapterError("simulated submit failure", {
+            code: status === "commit-unknown" ? "SEND_COMMIT_UNKNOWN" : "COMPOSER_NOT_FOUND",
+            recoverable: false,
+            details: { stage: "submit" },
+          });
+        }
+        return super.sendMessage(text, options);
+      }
+    }
+    const adapter = new FailedSubmitAdapter([
+      '<agent_response><done>false</done><tool_call name="provider.operation"><args/></tool_call></agent_response>',
+      '<agent_response><done>true</done><message>Failure reported.</message></agent_response>',
+    ]);
+    const session = await TaskSession.create({
+      sessionsDir: base, projectRoot: base, task: "Perform an operation", mode: null,
+    });
+    const registry = new ToolRegistry().register({
+      name: "provider.operation", risk: "write", inputSchema: z.object({}),
+      execute: async (_args, context) => context.runAuxiliaryTurn({
+        text: "Perform an operation",
+        waitForCompletion: async () => assert.fail("unconfirmed send must not reach completion"),
+      }),
+    });
+    const runtime = new AgentRuntime({
+      adapter, registry, session, policy: new PolicyEngine(), approval: async () => true,
+    });
+    if (status === "commit-unknown") {
+      await assert.rejects(runtime.run(), (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN");
+      const pending = structuredClone(session.state.pendingOutbound);
+      assert.equal(pending.kind, "auxiliary_tool_turn");
+      assert.equal(pending.status, "commit-unknown");
+      assert.equal(adapter.sentMessages.length, 1);
+      const operation = Object.values(session.state.sideEffectTools)[0];
+      assert.equal(operation.status, "unknown");
+      assert.equal(operation.result.meta.completionUnknown, true);
+      assert.equal(operation.result.meta.code, "SEND_COMMIT_UNKNOWN");
+      assert.equal(operation.result.meta.recoverable, false);
+      assert.deepEqual(operation.result.meta.details, { stage: "submit" });
+      await assert.rejects(runtime.sendMessage("next"), (error) => error.code === "OUTBOUND_COMMIT_UNCERTAIN");
+      assert.deepEqual(session.state.pendingOutbound, pending);
+      assert.equal(adapter.sentMessages.length, 1);
+    } else {
+      assert.equal((await runtime.run()).message, "Failure reported.");
+      assert.equal(session.state.pendingOutbound, null);
+      assert.equal(adapter.sentMessages.length, 2);
+      const operation = Object.values(session.state.sideEffectTools)[0];
+      assert.equal(operation.result.meta.completionUnknown, undefined);
+    }
+  });
+}
+
+test("an unproven interrupted auxiliary turn blocks resume without replay", async (t) => {
+  const { session } = await createInterruptedResumeSession(t, {
+    state: {
+      pendingAuxiliaryTurn: {
+        version: 1,
+        outboundId: "11111111-1111-4111-8111-111111111111",
+        status: "waiting",
+        conversationUrl: "https://chatgpt.com/c/WEB:expired",
+        conversationTargetId: "fake-target",
+        userMessageId: "user-image",
+        userTurn: 3,
+        assistantBaseline: { ids: ["assistant-1"], count: 1, maxTurn: 2 },
+      },
+    },
+  });
+  const adapter = new FakeWebModelAdapter([]);
+
+  await assert.rejects(
+    runtimeForResume(session, adapter).run({ resume: true }),
+    (error) => error.code === "AUXILIARY_TURN_RECOVERY_REQUIRED",
+  );
+  assert.equal(adapter.launched, false);
+  assert.deepEqual(adapter.sentMessages, []);
+  assert.notEqual(session.state.pendingAuxiliaryTurn, null);
+});
+
+test("an unproven auxiliary failure stops before sending a tool result", async (t) => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-image-failure-"));
+  const projectRoot = path.join(base, "project");
+  const sessionsDir = path.join(base, "sessions");
+  await fs.mkdir(projectRoot);
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+
+  class UncorrelatedImageAdapter extends FakeWebModelAdapter {
+    async captureAuxiliaryTurnCompletion() {
+      throw new Error("image turn is still unresolved");
+    }
+  }
+
+  const adapter = new UncorrelatedImageAdapter([
+    `<agent_response><done>false</done><tool_call name="image.generate"><args><prompt>blue circle</prompt><output_path>blue.png</output_path></args></tool_call></agent_response>`,
+  ]);
+  const session = await TaskSession.create({
+    sessionsDir,
+    task: "Generate a blue circle",
+    projectRoot,
+    mode: null,
+  });
+  const registry = new ToolRegistry().register({
+    name: "image.generate",
+    risk: "write",
+    requiresVisibleBrowser: true,
+    inputSchema: z.object({ prompt: z.string(), output_path: z.string() }),
+    execute: async (args, context) => {
+      await context.runAuxiliaryTurn({
+        text: `${args.prompt}\n\nGenerate an image.`,
+        waitForCompletion: async () => {
+          throw new Error("image download timed out");
+        },
+      });
+      return { ok: true, message: "unreachable" };
+    },
+  });
+
+  await assert.rejects(
+    new AgentRuntime({
+      adapter,
+      registry,
+      policy: new PolicyEngine(),
+      session,
+      approval: async () => true,
+    }).run(),
+    (error) => error.code === "AUXILIARY_TURN_RECOVERY_REQUIRED",
+  );
+  assert.equal(adapter.sentMessages.length, 2);
+  assert.notEqual(session.state.pendingAuxiliaryTurn, null);
+  const sideEffects = Object.values(session.state.sideEffectTools);
+  assert.equal(sideEffects.length, 1);
+  assert.equal(sideEffects[0].status, "unknown");
+  assert.equal(sideEffects[0].result.meta.completionUnknown, true);
 });
 
 test("persists the concrete conversation URL when the first send crashes", async (t) => {

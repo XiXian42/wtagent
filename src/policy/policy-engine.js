@@ -9,6 +9,7 @@ const PATH_FIELDS = Object.freeze({
   "fs.search": ["path"],
   "terminal.exec": ["cwd"],
   "process.start": ["cwd"],
+  "image.generate": ["output_path", "reference_images"],
 });
 
 const PRIVILEGED_PROGRAMS = new Set(["sudo", "su", "doas", "runas"]);
@@ -268,11 +269,15 @@ export class PolicyEngine {
     let allowOutside = false;
 
     for (const field of PATH_FIELDS[toolCall.name] ?? []) {
-      const rawPath = toolCall.args[field] || ".";
-      const resolved = await resolveToolPath(context.projectRoot, rawPath);
-      if (!resolved.inside) {
-        reasons.push(`${field} is outside the selected project: ${resolved.path}`);
-        allowOutside = true;
+      const values = Array.isArray(toolCall.args[field])
+        ? toolCall.args[field]
+        : [toolCall.args[field] || "."];
+      for (const rawPath of values) {
+        const resolved = await resolveToolPath(context.projectRoot, rawPath);
+        if (!resolved.inside) {
+          reasons.push(`${field} is outside the selected project: ${resolved.path}`);
+          allowOutside = true;
+        }
       }
     }
 

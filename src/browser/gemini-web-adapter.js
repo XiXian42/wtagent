@@ -2,6 +2,7 @@ import path from "node:path";
 import { BaseWebAdapter, firstVisible } from "./base-web-adapter.js";
 import { BrowserAdapterError } from "../shared/errors.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
+import { readRenderedBlocks } from "./rendered-text.js";
 
 export { isConnectionLostError } from "./base-web-adapter.js";
 
@@ -124,24 +125,13 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     // Read Gemini's rendered answer body before falling back to the enclosing
     // message-content. Attachment/source chips (for example a trailing "TXT")
     // live beside `.markdown` and are UI chrome, not model output.
-    const markdown = message.locator("message-content .markdown").last();
+    const markdown = message.locator("message-content .markdown");
     if (await markdown.count().catch(() => 0) > 0) {
-      const cleaned = await markdown.evaluate((element) => {
-        const clone = element.cloneNode(true);
-        clone.querySelectorAll(
-          "sources-carousel-inline, source-inline-chip, source-footnote, "
-            + ".hide-from-message-actions",
-        ).forEach((item) => item.remove());
-        return clone.innerText;
-      }).catch(() => null);
-      if (cleaned != null) {
-        return cleaned;
-      }
-      return await markdown.innerText().catch(() => "");
+      return await markdown.evaluateAll(readRenderedBlocks);
     }
-    const content = message.locator("message-content").last();
+    const content = message.locator("message-content");
     if (await content.count().catch(() => 0) > 0) {
-      return await content.innerText().catch(() => "");
+      return await content.evaluateAll(readRenderedBlocks);
     }
     return await message.innerText().catch(() => "");
   }
@@ -163,7 +153,6 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     const completed = await firstVisible([
       message.locator('[data-test-id="regenerate-button"]'),
       message.getByRole("button", { name: /^(Redo|Regenerate|重做)$/i }),
-      message.getByRole("button", { name: /^(Copy|复制)$/i }),
     ]);
     return !completed;
   }
@@ -308,16 +297,66 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     }
   }
 
-  async submitComposer(composer) {
+  async submitComposer(composer, options = {}) {
     const sendButton = await firstVisible(this.sendButtonLocators());
+    options.assertActive?.();
+    if (this.musicGeneration && sendButton && await sendButton.isEnabled()) {
+      // Gemini's current Music UI reliably activates through the focused
+      // button's keyboard handler. Submit once; never retry an unknown commit.
+      await sendButton.press("Space", { timeout: options.timeoutMs });
+      return;
+    }
     if (
       sendButton
       && await sendButton.isEnabled().catch(() => false)
-      && await this.#clickWithNativePointer(sendButton)
+      && await this.#clickWithNativePointer(sendButton, options.assertActive)
     ) {
       return;
     }
-    await super.submitComposer(composer);
+    await super.submitComposer(composer, options);
+  }
+
+  async prepareMusicGeneration() {
+    this.requirePage();
+    // Gemini may move Music from the regular chat tool menu to a dedicated
+    // creation screen. Its old tool chip then exists only in a hidden composer.
+    const prepareCreationPage = async () => {
+      if (typeof this.page.getByText !== "function") return false;
+      const heading = this.page.getByText("Create music", { exact: true });
+      if (!await heading.isVisible().catch(() => false)) return false;
+      const editor = this.page.locator('div.ql-editor[contenteditable="true"][role="textbox"]');
+      const template = this.page.getByRole("button", { name: "Background music", exact: true });
+      if (await template.isVisible().catch(() => false)) {
+        const placeholder = await editor.getAttribute("data-placeholder").catch(() => "");
+        if (!/background music/i.test(placeholder)) await template.click();
+      }
+      await editor.waitFor({ state: "visible", timeout: 15_000 });
+      this.musicGeneration = true;
+      return true;
+    };
+    if (await prepareCreationPage()) return;
+    try {
+      const selected = this.page.getByRole("button", {
+        name: /^(Deselect Music|取消选择音乐|取消選取音樂)$/i,
+      });
+      if (!await selected.isVisible().catch(() => false)) {
+        const tools = this.page.getByRole("button", { name: /^(Upload & tools|上传和工具|上傳和工具)$/i });
+        if (await tools.getAttribute("aria-expanded") !== "true") await tools.press("Space");
+        const music = this.page.locator('button[role="menuitemcheckbox"]:has([data-mat-icon-name="music"])');
+        await music.waitFor({ state: "visible", timeout: 10_000 });
+        if (await music.getAttribute("aria-disabled") === "true") {
+          throw new BrowserAdapterError("Gemini Music is unavailable for this account.", { code: "MUSIC_UNAVAILABLE", recoverable: false });
+        }
+        await music.press("Space");
+        await selected.waitFor({ state: "visible", timeout: 10_000 });
+      }
+    } catch (error) {
+      // Selecting Music in the old menu can navigate to the new screen before
+      // the old menu item appears. Reconcile the UI without sending twice.
+      if (await prepareCreationPage()) return;
+      throw error;
+    }
+    this.musicGeneration = true;
   }
 
   async dismissTransientOverlays() {
@@ -399,7 +438,8 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     return normalized;
   }
 
-  async #clickWithNativePointer(locator) {
+  async #clickWithNativePointer(locator, assertActive = () => {}) {
+    assertActive();
     await locator.scrollIntoViewIfNeeded().catch(() => null);
     const box = await locator.boundingBox().catch(() => null);
     if (!box || !this.page.mouse) {
@@ -409,6 +449,7 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     const y = box.y + box.height / 2;
     await this.page.mouse.move(x, y, { steps: 8 });
     await this.page.waitForTimeout(75);
+    assertActive();
     await this.page.mouse.down();
     await this.page.waitForTimeout(80);
     await this.page.mouse.up();

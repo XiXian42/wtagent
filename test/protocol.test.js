@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { hasCompleteAgentEnvelope } from "../src/protocol/envelope.js";
 import {
   extractTrailingProse,
   parseAgentResponse,
@@ -7,6 +8,45 @@ import {
   serializeToolResult,
   stripUiNoiseLines,
 } from "../src/protocol/xml-protocol.js";
+
+test("CDATA transport-like tags preserve the whole file and trailing answer", () => {
+  const content = 'const value = "</agent_response></tool_call><agent_response>";';
+  const raw = '<agent_response><done>false</done><tool_call name="fs.write"><args>'
+    + '<path>sample.js</path><content><![CDATA[' + content
+    + ']]></content></args></tool_call></agent_response>';
+  assert.equal(parseAgentResponse(raw).toolCall.args.content, content);
+  assert.equal(hasCompleteAgentEnvelope(raw.slice(0, raw.indexOf("]]>"))), false);
+  assert.equal(hasCompleteAgentEnvelope(raw), true);
+  assert.equal(extractTrailingProse(raw + "\nActual trailing answer."), "Actual trailing answer.");
+  assert.equal(parseAgentResponse(raw + raw).toolCall.args.content, content);
+  const bareTool = raw.slice(raw.indexOf("<tool_call"), raw.lastIndexOf("</agent_response>"));
+  assert.equal(parseAgentResponse(bareTool).toolCall.args.content, content);
+});
+
+test("comments and quoted attributes cannot end an envelope", () => {
+  const partial = '<agent_response data-note="</agent_response>">'
+    + '<!-- </agent_response> -->'
+    + '<done>true</done><message>Ready</message>';
+  assert.equal(hasCompleteAgentEnvelope(partial), false);
+  assert.equal(parseAgentResponse(partial + '</agent_response>').message, "Ready");
+  assert.equal(hasCompleteAgentEnvelope('<agent_response_extra></agent_response>'), false);
+});
+
+test("nested and alternate operation markup is never recovered as progress", () => {
+  for (const raw of [
+    '<agent_response><done>false</done><message>Working</message><```xml\n'
+      + '<agent_response><action name="terminal.exec"><parameter>pwd</parameter>'
+      + '</action></agent_response>',
+    '<agent_response><done>false</done><message>Working</message>'
+      + '<agent_response><done>true</done></agent_response></agent_response>',
+    '<agent_response><done>false</done><message>Working</message><action name="terminal.exec"/></agent_response>',
+    '<agent_response><done>false</done><message>bad <b>markup</message><invoke name="fs.write"/></agent_response>',
+    '<agent_response <tool_call name="fs.write"><args><path>a.txt</path></args></tool_call>',
+    '<agent_response><done>false</done><message>bad <b>markup</message><unknown_operation>request</unknown_operation></agent_response>',
+  ]) {
+    assert.throws(() => parseAgentResponse(raw));
+  }
+});
 
 test("parses a tool call with CDATA and item arrays", () => {
   const parsed = parseAgentResponse(`

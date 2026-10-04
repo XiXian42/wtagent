@@ -1,5 +1,6 @@
 import { BaseWebAdapter, firstVisible } from "./base-web-adapter.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
+import { readRenderedBlocks } from "./rendered-text.js";
 
 export { isConnectionLostError } from "./base-web-adapter.js";
 
@@ -20,7 +21,11 @@ export class GrokWebAdapter extends BaseWebAdapter {
 
   composerLocators() {
     return [
-      this.page.locator("main textarea").first(),
+      // Grok replaces its initial textarea with a role=textbox editor during
+      // hydration. Keep both variants in one live locator so a composer found
+      // just before that replacement does not become an empty stale selector
+      // by the time sendMessage fills it.
+      this.page.locator('main textarea, main [role="textbox"]').first(),
       this.page.locator("textarea[aria-label]").first(),
       this.page.locator('[role="textbox"]').first(),
     ];
@@ -84,13 +89,40 @@ export class GrokWebAdapter extends BaseWebAdapter {
     );
   }
 
+  async userMessageText(message) {
+    const markdown = message.locator(".response-content-markdown");
+    if (await markdown.count().catch(() => 0) > 0) {
+      const exact = await markdown.evaluateAll(readRenderedBlocks);
+      if (exact.trim()) return exact;
+    }
+    return await super.userMessageText(message);
+  }
+
   async messageIdentity(message) {
     const testId = await message.getAttribute("data-testid").catch(() => null);
     const aria = await message.getAttribute("aria-label").catch(() => null);
     const scope = testId === "user-message" || aria === "You"
       ? this.userMessages()
       : this.assistantMessages();
-    return { id: null, turn: await scope.count().catch(() => 0) };
+    // Grok wraps every visible user/assistant bubble in a stable response UUID:
+    //
+    //   <div id="response-..." data-scroll-anchor-root>
+    //     <div data-testid="user-message|assistant-message">...</div>
+    //   </div>
+    //
+    // Keep the count fallback for older DOM variants, but prefer the wrapper
+    // identity whenever it is present. Besides making normal multi-turn
+    // correlation stronger, this lets a fresh chat safely follow Grok's late
+    // root -> /c/... navigation after the user bubble has already committed.
+    const id = await message.evaluate((element) => (
+      element.closest('[data-scroll-anchor-root][id^="response-"]')?.id
+        ?? element.closest('[id^="response-"]')?.id
+        ?? null
+    )).catch(() => null);
+    return {
+      id: id || null,
+      turn: await scope.count().catch(() => 0),
+    };
   }
 
   isNewAssistantIdentity({ turn, text }) {
@@ -104,7 +136,7 @@ export class GrokWebAdapter extends BaseWebAdapter {
   async assistantText(message) {
     const response = message.locator(".response-content-markdown");
     if (await response.count().catch(() => 0) > 0) {
-      return await response.last().innerText().catch(() => "");
+      return await response.evaluateAll(readRenderedBlocks);
     }
     return await message.innerText().catch(() => "");
   }

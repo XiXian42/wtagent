@@ -114,16 +114,28 @@ export class ToolRegistry {
         meta: result.meta,
       };
     } catch (error) {
+      const meta = {
+        ...(error?.meta ?? {}),
+        ...(error?.code ? {
+          code: error.code,
+          recoverable: error.recoverable ?? false,
+          ...(error.details ? { details: error.details } : {}),
+        } : {}),
+        ...(error?.completionUnknown ? {
+          completionUnknown: true,
+          recoverable: error.recoverable ?? true,
+        } : {}),
+      };
       return {
         callId: preparedCall.id,
         name: preparedCall.name,
         ok: false,
         message: error.message,
         stderr: error.stack,
+        meta: Object.keys(meta).length ? meta : undefined,
       };
     } finally {
       clearTimeout(timer);
     }
   }
 }
-

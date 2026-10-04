@@ -849,6 +849,74 @@ export async function promptForText(config, options = {}) {
   });
 }
 
+// A non-permission startup pause: Enter and expiry both continue. Keep this
+// separate from text/approval prompts, which must never accept on a timer.
+export async function promptForContinue({ message, countdown, timeoutMs = 5_000 }, {
+  inputStream = process.stdin,
+  outputStream = process.stdout,
+} = {}) {
+  if (inputStream.readableEnded || inputStream.destroyed) return null;
+  return await new Promise((resolve, reject) => {
+    const previousRaw = Boolean(inputStream.isRaw);
+    const deadline = Date.now() + timeoutMs;
+    let timer;
+    let settled = false;
+    const render = (seconds) => {
+      const text = countdown(seconds);
+      if (outputStream.isTTY) {
+        // Keep the changing status on one physical terminal row.
+        let visible = "";
+        for (const ch of text) {
+          if (displayWidth(visible + ch) >= (outputStream.columns || 80)) break;
+          visible += ch;
+        }
+        outputStream.write(`\r\u001b[2K${visible}`);
+      } else {
+        outputStream.write(`${text}\n`);
+      }
+    };
+    const finish = (value, error) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      inputStream.removeListener("data", onData);
+      inputStream.removeListener("end", onEnd);
+      inputStream.removeListener("close", onEnd);
+      inputStream.removeListener("error", onError);
+      inputStream.setRawMode?.(previousRaw);
+      inputStream.pause?.();
+      if (value) render(0);
+      if (outputStream.isTTY) outputStream.write("\n");
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onData = (chunk) => {
+      const text = String(chunk);
+      if (/[\u0003\u0004]/.test(text)) finish(null);
+      else if (/[\r\n]/.test(text)) finish(true);
+    };
+    const onEnd = () => finish(null);
+    const onError = (error) => finish(null, error);
+    inputStream.on("data", onData);
+    inputStream.once("end", onEnd);
+    inputStream.once("close", onEnd);
+    inputStream.once("error", onError);
+    try {
+      inputStream.setRawMode?.(true);
+      outputStream.write(`${message}\n`);
+      render(Math.ceil(timeoutMs / 1_000));
+      timer = setInterval(() => {
+        const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1_000));
+        if (seconds === 0) finish(true);
+        else render(seconds);
+      }, 1_000);
+      inputStream.resume?.();
+    } catch (error) {
+      finish(null, error);
+    }
+  });
+}
+
 export async function promptForSelect(config, options = {}) {
   return await promptWithCleanExit(config, {
     ...options,

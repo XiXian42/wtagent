@@ -6,6 +6,7 @@ import {
   classifyChatInput,
   displayWidth,
   promptForSelect,
+  promptForContinue,
   promptForText,
   readChatMessage,
   ShellChatInput,
@@ -21,6 +22,58 @@ function createTtyStream() {
 
 function tick() {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("startup countdown shows five seconds and continues automatically", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000 });
+  const inputStream = createTtyStream();
+  const outputStream = createTtyStream();
+  const rawModes = [];
+  inputStream.setRawMode = (value) => rawModes.push(value);
+  let output = "";
+  outputStream.on("data", (chunk) => { output += chunk; });
+  let settled = false;
+  const pending = promptForContinue({
+    message: "Signed in.\nChoose a model in the browser.\nPress Enter to continue.",
+    countdown: (seconds) => seconds ? `Continuing in ${seconds}s` : "Continuing…",
+  }, { inputStream, outputStream }).then((result) => { settled = true; return result; });
+  assert.match(output, /Signed in\.\nChoose a model/);
+  for (let seconds = 5; seconds > 0; seconds -= 1) {
+    assert.ok(output.includes(`Continuing in ${seconds}s`));
+    assert.equal(settled, false);
+    t.mock.timers.tick(1_000);
+  }
+  assert.equal(await pending, true);
+  assert.deepEqual(rawModes, [true, false]);
+  assert.equal(inputStream.listenerCount("data"), 0);
+  assert.equal(inputStream.isPaused(), true);
+  const completedOutput = output;
+  t.mock.timers.tick(10_000);
+  assert.equal(output, completedOutput, "no redraws after completion");
+});
+
+for (const [name, key, expected] of [["Enter", "\r", true], ["Ctrl+C", "\u0003", null], ["Ctrl+D", "\u0004", null], ["EOF", null, null]]) {
+  test(`startup countdown handles ${name} and cleans up immediately`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000 });
+    const inputStream = createTtyStream();
+    const outputStream = createTtyStream();
+    inputStream.isRaw = true;
+    const rawModes = [];
+    inputStream.setRawMode = (value) => rawModes.push(value);
+    let output = "";
+    outputStream.on("data", (chunk) => { output += chunk; });
+    const pending = promptForContinue({ message: "Ready", countdown: (seconds) => `${seconds}s` }, { inputStream, outputStream });
+    if (key == null) inputStream.end();
+    else inputStream.write(key);
+    assert.equal(await pending, expected);
+    assert.deepEqual(rawModes, [true, true]);
+    for (const event of ["data", "end", "close", "error"]) {
+      assert.equal(inputStream.listenerCount(event), 0);
+    }
+    const completedOutput = output;
+    t.mock.timers.tick(10_000);
+    assert.equal(output, completedOutput);
+  });
 }
 
 // Replay editor ANSI into a cell grid so wrap/unwrap tests can assert the

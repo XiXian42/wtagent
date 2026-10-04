@@ -14,12 +14,15 @@ import { isUsageLimitNotice } from "../shared/usage-limit.js";
 // base module.
 export { isConnectionLostError } from "./base-web-adapter.js";
 
-const CHATGPT_URL = "https://chatgpt.com/";
+import {
+  CHATGPT_DOM,
+  readChatGPTDom,
+  summarizeChatGPTDom,
+  readChatGPTMessageIdentity,
+  readChatGPTAssistantText,
+} from "./chatgpt-dom.js";
 
-function parseConversationTurn(value) {
-  const match = String(value ?? "").match(/^conversation-turn-(\d+)$/);
-  return match ? Number.parseInt(match[1], 10) : null;
-}
+const CHATGPT_URL = "https://chatgpt.com/";
 
 function normalizedConversationUrl(value) {
   try {
@@ -101,9 +104,44 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
       return kind;
     }
     const parsed = value instanceof URL ? value : new URL(value);
-    return /^\/c\/WEB:/.test(parsed.pathname)
+    return /^\/c\/(?:WEB:|local-chatgpt(?::|%3[aA]))/.test(parsed.pathname)
       ? "provisional"
       : "restorable";
+  }
+
+  async startConversation(...args) {
+    try {
+      const result = await super.startConversation(...args);
+      await this.collectStructuralDiagnostics();
+      return result;
+    } catch (error) {
+      const diagnostic = await this.writeDiagnostics("conversation-start-failed", { stage: "conversation-start" }).catch(() => null);
+      if (diagnostic?.filename) {
+        error.details = { ...error.details, diagnosticFile: diagnostic.filename, dom: diagnostic.report.dom };
+      }
+      throw error;
+    }
+  }
+
+  hasStructuralDiagnostics() {
+    return true;
+  }
+
+  recordConversationNavigation(url) {
+    if (url === this.lastDiagnosticUrl) return;
+    this.lastDiagnosticUrl = url;
+    this.diagnosticRoutes ??= [];
+    this.diagnosticRoutes.push({ kind: this.classifyConversationUrl(url), at: Date.now() });
+    this.diagnosticRoutes = this.diagnosticRoutes.slice(-12);
+  }
+
+  async structuralDiagnostics() {
+    const snapshot = await this.page.evaluate(readChatGPTDom, {
+      selector: CHATGPT_DOM.messages, registry: CHATGPT_DOM,
+    });
+    const report = summarizeChatGPTDom(snapshot);
+    this.lastDomReport = report;
+    return report;
   }
 
   pendingAttachmentLocators() {
@@ -118,25 +156,19 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   }
 
   composerLocators() {
-    return [
-      this.page.locator("#prompt-textarea"),
-      this.page.locator('textarea[placeholder*="Message" i]'),
-      this.page.locator('textarea[placeholder*="消息"]'),
-      this.page.locator('div[contenteditable="true"][data-lexical-editor="true"]'),
-      this.page.locator('main div[contenteditable="true"]'),
-    ];
+    return CHATGPT_DOM.composers.map(({ selector }) => this.page.locator(selector));
   }
 
   sendButtonLocators() {
     return [
-      this.page.locator('[data-testid="send-button"]'),
+      this.page.locator(CHATGPT_DOM.send),
       this.page.getByRole("button", { name: /send|发送/i }),
     ];
   }
 
   stopButtonLocators() {
     return [
-      this.page.locator('[data-testid="stop-button"]'),
+      this.page.locator(CHATGPT_DOM.stop),
       this.page.getByRole("button", {
         name: /stop generating|stop|停止生成|停止/i,
       }),
@@ -182,19 +214,32 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     // keeps a failed request from being read as an envelope-less reply and
     // burned through the protocol-error retry loop; the turn instead sees "no
     // reply" and recovers with the continuation nudge.
-    return this.page.locator(
-      '[data-message-author-role="assistant"]:not([id^="request-placeholder-"])',
-    );
+    const legacy = this.page.locator(CHATGPT_DOM.assistant.legacy);
+    return legacy.or ? legacy.or(this.page.locator(CHATGPT_DOM.assistant.modern)) : legacy;
   }
 
   userMessages() {
-    return this.page.locator('[data-message-author-role="user"]');
+    const legacy = this.page.locator(CHATGPT_DOM.user.legacy);
+    return legacy.or ? legacy.or(this.page.locator(CHATGPT_DOM.user.modern)) : legacy;
+  }
+
+  async userMessageSnapshot() {
+    const messages = this.userMessages();
+    if (typeof messages.evaluateAll !== "function") {
+      return super.userMessageSnapshot();
+    }
+    // ChatGPT unmounts older turns as a long thread advances. count() followed
+    // by nth() can then wait for a vanished index until the send deadline, or
+    // combine one bubble's identity with another bubble's text.
+    return await messages.evaluateAll(readChatGPTDom).then((snapshot) => (
+      snapshot.entries.every((entry) => entry.role === "user" && entry.id && Number.isSafeInteger(entry.turn))
+        ? snapshot.entries : null
+    )).catch(() => null);
   }
 
   conversationMessages() {
-    return this.page.locator(
-      '[data-message-author-role="user"], [data-message-author-role="assistant"]',
-    );
+    const legacy = this.page.locator(CHATGPT_DOM.conversationLegacy);
+    return legacy.or ? legacy.or(this.page.locator(`${CHATGPT_DOM.user.modern}, ${CHATGPT_DOM.assistant.modern}`)) : legacy;
   }
 
   requiresOrderedConversationSnapshotForFreshSend() {
@@ -205,54 +250,9 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     if (typeof this.page?.evaluate !== "function") {
       return null;
     }
-    return await this.page.evaluate(() => {
-      const entries = [
-        ...document.querySelectorAll(
-          '[data-message-author-role="user"], [data-message-author-role="assistant"]',
-        ),
-      ].filter((element) => {
-        const role = element.getAttribute("data-message-author-role");
-        return role === "user"
-          || (role === "assistant" && !element.id.startsWith("request-placeholder-"));
-      }).map((element, domIndex) => {
-        const role = element.getAttribute("data-message-author-role");
-        const wrapper = element.closest('[data-testid^="conversation-turn-"]');
-        const turnMatch = wrapper?.getAttribute("data-testid")
-          ?.match(/^conversation-turn-(\d+)$/);
-        let renderedText = element.innerText ?? element.textContent ?? "";
-        if (role === "assistant" && !renderedText.includes("<agent_response")) {
-          const codeTexts = [...element.querySelectorAll("pre code")]
-            .map((code) => code.innerText ?? code.textContent ?? "");
-          const completeEnvelope = codeTexts.find((text) => {
-            const start = text.trim().indexOf("<agent_response");
-            const end = text.trim().lastIndexOf("</agent_response>");
-            return start >= 0 && end >= start;
-          });
-          const partialEnvelope = codeTexts.find(
-            (text) => text.includes("<agent_response"),
-          );
-          if (completeEnvelope) {
-            renderedText = completeEnvelope;
-          } else if (partialEnvelope) {
-            renderedText = partialEnvelope;
-          } else {
-            const markdown = [...element.querySelectorAll(".markdown")];
-            if (markdown.length > 0) {
-              const last = markdown.at(-1);
-              renderedText = last.innerText ?? last.textContent ?? "";
-            }
-          }
-        }
-        return {
-          domIndex,
-          role,
-          id: element.getAttribute("data-message-id"),
-          turn: turnMatch ? Number.parseInt(turnMatch[1], 10) : null,
-          renderedText,
-        };
-      });
-      return { url: window.location.href, entries };
-    }).catch(() => null);
+    return await this.page.evaluate(readChatGPTDom,
+      CHATGPT_DOM.messages,
+    ).catch(() => null);
   }
 
   async assertRecoveredTurnTopology({
@@ -523,7 +523,19 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     return found;
   }
 
-  async reconcilePendingOutbound({
+  async reconcilePendingOutbound(options = {}) {
+    try {
+      return await this.#reconcilePendingOutbound(options);
+    } catch (error) {
+      const diagnostic = await this.writeDiagnostics("pending-outbound-recovery-failed", { stage: "recovery" }).catch(() => null);
+      if (diagnostic?.filename) {
+        error.details = { ...error.details, diagnosticFile: diagnostic.filename, dom: diagnostic.report.dom };
+      }
+      throw error;
+    }
+  }
+
+  async #reconcilePendingOutbound({
     pendingOutbound = null,
     conversationTargetId = null,
     lastUserMessageId = null,
@@ -718,7 +730,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
             );
             if (!generationError && !usageLimit) {
               rawResponse = assistant.renderedText;
-              if (rawResponse.trim()) {
+              if (rawResponse.trim() || priorHandoff?.nativeImages?.length > 0) {
                 responseHash = createHash("sha256")
                   .update(rawResponse)
                   .digest("hex");
@@ -904,22 +916,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   }
 
   async messageIdentity(message) {
-    const [id, turn] = await Promise.all([
-      message.getAttribute("data-message-id").catch(() => null),
-      this.#messageTurn(message),
-    ]);
-    return { id, turn };
-  }
-
-  async #messageTurn(message) {
-    if (typeof message?.evaluate !== "function") {
-      return null;
-    }
-    const testId = await message.evaluate((element) => (
-      element.closest('[data-testid^="conversation-turn-"]')
-        ?.getAttribute("data-testid") ?? null
-    )).catch(() => null);
-    return parseConversationTurn(testId);
+    return readChatGPTMessageIdentity(message);
   }
 
   // The redesigned UI still exposes the stop button ([data-testid="stop-button"],
@@ -957,40 +954,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   }
 
   async assistantText(message) {
-    // Read the whole assistant turn first. A long XML response can contain
-    // Markdown fences inside CDATA; ChatGPT then splits the rendered response
-    // into many <pre><code> nodes and the first node contains the opening tag
-    // but not the closing tag. The parent innerText keeps the complete envelope
-    // and avoids one CDP round trip per nested code block on every poll.
-    const fullText = await message.innerText().catch(() => "");
-    if (fullText.includes("<agent_response")) {
-      return fullText;
-    }
-
-    // Rare fallback for alternate renderers where the parent text omits code
-    // contents: prefer a complete code-block envelope, but retain a partial
-    // one so streaming progress remains visible until its closing tag arrives.
-    const codeBlocks = message.locator("pre code");
-    const codeBlockCount = await codeBlocks.count();
-    let partialEnvelope = "";
-    for (let index = 0; index < codeBlockCount; index += 1) {
-      const code = await codeBlocks.nth(index).innerText().catch(() => "");
-      if (hasCompleteAgentEnvelope(code)) {
-        return code;
-      }
-      if (!partialEnvelope && code.includes("<agent_response")) {
-        partialEnvelope = code;
-      }
-    }
-    if (partialEnvelope) {
-      return partialEnvelope;
-    }
-
-    const markdown = message.locator(".markdown");
-    if (await markdown.count()) {
-      return await markdown.last().innerText().catch(() => "");
-    }
-    return fullText;
+    return readChatGPTAssistantText(message, hasCompleteAgentEnvelope);
   }
 
   // A plan/usage limit renders as an error card: error-tinted token classes
@@ -1110,8 +1074,8 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   // Scrolls the thread container to the bottom so the latest replies mount.
   // Best-effort — any failure is swallowed.
   async scrollConversationToBottom() {
-    await this.page.evaluate?.(() => {
-      const message = document.querySelector("[data-message-author-role]");
+    await this.page.evaluate?.((selector) => {
+      const message = document.querySelector(selector);
       if (!message) {
         return;
       }
@@ -1126,7 +1090,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
           return;
         }
       }
-    }).catch(() => null);
+    }, CHATGPT_DOM.messages).catch(() => null);
   }
 
 }

@@ -1,5 +1,6 @@
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { ProtocolError } from "../shared/errors.js";
+import { findXmlElement, xmlTags } from "./envelope.js";
 import {
   truncateUtf8HeadTail,
   utf8ByteLength,
@@ -64,8 +65,9 @@ function escapeBareAmpersands(text) {
 }
 
 function closeDanglingToolCall(envelope) {
-  const open = (envelope.match(/<tool_call(?:\s|>)/gi) ?? []).length;
-  const close = (envelope.match(/<\/tool_call>/gi) ?? []).length;
+  const tags = [...xmlTags(envelope)].filter((tag) => tag.name === "tool_call");
+  const open = tags.filter((tag) => !tag.closing && !tag.selfClosing).length;
+  const close = tags.filter((tag) => tag.closing).length;
   if (open !== close + 1) {
     return envelope;
   }
@@ -76,11 +78,9 @@ function closeDanglingToolCall(envelope) {
 }
 
 function wrapBareToolCall(text) {
-  const start = text.search(/<tool_call(?:\s|>)/i);
-  const endTag = "</tool_call>";
-  const end = start < 0 ? -1 : text.indexOf(endTag, start);
-  if (start >= 0 && end >= start) {
-    const toolCall = text.slice(start, end + endTag.length);
+  const bounds = findXmlElement(text, "tool_call");
+  if (bounds?.end != null) {
+    const toolCall = text.slice(bounds.start, bounds.end);
     if (/<args[\s>/]/i.test(toolCall)) {
       return [
         "<agent_response>",
@@ -134,12 +134,11 @@ function wrapClaudeStyleInvoke(text) {
 
 function extractEnvelope(text) {
   const cleaned = stripSingleCodeFence(text);
-  const start = cleaned.indexOf("<agent_response");
-  const endTag = "</agent_response>";
-  const end = start < 0 ? -1 : cleaned.indexOf(endTag, start);
+  const bounds = findXmlElement(cleaned);
 
-  if (start < 0 || end < 0) {
-    const wrapped = wrapBareToolCall(cleaned);
+  if (bounds?.end == null) {
+    // Never salvage an operation out of an unfinished outer response.
+    const wrapped = bounds == null ? wrapBareToolCall(cleaned) : null;
     if (wrapped) {
       return wrapped;
     }
@@ -154,7 +153,7 @@ function extractEnvelope(text) {
   // — so first-open + last-close would glue two envelopes together and fail
   // with "Extra text at the end". Trailing chatter after that first envelope
   // is ignored the same way a preamble before it is.
-  return cleaned.slice(start, end + endTag.length);
+  return cleaned.slice(bounds.start, bounds.end);
 }
 
 // Web-UIs render provider chrome into the assistant text: thinking-block
@@ -231,12 +230,11 @@ export function stripUiNoiseLines(text) {
 // and let the caller keep the envelope's own message.
 export function extractTrailingProse(rawText) {
   const text = String(rawText ?? "");
-  const endTag = "</agent_response>";
-  const end = text.indexOf(endTag);
-  if (end < 0) {
+  const bounds = findXmlElement(text);
+  if (bounds?.end == null) {
     return null;
   }
-  const trailing = text.slice(end + endTag.length);
+  const trailing = text.slice(bounds.end);
   if (trailing.includes("<agent_response")) {
     return null;
   }
@@ -332,9 +330,21 @@ function looseTagText(xml, tag) {
 // guessing the arguments of a side-effecting operation from broken XML is
 // unsafe, so those still fall through to a format retry.
 function recoverMessageOnlyResponse(envelope) {
-  if (/<tool_call[\s>]/i.test(envelope)) {
+  const tags = [...xmlTags(envelope)];
+  if (
+    tags.some((tag) => /^(tool_call|tool_calls|invoke|action|parameter)$/.test(tag.name))
+    || tags.filter((tag) => tag.name === "agent_response" && !tag.closing).length !== 1
+  ) {
     return null;
   }
+  // Tolerate malformed display markup only inside <message>. Unknown sibling
+  // fields must not disappear when a damaged operation is mistaken for prose.
+  const root = tags.find((tag) => tag.name === "agent_response" && !tag.closing);
+  const closing = tags.findLast((tag) => tag.name === "agent_response" && tag.closing);
+  const siblings = envelope.slice(root.end, closing.start)
+    .replace(/<done(?:\s[^>]*)?>[\s\S]*?<\/done>/g, "")
+    .replace(/<message(?:\s[^>]*)?>[\s\S]*?<\/message>/g, "");
+  if (siblings.trim()) return null;
   const doneText = looseTagText(envelope, "done");
   const message = looseTagText(envelope, "message");
   if (doneText == null || message == null) {
@@ -365,6 +375,11 @@ export function parseAgentResponse(rawText) {
   );
   if (/<!DOCTYPE|<!ENTITY/i.test(structuralXml)) {
     throw new ProtocolError("DTD and XML entities are not allowed.");
+  }
+  if ([...xmlTags(rawEnvelope)].filter((tag) => (
+    tag.name === "agent_response" && !tag.closing
+  )).length !== 1) {
+    throw new ProtocolError("Nested <agent_response> envelopes are not allowed.");
   }
 
   // Repair the most common, meaning-preserving corruptions before validation:
@@ -401,6 +416,9 @@ export function parseAgentResponse(rawText) {
   const response = parsed.agent_response;
   if (!response || typeof response !== "object" || Array.isArray(response)) {
     throw new ProtocolError("Missing <agent_response> root.");
+  }
+  if (["action", "invoke", "tool_calls"].some((name) => response[name] != null)) {
+    throw new ProtocolError("Operations must use one <tool_call> element with <args>.");
   }
 
   const done = parseDone(response.done);

@@ -21,6 +21,22 @@ export const DEFAULT_SYSTEM_REMINDER = [
   "Write large code or file payloads as CDATA (<![CDATA[...]]>) inside <content>, <new_text>, or <message> — never raw code directly inside the envelope — and never include the sequence ]]> inside CDATA content.",
 ].join(" ");
 
+// A native image is an assistant response, never a local XML tool call.
+export const NATIVE_IMAGE_CONTRACT = [
+  "When the task needs generated artwork, generate and output the image directly using your native image-generation capability.",
+  "Image responses are exempt from the XML format: output the image itself, without an XML wrapper or drawing code.",
+  "The Runtime automatically downloads images from your completed reply and returns verified local paths; then continue the user's task using those paths.",
+  "There is no local image-generation tool. This replaces any image-tool instructions from earlier in this conversation.",
+  "If generation returns only text, that text will be returned as the provider result so you can explain the limitation or ask the user; do not claim an image was saved.",
+].join(" ");
+
+export const NATIVE_IMAGE_SYSTEM_REMINDER = [
+  NATIVE_IMAGE_CONTRACT,
+  "For text answers and local operations, use exactly one complete <agent_response> XML envelope in one xml code fence.",
+  "Use done=true for a deliverable answer or a question that requires user input; use done=false with one local tool request when needed.",
+  "Use CDATA for code or long payloads. Local tools execute only after the Runtime returns their results.",
+].join(" ");
+
 export function wrapSystemPrompt(text) {
   return `<${SYSTEM_PROMPT_TAG}>\n${String(text ?? "")}\n</${SYSTEM_PROMPT_TAG}>`;
 }

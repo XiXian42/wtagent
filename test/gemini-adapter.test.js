@@ -29,6 +29,13 @@ class TextLocator extends EmptyLocator {
   async count() { return 1; }
   async isVisible() { return this.visible; }
   async innerText() { return this.text; }
+  async evaluateAll(callback) {
+    return callback([{
+      innerText: this.text,
+      contains: () => false,
+      getClientRects: () => this.visible ? [{}] : [],
+    }]);
+  }
   async getAttribute(name) { return name === "id" ? this.id : null; }
 }
 

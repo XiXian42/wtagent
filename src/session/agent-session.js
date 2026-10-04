@@ -560,7 +560,7 @@ export class AgentSession {
     this.persistenceQueue = Promise.resolve();
   }
 
-  static async create({ sessionsDir, tasksDir, task, projectRoot, mode, provider = "chatgpt" }) {
+  static async create({ sessionsDir, tasksDir, task, projectRoot, mode, provider = "chatgpt", generationType = "agent" }) {
     const root = await ensureSessionsRoot(sessionsDir ?? tasksDir);
     const sessionId = `session_${new Date().toISOString().replaceAll(/[-:.TZ]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
     const directory = path.join(root, sessionId);
@@ -574,6 +574,7 @@ export class AgentSession {
       projectRoot: path.resolve(projectRoot),
       provider,
       mode,
+      generationType,
       phase: "idle",
       turn: 0,
       runCount: 0,
@@ -583,6 +584,7 @@ export class AgentSession {
       lastAssistantMessageId: null,
       pendingOutbound: null,
       pendingAssistantTurn: null,
+      pendingAuxiliaryTurn: null,
       activeMode: null,
       stateRevision: 0,
       createdAt: now,
@@ -657,6 +659,7 @@ export class AgentSession {
     state.lastAssistantMessageId ??= null;
     state.pendingOutbound ??= null;
     state.pendingAssistantTurn ??= null;
+    state.pendingAuxiliaryTurn ??= null;
     state.activeMode ??= null;
     state.stateRevision = stateRevision(state);
     state.rolloutFile ??= "transcript.jsonl";
@@ -1130,6 +1133,63 @@ export class AgentSession {
     });
   }
 
+  async commitPendingAuxiliaryTurn({ outboundId, turn = {} }) {
+    if (typeof outboundId !== "string" || outboundId.length === 0) {
+      throw new Error("A pending outbound ID is required for an auxiliary turn.");
+    }
+    return await this.#mutateState((nextState) => {
+      if (nextState.pendingOutbound?.outboundId !== outboundId) {
+        throw new Error(`Pending outbound changed before auxiliary turn: ${outboundId}`);
+      }
+      const now = new Date().toISOString();
+      const pending = {
+        version: 1,
+        outboundId,
+        status: "waiting",
+        conversationUrl: turn.conversationUrl
+          ?? nextState.conversationUrl
+          ?? null,
+        conversationTargetId: turn.conversationTargetId
+          ?? nextState.conversationTargetId
+          ?? null,
+        userMessageId: turn.userMessageId ?? null,
+        userTurn: turn.userTurn ?? null,
+        assistantBaseline: turn.assistantBaseline ?? null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      nextState.pendingOutbound = null;
+      nextState.pendingAuxiliaryTurn = pending;
+      nextState.conversationUrl = pending.conversationUrl;
+      nextState.conversationTargetId = pending.conversationTargetId;
+      nextState.lastUserMessageId = pending.userMessageId;
+      nextState.updatedAt = now;
+      return structuredClone(pending);
+    });
+  }
+
+  async completePendingAuxiliaryTurn({
+    outboundId,
+    assistantMessageId = null,
+    assistantTurn = null,
+  }) {
+    return await this.#mutateState((nextState) => {
+      const current = nextState.pendingAuxiliaryTurn;
+      if (!current || current.outboundId !== outboundId) {
+        throw new Error(`Pending auxiliary turn changed before completion: ${outboundId}`);
+      }
+      nextState.lastAssistantMessageId = assistantMessageId;
+      nextState.pendingAuxiliaryTurn = null;
+      nextState.updatedAt = new Date().toISOString();
+      return {
+        ...structuredClone(current),
+        status: "complete",
+        assistantMessageId,
+        assistantTurn,
+      };
+    });
+  }
+
   async refreshPendingAssistantTurn(handoffId, patch = {}) {
     const requested = structuredClone(patch);
     const protectedKeys = new Set([
@@ -1142,6 +1202,8 @@ export class AgentSession {
       "createdAt",
       "rawResponse",
       "responseHash",
+      "nativeImages",
+      "nativeMusic",
     ]);
     if (Object.keys(requested).some((key) => protectedKeys.has(key))) {
       throw new Error("Assistant handoff refresh contains protected fields.");
@@ -1184,6 +1246,8 @@ export class AgentSession {
     assistantMessageId = null,
     assistantTurn = null,
     rawResponse,
+    nativeImages = [],
+    nativeMusic = [],
     completedAt = new Date().toISOString(),
   }) {
     if (typeof rawResponse !== "string") {
@@ -1197,6 +1261,8 @@ export class AgentSession {
       assistantTurn,
       rawResponse,
       responseHash,
+      nativeImages: structuredClone(nativeImages),
+      nativeMusic: structuredClone(nativeMusic),
     };
     return await this.#mutateState((nextState) => {
       const current = nextState.pendingAssistantTurn;
@@ -1211,6 +1277,8 @@ export class AgentSession {
           assistantTurn: current.assistantTurn ?? null,
           rawResponse: current.rawResponse,
           responseHash: current.responseHash,
+          nativeImages: current.nativeImages ?? [],
+          nativeMusic: current.nativeMusic ?? [],
         };
         if (!isDeepStrictEqual(existing, completion)) {
           throw new Error(

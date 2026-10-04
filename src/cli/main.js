@@ -33,6 +33,8 @@ import { PolicyEngine } from "../policy/policy-engine.js";
 import { ApprovalStore } from "../policy/approval-store.js";
 import { createDefaultToolRegistry } from "../tools/default-tools.js";
 import { ProcessManager } from "../tools/process-manager.js";
+import { NativeImageReceiver } from "../image/native-image-receiver.js";
+import { NativeMusicReceiver, validateGenerationType } from "../audio/native-music-receiver.js";
 import { resolveLimits } from "../shared/limits.js";
 import { BrowserAdapterError } from "../shared/errors.js";
 import { EXPORTERS } from "../session/session-export.js";
@@ -41,6 +43,7 @@ import { extractAtMentions } from "./at-files.js";
 import {
   classifyChatInput,
   promptForConfirm,
+  promptForContinue,
   promptForText,
   promptForSelect,
   readChatMessage,
@@ -241,6 +244,9 @@ class ConversationRunner {
       // interactive TTY sessions where stdin is available to listen on.
       cancelOnEsc: interactive,
     });
+    const generationType = validateGenerationType(session.state.generationType, provider.id);
+    this.nativeMusicReceiver = generationType === "music" ? new NativeMusicReceiver({ adapter: this.adapter }) : null;
+    this.nativeImageReceiver = this.nativeMusicReceiver ? null : NativeImageReceiver.forAdapter(provider.id, this.adapter);
     this.interrupted = false;
     this.closed = false;
   }
@@ -248,6 +254,8 @@ class ConversationRunner {
   #buildRuntime() {
     return new AgentRuntime({
       adapter: this.adapter,
+      nativeImageReceiver: this.nativeImageReceiver,
+      nativeMusicReceiver: this.nativeMusicReceiver,
       registry: createDefaultToolRegistry({
         processManager: this.processManager,
         limits: this.limits,
@@ -261,10 +269,12 @@ class ConversationRunner {
             this.renderer.stopSpinner();
             await adapter.restoreWindow?.();
             try {
-              const answer = await promptForText({
+              const answer = await promptForContinue({
                 message: t("model.chooseInBrowser", {
                   provider: this.provider.label,
                 }),
+                countdown: (seconds) => t(seconds > 0
+                  ? "model.continueCountdown" : "model.continuing", { seconds }),
               });
               if (answer == null) {
                 throw new Error(t("model.setupCancelled"));
@@ -749,6 +759,8 @@ async function runAgent(taskParts, options) {
   // Fail fast on an unknown/unsupported --model before any startup work.
   const provider = resolveProvider(options.model ?? DEFAULT_PROVIDER);
 
+  const generationType = validateGenerationType(options.type, provider.id);
+
   const startup = await maybeRunStartupChecks(options);
   if (startup === "updated" || startup === "aborted") {
     return null;
@@ -789,6 +801,7 @@ async function runAgent(taskParts, options) {
     projectRoot,
     provider: provider.id,
     mode: null,
+    generationType,
   });
 
   // Resolve @file attachments in the opening task, if any. The task itself is
@@ -863,6 +876,9 @@ async function runResume(sessionId, instructionParts, options) {
   }
 
   const provider = resolveProvider(session.state.provider ?? DEFAULT_PROVIDER);
+  if (options.type != null && validateGenerationType(options.type, provider.id) !== (session.state.generationType ?? "agent")) {
+    throw new Error("--type cannot change the generation type of an existing session.");
+  }
   // A conversation belongs to one provider. --model on resume is only allowed
   // if it names the same provider; switching mid-conversation is rejected.
   if (options.model != null && getProvider(options.model).id !== provider.id) {
@@ -988,6 +1004,7 @@ const program = new Command()
     }),
   )
   .option("--once", t("option.once"), false)
+  .option("--type <type>", t("option.type"))
   .option("--model-turn-timeout-ms <milliseconds>", t("option.timeout"))
   .option("--no-minimize", t("option.noMinimize"))
   .option("--debug", t("option.debug"), false)
@@ -1065,6 +1082,12 @@ if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
       return;
     }
     console.error(error.stack ?? error.message);
+    if (error.details?.diagnosticFile) {
+      const dom = error.details.dom;
+      const explanation = dom?.issues?.length ? dom.issues.join(", ") : dom?.status ?? "unavailable";
+      console.error(`Page compatibility: ${explanation}`);
+      console.error(`Diagnostic report: ${error.details.diagnosticFile}`);
+    }
     process.exitCode = 1;
   }).finally(() => {
     // By the time every command finishes, all per-command cleanup (browser

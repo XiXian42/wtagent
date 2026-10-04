@@ -5,6 +5,8 @@ import { launchAndConnectCdpChrome } from "./cdp-browser.js";
 import { discoverChromeExecutable } from "../platform/chrome-discovery.js";
 import { ensureDirectory } from "../platform/paths.js";
 import { BrowserAdapterError } from "../shared/errors.js";
+import { hasCompleteAgentEnvelope } from "../protocol/envelope.js";
+export { hasCompleteAgentEnvelope } from "../protocol/envelope.js";
 
 // Playwright error messages for a dead transport. The Chrome process itself is
 // usually still alive (e.g. the connection died while the Mac slept); these
@@ -66,17 +68,6 @@ function deltaFrom(previous, current) {
   if (!previous) return current;
   if (current.startsWith(previous)) return current.slice(previous.length);
   return "";
-}
-
-export function hasCompleteAgentEnvelope(text) {
-  const trimmed = String(text ?? "").trim();
-  const start = trimmed.indexOf("<agent_response");
-  const endTag = "</agent_response>";
-  const end = trimmed.lastIndexOf(endTag);
-  // The envelope is "complete" as soon as both the opening and closing tags
-  // are present. The web model may append trailing text or render rich cards
-  // after the XML, so we do not require the closing tag to be the last content.
-  return start >= 0 && end >= start;
 }
 
 function sameConversationUrl(left, right) {
@@ -220,6 +211,7 @@ export class BaseWebAdapter {
     this.lastAssistantMessageId = null;
     this.lastAssistantTurn = null;
     this.lastSendStatus = "not-submitted";
+    this.pendingSubmission = null;
   }
 
   // ---- provider primitives (override in subclasses) ----------------------
@@ -342,6 +334,13 @@ export class BaseWebAdapter {
     return await message.innerText().catch(() => "");
   }
 
+  // Virtualized providers can read identities and text in one DOM operation.
+  // undefined uses legacy locators; null means a supported sample failed and
+  // must be retried, never mixed with a different DOM revision.
+  async userMessageSnapshot() {
+    return undefined;
+  }
+
   // Providers with a shared user/assistant turn order return one atomic snapshot.
   // null keeps legacy normal-send behavior but cannot support ambiguous recovery.
   async orderedConversationSnapshot() {
@@ -415,17 +414,22 @@ export class BaseWebAdapter {
   // Submit the already-filled composer. Providers that need a native pointer
   // sequence may override this while retaining the shared post-send identity
   // checks and one-shot retry.
-  async submitComposer(composer) {
+  async submitComposer(composer, { assertActive = () => {}, timeoutMs } = {}) {
+    assertActive();
     const sendButton = await firstVisible(this.sendButtonLocators());
+    assertActive();
     if (sendButton && await sendButton.isEnabled().catch(() => false)) {
       try {
-        await sendButton.click();
+        assertActive();
+        await sendButton.click(timeoutMs == null ? {} : { timeout: timeoutMs });
         return;
       } catch {
+        assertActive();
         await this.dismissTransientOverlays();
       }
     }
-    await composer.press("Enter");
+    assertActive();
+    await composer.press("Enter", timeoutMs == null ? {} : { timeout: timeoutMs });
   }
 
   // Scroll a virtualized thread so the latest replies mount. No-op by default.
@@ -485,8 +489,23 @@ export class BaseWebAdapter {
     return new BrowserAdapterError(
       `${this.providerName} did not confirm the submitted message before the causal deadline. `
         + "It was not sent again automatically.",
-      { code: "SEND_COMMIT_UNKNOWN", recoverable: false },
+      {
+        code: "SEND_COMMIT_UNKNOWN",
+        recoverable: false,
+        details: this.#sendDiagnosticDetails(),
+      },
     );
+  }
+
+  #sendDiagnosticDetails() {
+    const proof = this.activeSendProof;
+    return {
+      stage: proof?.stage ?? "unknown",
+      sendStatus: this.lastSendStatus,
+      elapsedMs: proof?.submittedAt == null
+        ? null : Math.round(this.monotonicNow() - proof.submittedAt),
+      ...(proof?.sample ?? {}),
+    };
   }
 
   async #awaitWithinSendDeadline(promise, deadline) {
@@ -698,7 +717,11 @@ export class BaseWebAdapter {
     return true;
   }
 
-  #captureActiveTurnProof(conversationUrl) {
+  #captureActiveTurnProof(conversationUrl, {
+    outboundId = null,
+    userMessageId = null,
+    userTurn = null,
+  } = {}) {
     const normalizedUrl = normalizedConversationUrl(conversationUrl);
     this.activeTurnProof = {
       page: this.page,
@@ -708,6 +731,9 @@ export class BaseWebAdapter {
       targetId: this.cdpChrome?.targetId ?? null,
       scopeEpoch: this.conversationScopeEpoch,
       conversationUrl: normalizedUrl,
+      outboundId,
+      userMessageId,
+      userTurn,
       invalidated: false,
     };
     this.activeTurnConversationUrl = normalizedUrl;
@@ -903,14 +929,57 @@ export class BaseWebAdapter {
       this.expectedRestorationUserId
       && user.ids.has(this.expectedRestorationUserId)
     );
-    if (!assistantMatched && !userMatched) {
+    let currentSendUserMatched = Boolean(
+      this.freshSendConfirmed
+      && this.lastUserMessageId
+      && user.ids.has(this.lastUserMessageId)
+    );
+    let currentSendMarker = this.lastUserMessageId;
+    if (
+      !currentSendUserMatched
+      && this.freshSendConfirmed
+      && isValidOutboundCorrelationId(this.activeTurnProof?.outboundId)
+    ) {
+      const messages = this.userMessages();
+      const count = await messages.count().catch(() => 0);
+      for (let index = count - 1; index >= 0; index -= 1) {
+        const message = messages.nth(index);
+        const identity = await this.messageIdentity(message);
+        if (
+          this.activeTurnProof.userTurn != null
+          && identity.turn != null
+          && identity.turn !== this.activeTurnProof.userTurn
+        ) {
+          continue;
+        }
+        const renderedText = await this.userMessageText(message);
+        if (!renderedMessageContainsOutboundMarker(
+          renderedText,
+          this.activeTurnProof.outboundId,
+        )) {
+          continue;
+        }
+        currentSendUserMatched = true;
+        currentSendMarker = identity.id
+          ?? `turn:${identity.turn ?? this.activeTurnProof.userTurn ?? "unknown"}`;
+        if (identity.id) {
+          this.lastUserMessageId = identity.id;
+          this.expectedRestorationUserId = identity.id;
+          this.activeTurnProof.userMessageId = identity.id;
+        }
+        break;
+      }
+    }
+    if (!assistantMatched && !userMatched && !currentSendUserMatched) {
       this.#resetPendingCanonicalVerification();
       return false;
     }
 
-    const matchedMarker = assistantMatched
-      ? `assistant:${this.expectedRestorationAssistantId}`
-      : `user:${this.expectedRestorationUserId}`;
+    const matchedMarker = currentSendUserMatched
+      ? `user:${currentSendMarker}`
+      : assistantMatched
+        ? `assistant:${this.expectedRestorationAssistantId}`
+        : `user:${this.expectedRestorationUserId}`;
     const signature = [
       candidate,
       candidateKind,
@@ -976,6 +1045,7 @@ export class BaseWebAdapter {
 
   #observeConversationNavigation(value, { navigationEvent = false } = {}) {
     const normalized = normalizedConversationUrl(value);
+    if (normalized) this.recordConversationNavigation(normalized);
     if (!normalized) {
       if (this.activeSendProof) {
         this.activeSendProof.invalidated = true;
@@ -997,10 +1067,18 @@ export class BaseWebAdapter {
       // must be observed first for this send epoch.
       this.activeSendProof.invalidated = true;
     }
-    if (navigationEvent && this.activeSendProof) {
+    if (
+      navigationEvent
+      && this.activeSendProof
+      && !sameConversationUrl(normalized, this.activeSendProof.currentUrl)
+    ) {
       // Every top-frame navigation invalidates the current proof until this exact
-      // event is classified as an allowed causal transition below. A prior bad
-      // transition is permanent; a later plausible route cannot rehabilitate it.
+      // conversation change is classified as an allowed causal transition below.
+      // Providers can emit several history events for one route (for example
+      // adding a response-id query parameter); those retain the same normalized
+      // conversation identity and must not destroy an otherwise intact proof.
+      // A prior bad transition is permanent; a later plausible route cannot
+      // rehabilitate it.
       this.activeSendProof.invalidated = true;
     }
     this.lastObservedPageUrl = normalized;
@@ -1706,6 +1784,79 @@ export class BaseWebAdapter {
     return this.lastAssistantTurn;
   }
 
+  async captureAuxiliaryTurnCompletion({ timeoutMs = 30_000 } = {}) {
+    this.requirePage();
+    const deadline = this.monotonicNow() + Math.max(0, Number(timeoutMs) || 0);
+    let candidate = null;
+    let conversationUrl = null;
+    while (this.monotonicNow() <= deadline) {
+      // A fresh provider chat may allocate its durable conversation URL only
+      // after the generated image has rendered. Keep the exact page/frame/
+      // target binding while the saved user-message marker stabilizes; do not
+      // read or accept an assistant boundary from an uncorrelated candidate URL.
+      if (
+        this.activeTurnConversationUrl
+        && !this.#activeTurnProofIsIntact({ allowPendingCanonicalUrl: true })
+      ) {
+        throw new BrowserAdapterError(
+          `${this.providerName} left the verified conversation during the provider operation.`,
+          { code: "CONVERSATION_CHANGED_DURING_TURN", recoverable: false },
+        );
+      }
+      const pageState = await this.#submittedPageState();
+      if (pageState.status === "candidate") {
+        await this.waitForPoll(250);
+        continue;
+      }
+      if (pageState.status !== "trusted") {
+        throw new BrowserAdapterError(
+          `${this.providerName} left the verified conversation during the provider operation.`,
+          { code: "CONVERSATION_CHANGED_DURING_TURN", recoverable: false },
+        );
+      }
+      conversationUrl = pageState.conversationUrl;
+      this.activeTurnConversationUrl = conversationUrl;
+      if (this.activeTurnProof) {
+        this.activeTurnProof.conversationUrl = conversationUrl;
+      }
+
+      const messages = this.assistantMessages();
+      const count = await messages.count().catch(() => 0);
+      if (count > 0) {
+        const message = messages.last();
+        const { id, turn } = await this.messageIdentity(message);
+        const text = await this.assistantText(message).catch(() => "");
+        const generating = await this.isAssistantGenerating(message);
+        if (
+          !generating
+          && this.isNewAssistantIdentity({ id, turn, text, generating: false })
+        ) {
+          candidate = { id, turn };
+          break;
+        }
+      }
+      await this.waitForPoll(250);
+    }
+    if (!candidate) {
+      throw new BrowserAdapterError(
+        `${this.providerName} did not expose a completed, new assistant boundary for the provider operation.`,
+        { code: "AUXILIARY_TURN_UNCORRELATED", recoverable: false },
+      );
+    }
+    await this.#validateRecoveredTurnBoundary({
+      assistantPresent: true,
+      assistantMessageId: candidate.id,
+      assistantTurn: candidate.turn,
+    });
+    this.lastAssistantMessageId = candidate.id ?? null;
+    this.lastAssistantTurn = candidate.turn ?? null;
+    return {
+      assistantMessageId: this.lastAssistantMessageId,
+      assistantTurn: this.lastAssistantTurn,
+      conversationUrl,
+    };
+  }
+
   getLastSendStatus() {
     return this.lastSendStatus;
   }
@@ -1715,8 +1866,15 @@ export class BaseWebAdapter {
     maxBytes = null,
     outboundId = null,
     allowAssistantContinuation = false,
+    requireAttachments = false,
   } = {}) {
     this.requirePage();
+    if (this.pendingSubmission) {
+      throw new BrowserAdapterError(
+        "The previous submit action is still in flight. No new message was composed.",
+        { code: "SEND_COMMIT_UNKNOWN", recoverable: false, details: { stage: "previous-submit" } },
+      );
+    }
     this.lastSendStatus = "not-submitted";
     this.expectedAssistantCandidateId = null;
     this.expectedAssistantCandidateTurn = null;
@@ -1792,6 +1950,8 @@ export class BaseWebAdapter {
       submissionStarted: false,
       submittedAt: null,
       deadline: null,
+      stage: "prepare",
+      sample: null,
       orderedBaseline: null,
       freshCandidateUserId: null,
       freshCandidateUserTurn: null,
@@ -1807,6 +1967,16 @@ export class BaseWebAdapter {
     let attachment = null;
     if (files.length > 0) {
       attachment = await this.attachFiles(files);
+      if (requireAttachments && (attachment?.failed?.length ?? 0) > 0) {
+        throw new BrowserAdapterError(
+          `${this.providerName} could not attach every required file. Nothing was sent.`,
+          {
+            code: "ATTACHMENT_UPLOAD_FAILED",
+            recoverable: false,
+            details: { attachment },
+          },
+        );
+      }
     }
 
     const assistantMessages = this.assistantMessages();
@@ -1884,11 +2054,25 @@ export class BaseWebAdapter {
     sendProof.deadline = sendProof.submittedAt
       + this.sendConfirmationTimeoutMs();
     this.lastSendStatus = "commit-unknown";
-    await this.#awaitWithinSendDeadline(
-      this.submitComposer(composer),
-      sendProof.deadline,
-    );
+    sendProof.stage = "submit";
+    const assertActive = () => {
+      if (sendProof.invalidated || this.activeSendProof !== sendProof
+        || this.monotonicNow() >= sendProof.deadline) {
+        throw this.#sendDeadlineError();
+      }
+    };
+    const submission = Promise.resolve().then(() => this.submitComposer(composer, {
+      assertActive,
+      timeoutMs: Math.max(1, Math.ceil(sendProof.deadline - this.monotonicNow())),
+    }));
+    this.pendingSubmission = submission;
+    const settled = () => {
+      if (this.pendingSubmission === submission) this.pendingSubmission = null;
+    };
+    submission.then(settled, settled);
+    await this.#awaitWithinSendDeadline(submission, sendProof.deadline);
 
+    sendProof.stage = "user-message-confirmation";
     const sentMessage = await this.#waitForSentUserMessage(userBaseline, {
       deadline: sendProof.deadline,
       expectedText: text,
@@ -1913,6 +2097,7 @@ export class BaseWebAdapter {
       this.#observeConversationNavigation(this.page.url());
     }
 
+    sendProof.stage = "conversation-confirmation";
     let submittedPage = await this.#awaitWithinSendDeadline(
       this.#submittedPageState(),
       sendProof.deadline,
@@ -1938,7 +2123,11 @@ export class BaseWebAdapter {
     if (this.lastUserMessageId) {
       this.expectedRestorationUserId = this.lastUserMessageId;
     }
-    this.#captureActiveTurnProof(submittedPage.conversationUrl);
+    this.#captureActiveTurnProof(submittedPage.conversationUrl, {
+      outboundId,
+      userMessageId: this.lastUserMessageId,
+      userTurn: sentMessage.turn ?? null,
+    });
     this.lastSendStatus = "confirmed";
     return {
       attachment,
@@ -1957,6 +2146,20 @@ export class BaseWebAdapter {
         ...assistantBaseline.ids,
       ],
     };
+    } catch (error) {
+      if (error?.code === "SEND_COMMIT_UNKNOWN") {
+        error.completionUnknown = true;
+        error.details = { ...this.#sendDiagnosticDetails(), ...(error.details ?? {}) };
+        // Invalidate before collecting diagnostics: delayed submit callbacks
+        // must not enter a fallback action while this read-only capture runs.
+        if (sendProof) sendProof.invalidated = true;
+        const diagnostics = await this.writeDiagnostics("send-commit-unknown", error.details).catch(() => null);
+        if (diagnostics?.filename) {
+          error.details.diagnosticFile = diagnostics.filename;
+          error.details.dom = diagnostics.report.dom;
+        }
+      }
+      throw error;
     } finally {
       if (sendProof && this.activeSendProof === sendProof) {
         sendProof.invalidated = true;
@@ -1977,6 +2180,8 @@ export class BaseWebAdapter {
     truncatedEnvelopeWindowMs = null,
     emptyResponseWindowMs = 10_000,
     deadRequestGraceMs = 60_000,
+    readNativeImages = null,
+    readNativeMusic = null,
     onDelta,
   }) {
     this.requirePage();
@@ -1990,6 +2195,8 @@ export class BaseWebAdapter {
     let sawGenerationSignal = false;
     let lastGenerationSignalAt = 0;
     let unverifiedPageChecks = 0;
+    let nativeCandidate = null;
+    let nativeStableSince = 0;
     const detachEscCancel = this.#attachEscCancel();
     const truncatedGraceMs = truncatedEnvelopeWindowMs
       ?? this.truncatedEnvelopeGraceMs();
@@ -2129,6 +2336,33 @@ export class BaseWebAdapter {
             if (delta) {
               await onDelta?.(delta);
             }
+          }
+
+          if (readNativeImages || readNativeMusic) {
+            const snapshot = await (readNativeMusic ?? readNativeImages)(lastMessage);
+            const media = readNativeMusic ? snapshot.music : snapshot.images;
+            if (snapshot.pending || media.length > 0) {
+              emptySince = 0;
+              emptyCandidate = null;
+              const signature = JSON.stringify([candidateId, candidateTurn, text, media]);
+              if (generating || snapshot.pending || signature !== nativeCandidate) {
+                nativeCandidate = signature;
+                nativeStableSince = Date.now();
+              } else if (Date.now() - nativeStableSince >= Math.max(2_000, stableWindowMs)) {
+                await this.#validateRecoveredTurnBoundary({
+                  assistantPresent: true,
+                  assistantMessageId: candidateId,
+                  assistantTurn: candidateTurn,
+                });
+                this.lastAssistantMessageId = candidateId;
+                this.lastAssistantTurn = candidateTurn;
+                return readNativeMusic ? { text, nativeMusic: media } : { text, nativeImages: media };
+              }
+              await this.page.waitForTimeout(250);
+              continue;
+            }
+            nativeCandidate = null;
+            nativeStableSince = 0;
           }
 
           if (!text.trim() && !generating) {
@@ -2615,11 +2849,22 @@ export class BaseWebAdapter {
           outboundId,
         });
       } else {
-        const messages = this.userMessages();
-        const count = await withinDeadline(messages.count().catch(() => 0));
+        const snapshot = await withinDeadline(this.userMessageSnapshot());
+        if (snapshot === null) {
+          candidateBubbleSignature = null;
+          candidateBubbleStableSince = 0;
+          await this.#waitBeforeSendDeadline(deadline);
+          continue;
+        }
+        const messages = snapshot === undefined ? this.userMessages() : null;
+        const count = snapshot?.length
+          ?? await withinDeadline(messages.count().catch(() => 0));
+        if (this.activeSendProof) {
+          this.activeSendProof.sample = { userMessageCount: count, markerMatched: false };
+        }
         for (let index = count - 1; index >= 0; index -= 1) {
-          const message = messages.nth(index);
-          const identity = await withinDeadline(
+          const message = messages?.nth(index);
+          const identity = snapshot?.[index] ?? await withinDeadline(
             this.messageIdentity(message),
           );
           const newByTurn = identity.turn != null
@@ -2637,12 +2882,23 @@ export class BaseWebAdapter {
             if (!requireFreshCorrelation && outboundId == null) {
               continue;
             }
-            const renderedText = await withinDeadline(
+            const renderedText = snapshot?.[index].renderedText ?? await withinDeadline(
               this.userMessageText(message),
             );
+            const markerMatched = renderedMessageContains(renderedText, expectedText, outboundId);
+            if (this.activeSendProof) {
+              this.activeSendProof.sample = {
+                userMessageCount: count,
+                candidateId: identity.id ?? null,
+                candidateTurn: identity.turn ?? null,
+                candidateIsLast: index === count - 1,
+                renderedTextLength: renderedText.length,
+                markerMatched,
+              };
+            }
             if (
               index !== count - 1
-              || !renderedMessageContains(renderedText, expectedText, outboundId)
+              || !markerMatched
             ) {
               continue;
             }
@@ -3032,24 +3288,72 @@ export class BaseWebAdapter {
     throw new BrowserAdapterError("Browser access challenge detected.");
   }
 
-  async writeDiagnostics(label) {
-    if (!this.debug || !this.page) {
-      return;
+  hasStructuralDiagnostics() {
+    return false;
+  }
+
+  recordConversationNavigation(_url) {}
+
+  async structuralDiagnostics() {
+    return null;
+  }
+
+  async collectStructuralDiagnostics() {
+    if (!this.hasStructuralDiagnostics()) return null;
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => this.structuralDiagnostics()).catch(() => ({ status: "unavailable" })),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ status: "timeout" }), 500); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
     }
-    const directory = path.join(this.profileDir, "..", "diagnostics");
-    await ensureDirectory(directory);
+  }
+
+  async writeDiagnostics(label, details = null) {
+    if (!this.page || (!this.debug && !this.hasStructuralDiagnostics())) return;
+    const page = this.page;
+    const proof = this.activeSendProof;
     const stamp = Date.now();
-    await Promise.all([
-      this.page.screenshot({
-        path: path.join(directory, `${stamp}-${label}.png`),
-        fullPage: true,
-      }).catch(() => null),
-      fs.writeFile(
-        path.join(directory, `${stamp}-${label}.html`),
-        await this.page.content(),
-        "utf8",
-      ).catch(() => null),
-    ]);
+    // Capture the stage before awaiting CDP. Never log prompts, correlation IDs,
+    // raw URLs, or arbitrary provider error text in the default JSON report.
+    const report = {
+      schemaVersion: 1,
+      provider: this.providerName,
+      label,
+      capturedAt: new Date(stamp).toISOString(),
+      stage: details?.stage ?? proof?.stage ?? "unknown",
+      sendStatus: this.lastSendStatus,
+      elapsedMs: proof?.submittedAt == null ? null : Math.round(this.monotonicNow() - proof.submittedAt),
+      routes: [...(this.diagnosticRoutes ?? [])],
+    };
+    const directory = path.join(this.profileDir, "..", "diagnostics");
+    const filename = path.join(directory, `${stamp}-${label}.json`);
+    const capture = async () => {
+      const dom = await this.collectStructuralDiagnostics();
+      if (dom) report.dom = dom;
+      if (this.debug && details != null) report.details = details;
+      await ensureDirectory(directory);
+      await fs.writeFile(filename, JSON.stringify(report, null, 2), "utf8");
+      if (this.debug) {
+        await Promise.all([
+          page.screenshot({ path: path.join(directory, `${stamp}-${label}.png`), fullPage: true, timeout: 2_000 }).catch(() => null),
+          page.content().then((html) => fs.writeFile(path.join(directory, `${stamp}-${label}.html`), html, "utf8")).catch(() => null),
+        ]);
+      }
+      return { filename, report };
+    };
+    let timer;
+    try {
+      // A dead CDP connection or disk must not mask the original failure.
+      return await Promise.race([
+        capture().catch(() => null),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2_500); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // Non-private so provider subclasses (e.g. attachFiles) can guard too.

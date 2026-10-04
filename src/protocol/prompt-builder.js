@@ -1,4 +1,4 @@
-import { wrapSystemPrompt } from "./markers.js";
+import { NATIVE_IMAGE_CONTRACT, wrapSystemPrompt } from "./markers.js";
 
 function formatTool(tool) {
   // Flat, so multi-line descriptions (arrays) keep their line breaks instead
@@ -19,19 +19,19 @@ const DONE_SEMANTICS = `Current-run completion semantics:
 - Set done=true only when the current user request has a complete, deliverable answer, or when you have a specific question that must be answered by the user before useful work can continue.
 - For informational or conversational tasks (e.g. answering a question, summarizing text, brainstorming), you can reply with done=true and your answer directly — no tool call is required.
 - For tasks that require reading, creating, or modifying files on the user's machine, use the local tools and verify the result before done=true.
-- The Runtime validates completion against successful local tool evidence. Never claim that you created, changed, read, tested, or verified local state unless the corresponding tool results were returned in this run.
+- Base claims about creating, changing, reading, testing, or verifying local state on tool results returned in this run. The Runtime validates the protocol and tracks tool execution; you are responsible for assessing whether the user's request is satisfied.
 - Use done=false only when you are about to call a local tool and need its result before you can continue.
 - Tool count, elapsed turns, or lack of an immediately obvious next action never proves completion.`;
 
 // The protocol + tool catalog are WTAgent-specific transport scaffolding.
 // They are wrapped for the web message and never persisted into the portable
 // Codex rollout.
-function buildBootstrapScaffold({ projectRoot, tools }) {
+function buildBootstrapScaffold({ projectRoot, tools, nativeImages }) {
   const toolDocs = tools.map(formatTool).join("\n\n");
 
   return `The user is running WTAgent, a local application that uses this web AI conversation for reasoning. The following is the user's requested application-level response format and collaboration contract; it is not a claim that this web chat has native filesystem or function-call tools.
 
-You do not need direct filesystem access or provider-native tool buttons. Return local operation requests as XML text. After your reply is complete, the user's local Node.js Runtime will parse the XML, validate the arguments, apply local policy, and may execute the requested operation. Its result will arrive in the next user message as <tool_result>. XML by itself never guarantees execution.
+You do not need direct filesystem access for local operations. Return local operation requests as XML text. After your reply is complete, the user's local Node.js Runtime will parse the XML, validate the arguments, apply local policy, and may execute the requested operation. Its result will arrive in the next user message as <tool_result>. XML by itself never guarantees execution.
 
 You are not limited to coding tasks. You can answer questions, write text, brainstorm, analyze, summarize, and — when the task requires it — request that the user's Runtime read, create, or modify files or run commands.
 
@@ -40,8 +40,8 @@ The project filesystem described below is a logical, virtual filesystem namespac
 
 Do not inspect /workspace, /mnt/data, or any ambient, cloud, or sandbox filesystem. Those locations are unrelated to the user's project. Request all project reads, listings, writes, edits, and commands only through the XML operations declared below.
 
-## Output protocol
-Every reply must contain exactly one complete XML root node inside a single \`xml\` code fence, with no text outside the fence. The code fence guarantees that JavaScript backticks and other source characters are not swallowed by the web Markdown renderer:
+${nativeImages ? `## Native images\n${NATIVE_IMAGE_CONTRACT}\n\n` : ""}## Output protocol
+${nativeImages ? "Every text reply" : "Every reply"} must contain exactly one complete XML root node inside a single \`xml\` code fence, with no text outside the fence. The code fence guarantees that JavaScript backticks and other source characters are not swallowed by the web Markdown renderer:
 
 \`\`\`xml
 <agent_response>
@@ -106,18 +106,19 @@ export function buildBootstrapPrompt({
   task,
   projectRoot,
   tools,
+  nativeImages = false,
 }) {
-  const developer = buildBootstrapScaffold({ projectRoot, tools });
+  const developer = buildBootstrapScaffold({ projectRoot, tools, nativeImages });
   const web = `${wrapSystemPrompt(developer)}\n\n## User task\n${task}`;
   return { web, developer, user: task };
 }
 
-function buildResumeScaffold({ tools, followUpRule, state, nextInstruction }) {
+function buildResumeScaffold({ tools, followUpRule, state, nextInstruction, nativeImages }) {
   const toolDocs = tools.map(formatTool).join("\n\n");
 
   return `Continue the same WTAgent session using the user's requested XML application protocol. You do not need native tool access: write a <tool_call> request as text, and the user's local Runtime will validate it, may execute it, and will return <tool_result> in the next user message.
 
-Still place your single <agent_response> XML inside one \`xml\` code fence with no text outside it and call at most one tool per turn. This preserves JavaScript backticks inside file contents.
+${nativeImages ? `${NATIVE_IMAGE_CONTRACT}\n\nFor text replies: ` : ""}Still place your single <agent_response> XML inside one \`xml\` code fence with no text outside it and call at most one tool per turn. This preserves JavaScript backticks inside file contents.
 
 ${DONE_SEMANTICS}
 
@@ -138,6 +139,7 @@ export function buildResumePrompt({
   instruction,
   state,
   tools,
+  nativeImages = false,
 }) {
   const nextInstruction = instruction?.trim()
     || "Continue the interrupted run based on the current project state and return a deliverable result.";
@@ -150,6 +152,7 @@ export function buildResumePrompt({
     followUpRule,
     state,
     nextInstruction,
+    nativeImages,
   });
   return {
     web: wrapSystemPrompt(developer),

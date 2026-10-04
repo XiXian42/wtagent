@@ -88,3 +88,20 @@ jobs:
           }
         env:
           WTAGENT_PACKED_TGZ: ${{ env.WTAGENT_PACKED_TGZ }}
+
+  chatgpt-dom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - run: npm ci --engine-strict
+      - name: Install isolated Chromium
+        run: npx playwright-core install --with-deps chromium
+      - name: Offline browser and media regression tests
+        run: |
+          export WTAGENT_CHROME_PATH="$(node --input-type=module -e 'import { chromium } from "playwright-core"; console.log(chromium.executablePath())')"
+          npm run test:chatgpt-dom
+          npm run test:media

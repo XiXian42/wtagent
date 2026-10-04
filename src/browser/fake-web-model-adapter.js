@@ -169,7 +169,11 @@ export class FakeWebModelAdapter {
     return this.conversationUrl;
   }
 
-  async sendMessage(text, { files = [], outboundId = null } = {}) {
+  async sendMessage(text, {
+    files = [],
+    outboundId = null,
+    requireAttachments = false,
+  } = {}) {
     const priorUserMessageId = this.lastUserMessageId;
     const priorAssistantMessageId = this.lastAssistantMessageId;
     this.lastSendStatus = "commit-unknown";
@@ -222,5 +226,16 @@ export class FakeWebModelAdapter {
 
   async getLastAssistantTurn() {
     return this.lastAssistantTurn;
+  }
+
+  async captureAuxiliaryTurnCompletion() {
+    this.responseNumber += 1;
+    this.lastAssistantMessageId = `assistant-${this.responseNumber}`;
+    this.lastAssistantTurn = this.responseNumber * 2;
+    return {
+      assistantMessageId: this.lastAssistantMessageId,
+      assistantTurn: this.lastAssistantTurn,
+      conversationUrl: this.conversationUrl,
+    };
   }
 }

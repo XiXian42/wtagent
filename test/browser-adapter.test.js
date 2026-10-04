@@ -296,8 +296,8 @@ test("ChatGPT atomic snapshots retain nested code-block envelopes", async () => 
   try {
     const adapter = new ChatGPTWebAdapter({ profileDir: "." });
     adapter.page = {
-      async evaluate(callback) {
-        return callback();
+      async evaluate(callback, argument) {
+        return callback(argument);
       },
     };
     const snapshot = await adapter.orderedConversationSnapshot();
@@ -876,9 +876,9 @@ function createStructuralFreshSendPage({
   renderedText,
   assistantAtMs = 500,
   transformSnapshot = (entries) => entries,
+  provisionalUrl = "https://chatgpt.com/c/WEB:structural-send",
 } = {}) {
   const rootUrl = "https://chatgpt.com/";
-  const provisionalUrl = "https://chatgpt.com/c/WEB:structural-send";
   const composer = new VisibleLocator();
   const sendButton = new VisibleLocator();
   const navigationListeners = new Set();
@@ -1304,10 +1304,11 @@ test("fresh structural proof ignores long-message controls and assistant arrival
   assert.ok(fixture.snapshotRead > 10);
 });
 
+for (const provisionalUrl of ["https://chatgpt.com/c/WEB:structural-send", "https://chatgpt.com/c/local-chatgpt%3A63668e54-c5e6-4ad9-9f6b-59139dd5d1d9"])
 for (const timing of ["before DOM read", "after DOM read", "final DOM read"]) {
-  test(`fresh send retries a canonical transition ${timing}`, async () => {
+  test(`fresh send retries a canonical transition ${timing} from ${provisionalUrl}`, async () => {
     const expected = freshSendTestPayload(freshSendTestId);
-    const fixture = createStructuralFreshSendPage({ renderedText: expected });
+    const fixture = createStructuralFreshSendPage({ renderedText: expected, provisionalUrl });
     const adapter = new StructuralSendProofChatGPTAdapter({ profileDir: "." });
     adapter.page = fixture.page;
     adapter.cdpChrome = { targetId: "target-structural" };
@@ -1341,6 +1342,28 @@ for (const timing of ["before DOM read", "after DOM read", "final DOM read"]) {
     assert.equal(fixture.submitCount, 1);
   });
 }
+
+test("duplicate navigation events within one normalized conversation keep send proof intact", async () => {
+  const expected = freshSendTestPayload(freshSendTestId);
+  const fixture = createStructuralFreshSendPage({ renderedText: expected });
+  const adapter = new StructuralSendProofChatGPTAdapter({ profileDir: "." });
+  adapter.page = fixture.page;
+  adapter.cdpChrome = { targetId: "target-structural" };
+  await adapter.startConversation();
+  let duplicated = false;
+  fixture.setWaitHook(() => {
+    if (duplicated || fixture.elapsedMs < 300) return;
+    duplicated = true;
+    fixture.navigate(`${fixture.provisionalUrl}?rid=assistant-current`);
+  });
+
+  const sent = await adapter.sendMessage(expected, { outboundId: freshSendTestId });
+
+  assert.equal(duplicated, true);
+  assert.equal(sent.conversationUrl, fixture.provisionalUrl);
+  assert.equal(adapter.getLastSendStatus(), "confirmed");
+  assert.equal(fixture.submitCount, 1);
+});
 
 for (const mutation of ["different user", "missing nonce", "different target", "unrelated navigation"]) {
   test(`fresh send rejects ${mutation} during its DOM read`, async () => {
@@ -1439,6 +1462,43 @@ for (const timing of ["before waiting", "during generation"]) {
   });
 }
 
+test("auxiliary completion waits for a fresh chat's canonical URL correlation", async () => {
+  const { adapter, fixture } = await prepareConfirmedProvisionalTurn();
+  const canonicalUrl = "https://chatgpt.com/c/auxiliary-canonical";
+  fixture.navigate(canonicalUrl);
+
+  const completion = await adapter.captureAuxiliaryTurnCompletion({
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(completion.conversationUrl, canonicalUrl);
+  assert.equal(completion.assistantMessageId, "assistant-structural");
+  assert.equal((await adapter.getConversationIdentity()).conversationUrl, canonicalUrl);
+});
+
+test("a provider with stable user ids can correlate a late fresh-to-canonical transition", async () => {
+  const expected = freshSendTestPayload(freshSendTestId);
+  const fixture = createStructuralFreshSendPage({
+    renderedText: expected,
+    assistantAtMs: 500,
+  });
+  const adapter = new ImmediateCorrelationChatGPTAdapter({ profileDir: "." });
+  adapter.page = fixture.page;
+  await adapter.startConversation();
+  const sent = await adapter.sendMessage(expected, { outboundId: freshSendTestId });
+  assert.equal(sent.conversationUrl, fixture.provisionalUrl);
+
+  const canonicalUrl = "https://chatgpt.com/c/late-fresh-canonical";
+  fixture.navigate(canonicalUrl);
+  const completion = await adapter.captureAuxiliaryTurnCompletion({
+    timeoutMs: 10_000,
+  });
+
+  assert.equal(completion.conversationUrl, canonicalUrl);
+  assert.equal(completion.assistantMessageId, "assistant-structural");
+  assert.equal((await adapter.getConversationIdentity()).conversationUrl, canonicalUrl);
+});
+
 for (const marker of ["missing", "transient"]) {
   test(`a confirmed turn rejects a canonical candidate with a ${marker} user marker`, async () => {
     const { adapter, fixture } = await prepareConfirmedProvisionalTurn();
@@ -1514,6 +1574,41 @@ test("a hanging submit cannot outlive the send confirmation deadline", async () 
   );
   assert.ok(Date.now() - startedAt < 500);
   assert.equal(adapter.getLastSendStatus(), "commit-unknown");
+});
+
+test("an expired submit cannot start a fallback or overlap the next composer", async () => {
+  class DeadlineAdapter extends ImmediateCorrelationChatGPTAdapter {
+    sendConfirmationTimeoutMs() { return 25; }
+  }
+  const expected = freshSendTestPayload(freshSendTestId);
+  const fixture = createFreshRebuildTransitionPage({ renderedText: expected });
+  const adapter = new DeadlineAdapter({ profileDir: ".", debug: true });
+  adapter.page = fixture.page;
+  const diagnostics = [];
+  adapter.writeDiagnostics = async (label, details) => diagnostics.push({ label, details });
+  let release;
+  let submitted = false;
+  const original = adapter.submitComposer.bind(adapter);
+  adapter.submitComposer = async (composer, options) => {
+    await new Promise((resolve) => { release = resolve; });
+    await original(composer, options);
+    submitted = true;
+  };
+  await adapter.startConversation();
+  await assert.rejects(adapter.sendMessage(expected, { outboundId: freshSendTestId }), (error) => {
+    assert.equal(error.code, "SEND_COMMIT_UNKNOWN");
+    assert.equal(error.completionUnknown, true);
+    assert.equal(error.details.stage, "submit");
+    return true;
+  });
+  assert.equal(diagnostics.at(-1).label, "send-commit-unknown");
+  assert.equal(diagnostics.at(-1).details.stage, "submit");
+  await assert.rejects(adapter.sendMessage("next"), /previous submit action is still in flight/);
+  const pending = adapter.pendingSubmission;
+  release();
+  await assert.rejects(pending, (error) => error.code === "SEND_COMMIT_UNKNOWN");
+  assert.equal(submitted, false);
+  assert.equal(adapter.pendingSubmission, null);
 });
 
 test("a DOM sample crossing the monotonic deadline cannot confirm a send", async () => {
@@ -2747,6 +2842,52 @@ test("pre-submit candidate must stay empty while existing history hydrates", asy
   assert.equal(adapter.getLastSendStatus(), "not-submitted");
 });
 
+test("required attachment failure aborts before typing or submitting", async () => {
+  const fixture = createPostSubmitNavigationPage({
+    confirmUserImmediately: true,
+  });
+  const adapter = new ImmediateCorrelationChatGPTAdapter({ profileDir: "." });
+  adapter.page = fixture.page;
+  adapter.attachFiles = async (files) => ({
+    attached: [],
+    failed: files.map((file) => ({ path: file.path, message: "upload failed" })),
+  });
+  await adapter.startConversation(fixture.originalUrl, {
+    expectedAssistantMessageId: "assistant-old",
+  });
+
+  await assert.rejects(
+    adapter.sendMessage("edit this image", {
+      files: [{ path: "/tmp/reference.png", name: "reference.png" }],
+      requireAttachments: true,
+    }),
+    (error) => error.code === "ATTACHMENT_UPLOAD_FAILED",
+  );
+  assert.equal(adapter.getLastSendStatus(), "not-submitted");
+});
+
+test("ordinary chat keeps attachment upload best-effort", async () => {
+  const fixture = createPostSubmitNavigationPage({
+    confirmUserImmediately: true,
+    sentText: "inspect this file",
+  });
+  const adapter = new ImmediateCorrelationChatGPTAdapter({ profileDir: "." });
+  adapter.page = fixture.page;
+  adapter.attachFiles = async (files) => ({
+    attached: [],
+    failed: files.map((file) => ({ path: file.path, message: "upload failed" })),
+  });
+  await adapter.startConversation(fixture.originalUrl, {
+    expectedAssistantMessageId: "assistant-old",
+  });
+
+  const sent = await adapter.sendMessage("inspect this file", {
+    files: [{ path: "/tmp/input.txt", name: "input.txt" }],
+  });
+  assert.equal(sent.attachment.failed.length, 1);
+  assert.equal(adapter.getLastSendStatus(), "confirmed");
+});
+
 test("fresh bootstrap refuses a conversation opened before submit", async () => {
   const adapter = new ChatGPTWebAdapter({ profileDir: "." });
   adapter.page = createConversationPage({ existingMessages: 2 });
@@ -2966,6 +3107,77 @@ test("same-route sends require their exact outbound marker", async () => {
   assert.equal(sent.userMessageId, "user-sent");
   assert.equal(adapter.getLastSendStatus(), "confirmed");
 });
+
+for (const scenario of ["virtualized tail", "transient read failure", "foreign tail"]) {
+  test(`same-route submission samples an atomic user snapshot: ${scenario}`, async () => {
+    const expected = freshSendTestPayload(freshSendTestId);
+    const fixture = createPostSubmitNavigationPage({
+      confirmUserImmediately: true,
+      sentText: expected,
+    });
+    const adapter = new StructuralSendProofChatGPTAdapter({ profileDir: "." });
+    const originalLocator = fixture.page.locator.bind(fixture.page);
+    const sendButton = originalLocator('[data-testid="send-button"]');
+    const originalClick = sendButton.click.bind(sendButton);
+    let submitted = false;
+    let snapshots = 0;
+    let staleIndexReads = 0;
+    sendButton.click = async () => {
+      await originalClick();
+      submitted = true;
+    };
+    fixture.page.locator = (selector) => {
+      if (selector !== '[data-message-author-role="user"]' || !submitted) {
+        return originalLocator(selector);
+      }
+      return {
+        // The old list had 26 user bubbles; virtualization has retained only
+        // the new one. A locator resolved from this stale count cannot finish.
+        async count() { return 26; },
+        nth() {
+          staleIndexReads += 1;
+          return {
+            async getAttribute() { return new Promise(() => {}); },
+            async evaluate() { return new Promise(() => {}); },
+          };
+        },
+        async evaluateAll(callback) {
+          snapshots += 1;
+          if (scenario === "transient read failure" && snapshots === 1) {
+            throw new Error("DOM sample unavailable");
+          }
+          const rows = [{ id: "user-sent", turn: 51, text: expected }];
+          if (scenario === "foreign tail") {
+            rows.push({ id: "user-foreign", turn: 53, text: "another request" });
+          }
+          return callback(rows.map((row) => ({
+            innerText: row.text,
+            getAttribute: (name) => name === "data-message-author-role" ? "user" : name === "data-message-id" ? row.id : null,
+            closest: () => ({ getAttribute: () => `conversation-turn-${row.turn}` }),
+          })));
+        },
+      };
+    };
+    adapter.page = fixture.page;
+    await adapter.startConversation(fixture.originalUrl, {
+      expectedAssistantMessageId: "assistant-old",
+    });
+    if (scenario === "foreign tail") {
+      await assert.rejects(
+        adapter.sendMessage(expected, { outboundId: freshSendTestId }),
+        (error) => error.code === "SEND_COMMIT_UNKNOWN",
+      );
+    } else {
+      const result = await adapter.sendMessage(expected, { outboundId: freshSendTestId });
+      assert.equal(result.userMessageId, "user-sent");
+      assert.equal(result.userTurn, 51);
+      assert.equal(adapter.getLastSendStatus(), "confirmed");
+      assert.ok(adapter.monotonicNow() >= adapter.restorationCorrelationWindowMs());
+    }
+    assert.ok(snapshots > 1);
+    assert.equal(staleIndexReads, 0);
+  });
+}
 
 test("same-route foreign user bubbles cannot confirm an outbound", async () => {
   const expected = freshSendTestPayload(freshSendTestId);

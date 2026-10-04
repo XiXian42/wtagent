@@ -5,11 +5,11 @@ import {
   parseAgentResponse,
   serializeProtocolError,
   serializeToolResult,
-  stripUiNoiseLines,
 } from "../protocol/xml-protocol.js";
 import {
   appendSystemReminder,
   DEFAULT_SYSTEM_REMINDER,
+  NATIVE_IMAGE_SYSTEM_REMINDER,
 } from "../protocol/markers.js";
 import {
   buildBootstrapPrompt,
@@ -24,6 +24,7 @@ import {
   userMessage,
 } from "../session/canonical-transcript.js";
 import { DEFAULT_LIMITS } from "../shared/limits.js";
+import { MUSIC_SYSTEM_REMINDER } from "../audio/native-music-receiver.js";
 import { utf8ByteLength } from "../shared/text-budget.js";
 import {
   BrowserAdapterError,
@@ -157,6 +158,8 @@ export class AgentRuntime {
     approval,
     onEvent,
     postAuthSetup = null,
+    nativeImageReceiver = null,
+    nativeMusicReceiver = null,
     limits = DEFAULT_LIMITS,
   }) {
     this.adapter = adapter;
@@ -166,6 +169,8 @@ export class AgentRuntime {
     this.approval = approval;
     this.onEvent = onEvent;
     this.postAuthSetup = postAuthSetup;
+    this.nativeImageReceiver = nativeImageReceiver;
+    this.nativeMusicReceiver = nativeMusicReceiver;
     this.limits = limits;
     this.conversationIdentityQueue = Promise.resolve();
     this.deferConversationIdentityPersistence = false;
@@ -180,20 +185,40 @@ export class AgentRuntime {
     return event;
   }
 
+  #assertProviderReadyForMessage() {
+    if (this.session.state.pendingAuxiliaryTurn != null) {
+      throw new BrowserAdapterError(
+        "The provider operation has no verified assistant boundary. No further message was sent.",
+        { code: "AUXILIARY_TURN_RECOVERY_REQUIRED", recoverable: false },
+      );
+    }
+    if (this.session.state.pendingOutbound != null) {
+      throw new BrowserAdapterError(
+        "A previous provider message has not been reconciled. No further message was sent.",
+        { code: "OUTBOUND_COMMIT_UNCERTAIN", recoverable: false },
+      );
+    }
+  }
+
   async sendMessage(text, {
     files = [],
     maxBytes = null,
     allowFreshReconnect = false,
     allowAssistantContinuation = false,
+    requireAttachments = false,
     outboundKind = "runtime_message",
     transcriptItems = [],
     runtimeTurn = null,
     pendingToolAcknowledgement = null,
   } = {}) {
+    this.#assertProviderReadyForMessage();
+    await this.nativeMusicReceiver?.prepare();
     const outboundId = randomUUID();
+    const reminder = this.nativeMusicReceiver ? MUSIC_SYSTEM_REMINDER
+      : this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER;
     const message = appendSystemReminder(
       text,
-      `${DEFAULT_SYSTEM_REMINDER}${OUTBOUND_CORRELATION_PREFIX}${outboundId}.`,
+      `${reminder}${OUTBOUND_CORRELATION_PREFIX}${outboundId}.`,
     );
     const pendingOutbound = {
       kind: outboundKind,
@@ -213,6 +238,7 @@ export class AgentRuntime {
         maxBytes,
         allowFreshReconnect,
         allowAssistantContinuation,
+        requireAttachments,
         outboundId,
       });
       const handoff = await this.#queueSessionOperation(() => (
@@ -414,6 +440,7 @@ export class AgentRuntime {
     maxBytes,
     allowFreshReconnect,
     allowAssistantContinuation,
+    requireAttachments,
     outboundId,
   }) {
     try {
@@ -422,6 +449,7 @@ export class AgentRuntime {
         maxBytes,
         outboundId,
         allowAssistantContinuation,
+        requireAttachments,
       });
     } catch (error) {
       if (isConnectionLostError(error)) {
@@ -447,11 +475,13 @@ export class AgentRuntime {
             )
           ),
         });
+        await this.nativeMusicReceiver?.prepare();
         return await this.adapter.sendMessage(message, {
           files,
           maxBytes,
           outboundId,
           allowAssistantContinuation,
+          requireAttachments,
         });
       }
       throw error;
@@ -514,6 +544,9 @@ export class AgentRuntime {
     }
     if (state.pendingAssistantTurn != null) {
       blockers.push("pending assistant handoff");
+    }
+    if (state.pendingAuxiliaryTurn != null) {
+      blockers.push("pending auxiliary provider turn");
     }
     if (state.pendingToolResult != null) {
       blockers.push("pending tool result");
@@ -581,7 +614,8 @@ export class AgentRuntime {
 
   buildToolResultMessage(result, { suffix = "" } = {}) {
     const limit = this.limits.maxBrowserToolResultBytes;
-    const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix))
+    const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix,
+      this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER))
       + OUTBOUND_CORRELATION_RESERVE_BYTES;
     const resultBudget = limit - nonResultBytes;
     if (resultBudget < 512) {
@@ -609,6 +643,144 @@ export class AgentRuntime {
         },
       },
     );
+  }
+
+  // Runs a provider-native helper turn (currently used by image.generate) in
+  // the same web conversation without exposing that turn as another WTAgent
+  // protocol exchange. The send still goes through the adapter's full causal
+  // checks, and both provider message identities are checkpointed before the
+  // caller is allowed to send the tool result.
+  async runAuxiliaryTurn({
+    text,
+    files = [],
+    timeoutMs = this.limits.modelTurnTimeoutMs,
+    waitForCompletion,
+  }) {
+    if (typeof waitForCompletion !== "function") {
+      throw new TypeError("An auxiliary turn requires a completion callback.");
+    }
+    this.#assertProviderReadyForMessage();
+    const outboundId = randomUUID();
+    const message = appendSystemReminder(
+      text,
+      `This is an internal WTAgent provider operation. Perform only the requested operation; do not emit the WTAgent XML protocol.${OUTBOUND_CORRELATION_PREFIX}${outboundId}.`,
+    );
+    const pendingOutbound = {
+      kind: "auxiliary_tool_turn",
+      outboundId,
+      messageHash: createHash("sha256").update(message).digest("hex"),
+      preparedAt: new Date().toISOString(),
+      transcriptItems: [],
+      runtimeTurn: null,
+      pendingToolAcknowledgement: null,
+      conversationUrl: this.session.state.conversationUrl ?? null,
+      conversationTargetId: this.session.state.conversationTargetId ?? null,
+    };
+    await this.#queueSessionUpdate({ pendingOutbound });
+
+    let sendResult;
+    try {
+      sendResult = await this.#sendMessageWithReconnect(message, {
+        files,
+        maxBytes: null,
+        allowFreshReconnect: false,
+        allowAssistantContinuation: false,
+        requireAttachments: files.length > 0,
+        outboundId,
+      });
+      await this.#queueSessionOperation(() => (
+        this.session.commitPendingAuxiliaryTurn({
+          outboundId,
+          turn: {
+            conversationUrl: sendResult?.conversationUrl
+              ?? this.session.state.conversationUrl,
+            conversationTargetId: sendResult?.conversationTargetId
+              ?? this.session.state.conversationTargetId,
+            userMessageId: sendResult?.userMessageId ?? null,
+            userTurn: sendResult?.userTurn ?? null,
+            assistantBaseline: sendResult?.assistantBaseline ?? null,
+          },
+        })
+      ));
+    } catch (error) {
+      const sendStatus = this.adapter.getLastSendStatus?.() ?? "commit-unknown";
+      await this.#queueSessionOperation(async () => {
+        if (this.session.state.pendingOutbound?.outboundId === outboundId) {
+          await this.session.update({
+            pendingOutbound: sendStatus === "not-submitted"
+              ? null
+              : {
+                ...pendingOutbound,
+                status: "commit-unknown",
+                failedAt: new Date().toISOString(),
+              },
+          });
+        }
+      }).catch(() => {});
+      if (sendStatus !== "not-submitted") {
+        error.completionUnknown = true;
+      }
+      throw error;
+    } finally {
+      await this.#syncConversationIdentity({ suppressErrors: true });
+    }
+
+    let value;
+    try {
+      value = await waitForCompletion({
+        adapter: this.adapter,
+        page: this.adapter.page,
+        sendResult,
+        timeoutMs,
+      });
+      const completion = await this.adapter.captureAuxiliaryTurnCompletion?.({
+        timeoutMs: Math.min(timeoutMs, 30_000),
+      })
+        ?? null;
+      const assistantMessageId = completion?.assistantMessageId
+        ?? await this.adapter.getLastAssistantMessageId?.()
+        ?? null;
+      const assistantTurn = completion?.assistantTurn
+        ?? await this.adapter.getLastAssistantTurn?.()
+        ?? null;
+      await this.#queueSessionOperation(() => (
+        this.session.completePendingAuxiliaryTurn({
+          outboundId,
+          assistantMessageId,
+          assistantTurn,
+        })
+      ));
+      return value;
+    } catch (error) {
+      // A provider can finish the visible assistant turn yet fail while WTAgent
+      // downloads or validates its artifact. Close that browser-turn checkpoint
+      // when its final boundary is still provable; otherwise retain it so a
+      // later resume cannot blindly submit a duplicate image request.
+      try {
+        const completion = await this.adapter.captureAuxiliaryTurnCompletion?.({
+          timeoutMs: Math.min(timeoutMs, 5_000),
+        });
+        if (completion) {
+          await this.#queueSessionOperation(() => (
+            this.session.completePendingAuxiliaryTurn({
+              outboundId,
+              assistantMessageId: completion.assistantMessageId ?? null,
+              assistantTurn: completion.assistantTurn ?? null,
+            })
+          ));
+        }
+      } catch {
+        // Keep pendingAuxiliaryTurn intact when completion cannot be proven.
+      }
+      // If the completion callback produced a temporary artifact but the
+      // assistant-boundary checkpoint failed, ownership never reaches the
+      // ImageGenerationService, so clean it here.
+      await value?.cleanup?.().catch(() => null);
+      error.completionUnknown = true;
+      throw error;
+    } finally {
+      await this.#syncConversationIdentity({ suppressErrors: true });
+    }
   }
 
   async #appendHandoffTranscript(activeHandoff, suffix, item) {
@@ -789,7 +961,9 @@ export class AgentRuntime {
       ));
     }
 
-    if (outcome.status === "complete") {
+    // Recovery reconciles text/identity. A not-yet-checkpointed native turn
+    // still needs the ordinary image-aware completion reader before sealing it.
+    if (outcome.status === "complete" && ((!this.nativeImageReceiver && !this.nativeMusicReceiver) || handoff.status === "complete")) {
       const outcomeHash = createHash("sha256")
         .update(outcome.rawResponse)
         .digest("hex");
@@ -805,6 +979,8 @@ export class AgentRuntime {
           assistantMessageId: outcome.assistantMessageId ?? null,
           assistantTurn: outcome.assistantTurn ?? null,
           rawResponse: outcome.rawResponse,
+          nativeImages: handoff.nativeImages ?? [],
+          nativeMusic: handoff.nativeMusic ?? [],
         })
       ));
     }
@@ -824,8 +1000,23 @@ export class AgentRuntime {
     const previousConversationUrl = this.session.state.conversationUrl;
     const pendingOutboundAtStart = this.session.state.pendingOutbound;
     const pendingAssistantAtStart = this.session.state.pendingAssistantTurn;
+    const pendingAuxiliaryAtStart = this.session.state.pendingAuxiliaryTurn;
+    if (pendingAuxiliaryAtStart != null) {
+      throw new BrowserAdapterError(
+        "An image/provider auxiliary turn was interrupted after submission. "
+          + "WTAgent will not replay it automatically because that could create a duplicate remote artifact.",
+        { code: "AUXILIARY_TURN_RECOVERY_REQUIRED", recoverable: false },
+      );
+    }
     const hasPendingRecovery = pendingOutboundAtStart != null
       || pendingAssistantAtStart != null;
+    if (this.nativeMusicReceiver && resume && !hasPendingRecovery
+        && !instruction?.trim() && files.length === 0 && this.session.state.lastMusicResult) {
+      // Bare resume of a completed generation must not spend quota again.
+      const result = this.session.state.lastMusicResult;
+      await this.emit("run.completed", result);
+      return { sessionId: this.session.sessionId, ...result };
+    }
     const supportsStrictRecovery = Boolean(
       this.adapter.supportsPendingOutboundRecovery?.(),
     );
@@ -1091,7 +1282,13 @@ export class AgentRuntime {
     // records only confirmed user messages; WTAgent scaffolding stays transport-only.
     let initialTranscript = [];
     if (!legacyAssistantRecoveryAtStart) {
-    if (resumedExistingConversation && pendingToolResult && !inPlaceRecovery) {
+    if (this.nativeMusicReceiver) {
+      if (inPlaceRecovery) throw new Error("Music generation is not automatically repeated; resume the pending turn without a new instruction.");
+      const request = effectiveInstruction?.trim() || task;
+      initialMessage = `Create the following music using the native Music tool.\n\n${request}`;
+      initialTranscript = resume && effectiveInstruction?.trim() ? [userMessage(effectiveInstruction.trim(), messageOptions)] : [];
+      initialKind = resume ? "music_follow_up" : "music_generation";
+    } else if (resumedExistingConversation && pendingToolResult && !inPlaceRecovery) {
       let suffix = "";
       if (instruction?.trim()) {
         suffix = `\n<resume_instruction>${cdata(instruction)}</resume_instruction>`;
@@ -1120,6 +1317,7 @@ export class AgentRuntime {
           : instruction,
         state: this.session.state,
         tools: this.registry.list(),
+        nativeImages: Boolean(this.nativeImageReceiver),
       });
       initialMessage = prompt.web;
       // The original task is already the one safe canonical item required by the
@@ -1135,6 +1333,7 @@ export class AgentRuntime {
         task,
         projectRoot,
         tools: this.registry.list(),
+        nativeImages: Boolean(this.nativeImageReceiver),
       });
       initialMessage = prompt.web;
       // The opening item was persisted before browser setup above.
@@ -1188,12 +1387,16 @@ export class AgentRuntime {
         : baseTurn + step;
       await this.session.update({ turn: turnNumber, phase: "waiting_model" });
       let raw;
+      let nativeImages = [];
+      let nativeMusic = [];
       let emptyAssistantRetries = 0;
       let connectionRetries = 0;
       for (;;) {
         try {
           if (activeHandoff.status === "complete") {
             raw = activeHandoff.rawResponse;
+            nativeImages = activeHandoff.nativeImages ?? [];
+            nativeMusic = activeHandoff.nativeMusic ?? [];
           } else {
             try {
               raw = await this.adapter.waitForTurnComplete({
@@ -1201,6 +1404,10 @@ export class AgentRuntime {
                 stableWindowMs: this.limits.modelStableWindowMs,
                 emptyResponseWindowMs: this.limits.emptyAssistantWindowMs,
                 deadRequestGraceMs: this.limits.deadRequestGraceMs,
+                readNativeImages: this.nativeImageReceiver
+                  ? (message) => this.nativeImageReceiver.read(message) : null,
+                readNativeMusic: this.nativeMusicReceiver
+                  ? (message) => this.nativeMusicReceiver.read(message) : null,
                 onDelta: async (delta) => {
                   await this.onEvent?.({
                     type: "model.streaming",
@@ -1210,6 +1417,13 @@ export class AgentRuntime {
                   });
                 },
               });
+              if (raw && typeof raw === "object" && Array.isArray(raw.nativeImages)) {
+                nativeImages = raw.nativeImages;
+                raw = raw.text ?? "";
+              } else if (raw && typeof raw === "object" && Array.isArray(raw.nativeMusic)) {
+                nativeMusic = raw.nativeMusic;
+                raw = raw.text ?? "";
+              }
             } finally {
               // Navigation events normally persist canonicalization immediately;
               // this validated fallback runs on every outcome but never masks a
@@ -1259,6 +1473,7 @@ export class AgentRuntime {
 
           const deadRequest = error?.code === "DEAD_ASSISTANT_REQUEST";
           const generationFailed = error?.code === "GENERATION_FAILED";
+          if (this.nativeMusicReceiver) throw error;
           if (
             error?.code !== "EMPTY_ASSISTANT_RESPONSE"
             && !deadRequest
@@ -1351,6 +1566,8 @@ export class AgentRuntime {
             assistantMessageId,
             assistantTurn,
             rawResponse: raw,
+            nativeImages,
+            nativeMusic,
           })
         ));
       } else {
@@ -1371,6 +1588,66 @@ export class AgentRuntime {
         raw,
         assistantMessageId,
       });
+
+      if (this.nativeMusicReceiver) {
+        let artifacts = activeHandoff.nativeArtifacts;
+        if (!artifacts) {
+          artifacts = nativeMusic.length ? await this.nativeMusicReceiver.save(nativeMusic, {
+            projectRoot, handoffId: activeHandoff.handoffId, assistantMessageId,
+          }) : [];
+          activeHandoff = await this.#queueSessionOperation(() => (
+            this.session.refreshPendingAssistantTurn(activeHandoff.handoffId, { nativeArtifacts: artifacts })
+          ));
+        }
+        const message = [
+          raw,
+          ...artifacts.map((artifact) => `Saved music: ${artifact.localPath} (${artifact.durationSeconds.toFixed(2)} s)`),
+          ...artifacts.map((artifact) => artifact.audioExtractionNote).filter(Boolean),
+          ...(artifacts.length ? [] : ["No music file was generated or saved."]),
+        ].filter(Boolean).join("\n");
+        await this.#appendHandoffTranscript(activeHandoff, "assistant", assistantMessage(message));
+        const result = { message, artifacts };
+        await this.#queueSessionOperation(() => this.session.clearPendingAssistantTurn(activeHandoff.handoffId, {
+          phase: "idle", lastMessage: message, pendingToolResult: null, lastMusicResult: result,
+        }));
+        if (artifacts.length) await this.emit("model.native_music", { turn: turnNumber, artifacts });
+        await this.emit("run.completed", result);
+        return { sessionId: this.session.sessionId, ...result };
+      }
+
+      if (nativeImages.length > 0) {
+        if (!this.nativeImageReceiver) {
+          throw new Error("This session has pending native images but no image receiver.");
+        }
+        let artifacts = activeHandoff.nativeArtifacts;
+        if (!artifacts) {
+          artifacts = await this.nativeImageReceiver.save(nativeImages, {
+            projectRoot,
+            handoffId: activeHandoff.handoffId,
+            assistantMessageId,
+          });
+          activeHandoff = await this.#queueSessionOperation(() => (
+            this.session.refreshPendingAssistantTurn(activeHandoff.handoffId, { nativeArtifacts: artifacts })
+          ));
+        }
+        protocolErrors = 0;
+        const message = [raw, ...artifacts.map((artifact) => `Saved image: ${artifact.localPath}`)]
+          .filter(Boolean).join("\n");
+        await this.#appendHandoffTranscript(activeHandoff, "assistant", assistantMessage(message));
+        await this.emit("model.native_images", { turn: turnNumber, artifacts });
+        await this.emit("model.progress", { turn: turnNumber, message });
+        const receipt = artifacts.map(({ localPath, mimeType, width, height, size, sha256 }) => (
+          { localPath, mimeType, width, height, size, sha256 }
+        ));
+        await this.sendMessage(
+          `<native_image_result>${cdata(JSON.stringify(receipt))}</native_image_result>\n`
+            + "The images from your preceding reply are saved at these verified local paths. "
+            + "Continue the user's original task. Generate further images directly if needed; "
+            + "use local tools for file operations, or finish with a done=true XML answer.",
+          { outboundKind: "native_image_result", runtimeTurn: turnNumber + 1 },
+        );
+        continue;
+      }
 
       let parsed;
       let finalMessage;
@@ -1421,50 +1698,33 @@ export class AgentRuntime {
           );
         }
 
-        // The model answered in plain prose without any <agent_response> at
-        // all. That cannot be a broken tool request (tools only exist inside a
-        // parsed envelope), so it is safe to treat the prose as the final
-        // answer: end the run and show it, instead of burning retries on a
-        // model that deliberately finished the conversation. A reply that DOES
-        // contain <agent_response but fails to parse keeps the retry path —
-        // the model tried the protocol and we must not guess its intent.
-        // A bare <tool_calls>/<invoke> reply (no envelope) is likewise a tool
-        // REQUEST, never prose: it goes to the protocol-error retry below.
-        const looksLikeToolRequest = /<tool_calls[\s>]|<tool_call[\s>]|<invoke[\s>]/i
-          .test(raw);
-        const plainAnswer = !raw.includes("<agent_response")
-          && !looksLikeToolRequest
-          ? stripUiNoiseLines(raw)
-          : "";
-        if (plainAnswer) {
-          await this.emit("protocol.plain_answer", {
-            snippet: plainAnswer.slice(0, 200),
-          });
-          await this.#appendHandoffTranscript(
-            activeHandoff,
-            "assistant",
-            assistantMessage(plainAnswer),
+        // A finished native refusal/clarification is data for the agent, not a
+        // successful image or an empty-response retry. Keep a bounded budget;
+        // malformed XML still follows strict protocol correction below.
+        if (this.nativeImageReceiver && raw.trim() && !/<\/?(?:agent_response|tool_call|tool_calls|invoke|done|message)(?:\s|>)/i.test(raw)) {
+          protocolErrors += 1;
+          await this.#appendHandoffTranscript(activeHandoff, "assistant", assistantMessage(raw));
+          await this.emit("model.progress", { turn: turnNumber, message: raw });
+          if (protocolErrors >= this.limits.maxProtocolErrors) {
+            throw new ProtocolError("The provider repeatedly returned text without a completed XML answer or an image.");
+          }
+          await this.sendMessage(
+            `<native_image_result type="text">${cdata(raw)}</native_image_result>\n`
+              + "Your preceding reply contained only this text; no image was received or saved. "
+              + "Continue the original task based on this result. If generation is unavailable or declined, "
+              + "explain it or ask the user a specific question in a done=true XML answer. Do not automatically retry the same image request.",
+            { outboundKind: "native_image_text", runtimeTurn: turnNumber + 1 },
           );
-          await this.#queueSessionOperation(() => (
-            this.session.clearPendingAssistantTurn(
-              activeHandoff.handoffId,
-              {
-                phase: "idle",
-                lastMessage: plainAnswer,
-                pendingToolResult: null,
-              },
-            )
-          ));
-          await this.emit("run.completed", {
-            message: plainAnswer,
-            plainAnswer: true,
-          });
-          return {
-            sessionId: this.session.sessionId,
-            message: plainAnswer,
-          };
+          continue;
         }
 
+        // Absence of an envelope is a protocol failure, not proof of done.
+        // This also covers UI-only text and partial native-artifact responses.
+        await this.adapter.writeDiagnostics?.("protocol-invalid", {
+          turn: turnNumber,
+          assistantMessageId,
+          error: error.message,
+        }).catch(() => null);
         protocolErrors += 1;
         await this.emit("protocol.invalid", {
           message: error.message,
@@ -1628,6 +1888,7 @@ export class AgentRuntime {
       const sideEffect = isReadTool ? null : identity;
       const fingerprint = identity.fingerprint;
       let result;
+      let restoredForTool = false;
 
       if (
         sideEffect
@@ -1746,32 +2007,46 @@ export class AgentRuntime {
         }
 
         if (!result) {
+          if (preparedCall.definition.requiresVisibleBrowser) {
+            await this.adapter.restoreWindow?.();
+            restoredForTool = true;
+          }
           await this.emit("tool.started", {
             id: preparedCall.id,
             name: preparedCall.name,
           });
-          result = await this.registry.execute(preparedCall, {
-            projectRoot,
-            allowOutside: grants?.allowOutside ?? false,
-            toolTimeoutMs: this.limits.toolTimeoutMs,
-            onToolOutput: async (output) => {
-              await this.session.appendToolOutput({
-                id: preparedCall.id,
-                name: preparedCall.name,
-                ...output,
-              });
-              await this.onEvent?.({
-                type: "tool.output",
-                sessionId: this.session.sessionId,
-                timestamp: new Date().toISOString(),
-                payload: {
+          try {
+            result = await this.registry.execute(preparedCall, {
+              projectRoot,
+              allowOutside: grants?.allowOutside ?? false,
+              toolTimeoutMs: this.limits.toolTimeoutMs,
+              sessionId: this.session.sessionId,
+              operationKey: identity.operationKey,
+              requestSignature: identity.requestSignature,
+              runAuxiliaryTurn: (options) => this.runAuxiliaryTurn(options),
+              onToolOutput: async (output) => {
+                await this.session.appendToolOutput({
                   id: preparedCall.id,
                   name: preparedCall.name,
                   ...output,
-                },
-              });
-            },
-          });
+                });
+                await this.onEvent?.({
+                  type: "tool.output",
+                  sessionId: this.session.sessionId,
+                  timestamp: new Date().toISOString(),
+                  payload: {
+                    id: preparedCall.id,
+                    name: preparedCall.name,
+                    ...output,
+                  },
+                });
+              },
+            });
+          } finally {
+            if (restoredForTool) {
+              await this.adapter.page?.bringToFront?.().catch(() => null);
+            }
+          }
         }
 
         if (sideEffect) {
@@ -1794,6 +2069,8 @@ export class AgentRuntime {
         }
       }
 
+      this.#assertProviderReadyForMessage();
+
       await this.#appendHandoffTranscript(
         activeHandoff,
         "function_output",
@@ -1809,6 +2086,9 @@ export class AgentRuntime {
         name: result.name,
         ok: result.ok,
       });
+      if (restoredForTool) {
+        await this.adapter.minimizeWindow?.();
+      }
     }
 
   }
