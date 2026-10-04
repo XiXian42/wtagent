@@ -41,6 +41,28 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+async function reserveSessionMutexPorts({ tasksDir, projectRoot }) {
+  // Test deliberate collisions against ports that the OS actually permits.
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const session = await AgentSession.create({
+      sessionsDir: tasksDir, task: "mutex availability", projectRoot, mode: null,
+    });
+    const servers = [];
+    try {
+      for (const port of persistenceMutexPorts(session.directory)) {
+        const server = net.createServer();
+        servers.push(server);
+        await listen(server, { host: "127.0.0.1", port, exclusive: true });
+      }
+      return { session, servers };
+    } catch (error) {
+      await Promise.all(servers.map((server) => closeServer(server)));
+      if (error.code !== "EADDRINUSE" && error.code !== "EACCES") throw error;
+    }
+  }
+  throw new Error("could not find an available mutex port set");
+}
+
 async function createDirectorySymlink(t, target, linkPath) {
   try {
     await fs.symlink(
@@ -527,20 +549,9 @@ test("a recycled live pid does not make a crashed state lock permanent", async (
 
 test("unrelated listeners cannot block a state-lock mutex quorum", async (t) => {
   const { tasksDir, projectRoot } = await makeFixture(t);
-  const session = await AgentSession.create({
-    sessionsDir: tasksDir,
-    task: "unrelated state-lock listeners",
-    projectRoot,
-    mode: null,
-  });
-  const occupiedPorts = persistenceMutexPorts(session.directory).slice(0, 2);
-  const servers = occupiedPorts.map(() => net.createServer());
-  await Promise.all(servers.map((server, index) => listen(server, {
-    host: "127.0.0.1",
-    port: occupiedPorts[index],
-    exclusive: true,
-  })));
+  const { session, servers } = await reserveSessionMutexPorts({ tasksDir, projectRoot });
   t.after(() => Promise.all(servers.map((server) => closeServer(server))));
+  await Promise.all(servers.slice(2).map((server) => closeServer(server)));
   await fs.writeFile(
     path.join(session.directory, ".wtagent-state.lock"),
     `${JSON.stringify({
@@ -558,6 +569,33 @@ test("unrelated listeners cannot block a state-lock mutex quorum", async (t) => 
     sessionId: session.sessionId,
   });
   assert.equal(reloaded.state.phase, "quorum-with-collisions");
+});
+
+test("unavailable mutex ports do not lower the required majority", async (t) => {
+  const { tasksDir, projectRoot } = await makeFixture(t);
+  const { session, servers } = await reserveSessionMutexPorts({ tasksDir, projectRoot });
+  await Promise.all(servers.map((server) => closeServer(server)));
+  const ports = persistenceMutexPorts(session.directory);
+  const originalListen = net.Server.prototype.listen;
+  let unavailable = new Set(ports.slice(0, 2));
+  t.mock.method(net.Server.prototype, "listen", function (options, ...args) {
+    if (unavailable.has(options?.port)) {
+      const error = Object.assign(new Error("OS-excluded port"), { code: "EACCES" });
+      queueMicrotask(() => this.emit("error", error));
+      return this;
+    }
+    return originalListen.call(this, options, ...args);
+  });
+
+  await session.update({ phase: "two-unavailable" });
+  unavailable = new Set(ports.slice(0, 3));
+  await assert.rejects(session.update({ phase: "must-not-save" }), {
+    code: "SESSION_STATE_LOCKED",
+  });
+  assert.equal(JSON.parse(await fs.readFile(path.join(session.directory, "session.json"), "utf8")).phase, "two-unavailable");
+  assert.equal((await fs.readdir(session.directory)).includes(".wtagent-state.lock"), false);
+  unavailable = new Set();
+  await session.update({ phase: "ports-released" });
 });
 
 test("keyed transcript appends are idempotent across loaded session instances", async (t) => {

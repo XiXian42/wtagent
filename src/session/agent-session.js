@@ -115,7 +115,10 @@ async function acquirePersistenceLockMutex(
         try {
           servers.push(await openPersistenceLockServer({ port, token }));
         } catch (error) {
-          if (error.code !== "EADDRINUSE") {
+          // Windows excluded port ranges fail with EACCES rather than
+          // EADDRINUSE. Both make this member unavailable; the same fixed
+          // majority is still required, so contenders cannot bypass the lock.
+          if (error.code !== "EADDRINUSE" && error.code !== "EACCES") {
             throw error;
           }
           lastError = error;
