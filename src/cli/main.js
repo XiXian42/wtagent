@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { confirm, select } from "@inquirer/prompts";
 import { launchNativeLoginBrowser } from "../browser/native-login.js";
@@ -1072,7 +1072,13 @@ program
 const entryPath = process.argv[1]
   ? await fs.realpath(process.argv[1]).catch(() => null)
   : null;
-if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
+const modulePath = await fs.realpath(fileURLToPath(import.meta.url)).catch(() => null);
+// npm's Windows shim can use a short path or differently cased path. Compare
+// canonical filesystem paths rather than independently encoded file URLs.
+const isEntryPoint = entryPath && modulePath && (process.platform === "win32"
+  ? entryPath.toLowerCase() === modulePath.toLowerCase()
+  : entryPath === modulePath);
+if (isEntryPoint) {
   await program.parseAsync().catch((error) => {
     // Expected, actionable failures carry a plain message instead of a stack
     // trace (e.g. the provider's Chrome profile is locked by another session).
