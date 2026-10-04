@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "kind": "offline-scripted-runtime-demo",
+  "liveProvider": false,
+  "actualLocalTools": true,
+  "task": "Fix slugify so repeated spaces become one hyphen. Run the tests.",
+  "baseline": {
+    "exitCode": 1,
+    "passed": 2,
+    "failed": 1
+  },
+  "verified": {
+    "exitCode": 0,
+    "passed": 3,
+    "failed": 0
+  },
+  "runtimeToolCompletions": 5,
+  "steps": [
+    {
+      "name": "fs.read",
+      "label": "Read src/slugify.js"
+    },
+    {
+      "name": "terminal.exec",
+      "label": "Reproduce the failing test"
+    },
+    {
+      "name": "fs.edit",
+      "label": "Normalize repeated whitespace"
+    },
+    {
+      "name": "terminal.exec",
+      "label": "Rerun all three tests"
+    },
+    {
+      "name": "fs.read",
+      "label": "Read back the modified file"
+    }
+  ],
+  "source": {
+    "path": "src/slugify.js",
+    "before": "export function slugify(value) {\n  return value.trim().toLowerCase().replace(\" \", \"-\");\n}\n",
+    "after": "export function slugify(value) {\n  return value.trim().toLowerCase().replace(/\\s+/g, \"-\");\n}\n"
+  },
+  "disclosure": "Offline scripted AI replies; real local tools. Not an online recording or speed benchmark."
+}

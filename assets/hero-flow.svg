@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 590" role="img" aria-labelledby="title desc">
+  <title id="title">WTAgent connects web AI to local tools</title>
+  <desc id="desc">A browser on the left, WTAgent in the center, and a local project with files and commands on the right.</desc>
+  <defs>
+    <filter id="rough" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence baseFrequency="0.015" numOctaves="2" seed="7" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.25"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#151516"/>
+    </marker>
+  </defs>
+
+  <path d="M64 489 C181 564 471 574 629 474" fill="none" stroke="#d7d0c1" stroke-width="3" stroke-linecap="round" stroke-dasharray="5 13"/>
+
+  <g filter="url(#rough)">
+    <path d="M33 91 C86 76 211 76 260 94 C270 170 269 319 252 389 C188 404 91 402 36 386 C23 302 21 170 33 91Z" fill="#fbf9f4" stroke="#151516" stroke-width="3"/>
+    <path d="M30 132 C89 124 201 125 262 135" fill="none" stroke="#151516" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="51" cy="111" r="5" fill="#ff8c73" stroke="#151516" stroke-width="1.5"/>
+    <circle cx="69" cy="110" r="5" fill="#ffd76a" stroke="#151516" stroke-width="1.5"/>
+    <circle cx="87" cy="110" r="5" fill="#72d69b" stroke="#151516" stroke-width="1.5"/>
+    <path d="M110 106 C142 101 207 102 230 108" fill="none" stroke="#aaa395" stroke-width="5" stroke-linecap="round"/>
+
+    <path d="M64 169 C94 156 190 156 224 168 C231 193 230 234 219 255 C174 265 100 263 67 252 C56 229 56 190 64 169Z" fill="#d8ceff" stroke="#151516" stroke-width="2.5"/>
+    <circle cx="91" cy="191" r="10" fill="#6947ed"/>
+    <path d="M113 185 H197 M113 200 H174" stroke="#151516" stroke-width="5" stroke-linecap="round" opacity=".74"/>
+    <path d="M80 224 C113 217 172 217 207 225" stroke="#716a5d" stroke-width="4" stroke-linecap="round"/>
+    <path d="M80 239 H162" stroke="#716a5d" stroke-width="4" stroke-linecap="round"/>
+
+    <path d="M80 298 C107 283 175 281 213 294 C223 316 221 347 210 362 C164 371 106 370 76 359 C67 340 68 315 80 298Z" fill="#fff" stroke="#151516" stroke-width="2.5"/>
+    <path d="M91 316 H189 M91 333 H173" stroke="#8c877d" stroke-width="4" stroke-linecap="round"/>
+    <path d="M91 349 H145" stroke="#8c877d" stroke-width="4" stroke-linecap="round"/>
+
+    <path d="M261 236 C296 224 320 226 347 239" fill="none" stroke="#151516" stroke-width="3" stroke-linecap="round" marker-end="url(#arrow)"/>
+    <path d="M349 282 C321 294 292 294 264 283" fill="none" stroke="#151516" stroke-width="2" stroke-linecap="round" stroke-dasharray="5 8" marker-end="url(#arrow)"/>
+
+    <path d="M358 176 C391 162 440 166 465 187 C480 222 476 302 458 335 C423 351 380 346 355 326 C339 286 340 215 358 176Z" fill="#ffd76a" stroke="#151516" stroke-width="3"/>
+    <path d="M371 203 C395 194 426 194 449 205" fill="none" stroke="#151516" stroke-width="2" stroke-linecap="round"/>
+    <text x="409" y="248" text-anchor="middle" font-family="ui-monospace,monospace" font-size="19" font-weight="800" fill="#151516">WTAgent</text>
+    <path d="M376 269 H443 M386 288 H433 M397 307 H421" stroke="#151516" stroke-width="4" stroke-linecap="round" opacity=".65"/>
+
+    <path d="M472 235 C497 221 518 220 542 232" fill="none" stroke="#151516" stroke-width="3" stroke-linecap="round" marker-end="url(#arrow)"/>
+    <path d="M542 283 C516 297 495 296 473 285" fill="none" stroke="#151516" stroke-width="2" stroke-linecap="round" stroke-dasharray="5 8" marker-end="url(#arrow)"/>
+
+    <path d="M548 111 C589 97 644 104 674 126 C681 203 679 340 665 398 C628 412 578 407 545 388 C534 308 534 182 548 111Z" fill="#bff2d4" stroke="#151516" stroke-width="3"/>
+    <path d="M546 160 C585 150 639 153 675 163" fill="none" stroke="#151516" stroke-width="2.5"/>
+    <text x="610" y="138" text-anchor="middle" font-family="ui-sans-serif,sans-serif" font-size="14" font-weight="800" fill="#151516">LOCAL PROJECT</text>
+
+    <path d="M569 186 H645 V246 H569Z" fill="#fbf9f4" stroke="#151516" stroke-width="2"/>
+    <path d="M583 204 H631 M583 218 H618 M583 232 H626" stroke="#6c685f" stroke-width="4" stroke-linecap="round"/>
+    <path d="M563 277 C586 267 638 269 655 282 C660 307 657 342 649 358 C625 369 584 367 565 357 C557 335 556 299 563 277Z" fill="#17171d" stroke="#151516" stroke-width="2.5"/>
+    <path d="M575 296 L586 306 L575 316 M593 318 H626" fill="none" stroke="#bff2d4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M333 381 C371 403 445 404 488 382" fill="none" stroke="#6947ed" stroke-width="3" stroke-linecap="round" stroke-dasharray="5 9"/>
+    <path d="M397 418 C420 409 455 413 469 428 C472 449 468 474 459 488 C438 497 411 493 397 481 C390 462 389 438 397 418Z" fill="#ff8c73" stroke="#151516" stroke-width="2.5"/>
+    <path d="M413 447 L426 459 L451 434" fill="none" stroke="#151516" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <text x="198" y="63" text-anchor="middle" font-family="Comic Sans MS,Bradley Hand,cursive" font-size="15" fill="#625c50" transform="rotate(-3 198 63)">your signed-in web AI</text>
+  <path d="M176 69 C153 79 139 82 119 87" fill="none" stroke="#625c50" stroke-width="1.8" stroke-linecap="round" marker-end="url(#arrow)"/>
+  <text x="309" y="214" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#625c50">tool call</text>
+  <text x="508" y="214" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" fill="#625c50">validated</text>
+  <text x="432" y="515" text-anchor="middle" font-family="Comic Sans MS,Bradley Hand,cursive" font-size="14" fill="#625c50" transform="rotate(2 432 515)">policy checks stay local</text>
+  <path d="M486 506 C507 491 517 471 518 447" fill="none" stroke="#625c50" stroke-width="1.8" stroke-linecap="round" marker-end="url(#arrow)"/>
+</svg>
