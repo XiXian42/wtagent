@@ -143,6 +143,7 @@ test("installLatest uses the official registry and treats a zero exit as success
       "-g",
       "wtagent@latest",
       "--registry=https://registry.npmjs.org/",
+      "--ignore-scripts",
     ],
   }]);
 });
@@ -218,7 +219,7 @@ test("wtagent update prints a manual command when the check or install fails", a
   assert.equal(offline.status, "error");
   assert.match(
     errors.join("\n"),
-    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\//,
+    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\/ --ignore-scripts/,
   );
 
   errors.length = 0;
@@ -233,6 +234,6 @@ test("wtagent update prints a manual command when the check or install fails", a
   assert.match(errors.join("\n"), /Update failed/);
   assert.match(
     errors.join("\n"),
-    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\//,
+    /npm install -g wtagent@latest --registry=https:\/\/registry\.npmjs\.org\/ --ignore-scripts/,
   );
 });
