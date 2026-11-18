@@ -3,13 +3,15 @@
 const legacyUser = '[data-message-author-role="user"]';
 const legacyAssistant = '[data-message-author-role="assistant"]:not([id^="request-placeholder-"])';
 const modern = (role) => `[data-chatgpt-search-unit-key$=":${role}"]:not([id^="request-placeholder-"]):not(:has([data-message-author-role])):not([data-message-author-role] *)`;
+const guest = (role) => `ol[data-conversation-transcript] > li[data-message-role="${role}"]`;
 export const CHATGPT_DOM = {
-  user: { legacy: legacyUser, modern: modern("user") },
-  assistant: { legacy: legacyAssistant, modern: modern("assistant") },
+  user: { legacy: legacyUser, modern: modern("user"), guest: guest("user") },
+  assistant: { legacy: legacyAssistant, modern: modern("assistant"), guest: guest("assistant") },
   conversationLegacy: '[data-message-author-role="user"], [data-message-author-role="assistant"]',
   composers: [
     { name: "prompt-textarea", selector: "#prompt-textarea" },
     { name: "markdown-composer", selector: '[data-composer-markdown][contenteditable="true"][role="textbox"]' },
+    { name: "guest-composer", selector: "form[data-mobile-composer] textarea[data-mobile-composer-prompt]" },
     { name: "message-textarea-en", selector: 'textarea[placeholder*="Message" i]' },
     { name: "message-textarea-zh", selector: 'textarea[placeholder*="消息"]' },
     { name: "lexical-composer", selector: 'div[contenteditable="true"][data-lexical-editor="true"]' },
@@ -17,10 +19,13 @@ export const CHATGPT_DOM = {
   ],
   send: '[data-testid="send-button"]',
   sendModern: 'form[data-chatgpt-composer] button[type="submit"]',
+  sendGuest: 'form[data-mobile-composer] button[data-composer-submit][type="submit"]',
   stop: '[data-testid="stop-button"]',
   expandUserMessage: '[data-user-message-bubble] button[aria-expanded="false"][data-thread-find-skip="true"][data-markdown-copy="exclude"]',
 };
-CHATGPT_DOM.messages = [legacyUser, legacyAssistant, modern("user"), modern("assistant")].join(", ");
+CHATGPT_DOM.messages = [
+  ...Object.values(CHATGPT_DOM.user), ...Object.values(CHATGPT_DOM.assistant),
+].join(", ");
 
 // This function is serialized into the page. Keep it self-contained, and pass
 // the registry explicitly when requesting a capability sample.
@@ -30,28 +35,61 @@ export function readChatGPTDom(input) {
     ? [...document.querySelectorAll(options?.selector ?? input)]
     : Array.isArray(input) ? input : [input];
   const structure = { legacy: 0, modern: 0, unknown: 0, ambiguousIds: 0 };
+  const guestTurns = new Map();
+  const turnKeySelector = "[data-content-search-turn-key]";
+  const fallbackSearchKey = /^fallback-turn-(\d+):(\d+):(user|assistant)$/;
+  const uuidSearchKey = /^([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}):\d+:(user|assistant)$/i;
+  let turnGroupIndexes = null;
+  const readSearchUnit = (element) => {
+    const key = element.getAttribute("data-chatgpt-search-unit-key") ?? "";
+    const fallback = key.match(fallbackSearchKey);
+    if (fallback) return { group: Number(fallback[1]), role: fallback[3] };
+    const uuid = key.match(uuidSearchKey);
+    if (!uuid) return null;
+    const group = element.closest(turnKeySelector);
+    if (group?.getAttribute("data-content-search-turn-key") !== uuid[1]) return null;
+    // The UUID identifies the group but does not encode its position. Use the
+    // ordered turn wrappers, including wrappers without a mounted reply.
+    turnGroupIndexes ??= new Map([...document.querySelectorAll(turnKeySelector)]
+      .map((wrapper, index) => [wrapper, index]));
+    const index = turnGroupIndexes.get(group);
+    return index == null ? null : { group: index, role: uuid[2] };
+  };
   const entries = elements.map((element, domIndex) => {
     const legacyRole = element.getAttribute("data-message-author-role");
-    const key = element.getAttribute("data-chatgpt-search-unit-key") ?? "";
-    const modern = key.match(/^fallback-turn-(\d+):(\d+):(user|assistant)$/);
-    const role = legacyRole ?? modern?.[3] ?? null;
-    structure[legacyRole ? "legacy" : modern ? "modern" : "unknown"] += 1;
+    const modern = readSearchUnit(element);
+    const guestRole = element.getAttribute("data-message-role");
+    const guestList = guestRole && element.matches("ol[data-conversation-transcript] > li[data-message-role]")
+      ? element.parentElement : null;
+    const role = legacyRole ?? modern?.role ?? (guestList ? guestRole : null);
+    const layout = legacyRole ? "legacy" : modern ? "modern" : guestList ? "guest" : "unknown";
+    structure[layout] = (structure[layout] ?? 0) + 1;
     const wrapper = element.closest('[data-testid^="conversation-turn-"]');
     const legacyTurn = wrapper?.getAttribute("data-testid")?.match(/^conversation-turn-(\d+)$/);
     const messageIds = [...new Set((element.getAttribute("data-chatgpt-search-message-ids") ?? "").split(/\s+/).filter(Boolean))];
     const legacyId = element.getAttribute("data-message-id");
     if (legacyId == null && messageIds.length > 1) structure.ambiguousIds += 1;
-    const id = legacyId ?? (messageIds.length === 1 ? messageIds[0] : null);
+    const guestId = guestList ? element.id || null : null;
+    const id = legacyId ?? (messageIds.length === 1 ? messageIds[0] : guestId);
     // Thinking/tool blocks occupy positions too. Only the group and role define
     // turn order; duplicate roles within a group are rejected by validation.
+    if (guestList && !guestTurns.has(guestList)) {
+      const rows = guestList.querySelectorAll(":scope > li[data-message-role]");
+      guestTurns.set(guestList, new Map([...rows].map((row, index) => [row, index + 1])));
+    }
     const turn = legacyTurn ? Number(legacyTurn[1])
-      : modern ? Number(modern[1]) * 2 + (role === "user" ? 1 : 2) : null;
-    let renderedText = element.innerText ?? element.textContent ?? "";
+      : modern ? modern.group * 2 + (role === "user" ? 1 : 2)
+        : guestTurns.get(guestList)?.get(element) ?? null;
+    const content = guestList
+      ? element.querySelector(role === "assistant" ? "[data-assistant-markdown-root]" : "[data-user-message-copy]")
+      : null;
+    const rendered = content ?? element;
+    let renderedText = rendered.innerText ?? rendered.textContent ?? "";
     if (role === "assistant" && !renderedText.includes("<agent_response")) {
       const codeTexts = [...element.querySelectorAll("pre code")].map((node) => node.innerText ?? node.textContent ?? "");
       const envelope = codeTexts.find((text) => text.includes("<agent_response") && text.includes("</agent_response>"))
         ?? codeTexts.find((text) => text.includes("<agent_response"));
-      const markdown = [...element.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]')].at(-1);
+      const markdown = [...element.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"], [data-assistant-markdown-root]')].at(-1);
       if (envelope) renderedText = envelope;
       else if (markdown) renderedText = markdown.innerText ?? markdown.textContent ?? "";
     }
@@ -63,7 +101,7 @@ export function readChatGPTDom(input) {
       && getComputedStyle(element).visibility !== "hidden";
     const count = (selector) => [...document.querySelectorAll(selector)].filter(visible).length;
     const sendControls = [...document.querySelectorAll(
-      [options.registry.send, options.registry.sendModern].filter(Boolean).join(', '),
+      [options.registry.send, options.registry.sendModern, options.registry.sendGuest].filter(Boolean).join(', '),
     )].filter(visible);
     snapshot.capabilities = {
       readyState: document.readyState,
@@ -76,9 +114,9 @@ export function readChatGPTDom(input) {
       )),
       stopButton: count(options.registry.stop) > 0,
       placeholderCount: document.querySelectorAll('[id^="request-placeholder-"]').length,
-      // Unknown suffixes are evidence of a renderer change, not valid messages.
+      // Unrecognized search keys are evidence of a renderer change.
       unknownSearchUnits: [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
-        .filter((element) => !/^fallback-turn-\d+:\d+:(user|assistant)$/.test(element.getAttribute("data-chatgpt-search-unit-key"))).length,
+        .filter((element) => !readSearchUnit(element)).length,
     };
   }
   return snapshot;
@@ -119,7 +157,7 @@ function parseConversationTurn(value) {
 }
 
 export async function readChatGPTMessageIdentity(message) {
-  if (await message.getAttribute("data-chatgpt-search-unit-key").catch(() => null)) {
+  if (await usesStructuredRow(message)) {
     const snapshot = await message.evaluate(readChatGPTDom).catch(() => null);
     const entry = snapshot?.entries?.[0];
     if (!entry || !["user", "assistant"].includes(entry.role)
@@ -148,7 +186,7 @@ async function readLegacyTurn(message) {
 
 
 export async function readChatGPTAssistantText(message, hasCompleteAgentEnvelope) {
-  if (await message.getAttribute("data-chatgpt-search-unit-key").catch(() => null)) {
+  if (await usesStructuredRow(message)) {
     const snapshot = await message.evaluate(readChatGPTDom).catch(() => null);
     return snapshot?.entries?.[0]?.renderedText ?? "";
   }
@@ -186,4 +224,11 @@ export async function readChatGPTAssistantText(message, hasCompleteAgentEnvelope
     return await markdown.last().innerText().catch(() => "");
   }
   return fullText;
+}
+
+async function usesStructuredRow(message) {
+  return Boolean(
+    await message.getAttribute("data-chatgpt-search-unit-key").catch(() => null)
+    || await message.getAttribute("data-message-role").catch(() => null)
+  );
 }

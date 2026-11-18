@@ -54,6 +54,21 @@ test("uses Grok stop-response button as generation signal", async () => {
   assert.equal(adapter.hasReliableCompletionSignal(), true);
 });
 
+test("detects a visible Grok guest sign-up gate", async () => {
+  const adapter = new GrokWebAdapter({ profileDir: "." });
+  const card = new EmptyLocator();
+  card.count = async () => 1;
+  adapter.page = {
+    locator(selector) {
+      assert.equal(selector, '[data-testid="anon-paywall-sign-up-card"]');
+      return card;
+    },
+  };
+  assert.equal(await adapter.isGuestAccessBlocked(), false);
+  card.isVisible = async () => true;
+  assert.equal(await adapter.isGuestAccessBlocked(), true);
+});
+
 test("uses Grok response wrapper UUID as a stable message identity", async () => {
   const adapter = new GrokWebAdapter({ profileDir: "." });
   const message = new EmptyLocator();

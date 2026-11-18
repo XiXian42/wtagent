@@ -158,6 +158,8 @@ export class AgentRuntime {
     approval,
     onEvent,
     postAuthSetup = null,
+    chooseLogin = null,
+    preferGuest = false,
     nativeImageReceiver = null,
     nativeMusicReceiver = null,
     limits = DEFAULT_LIMITS,
@@ -169,6 +171,8 @@ export class AgentRuntime {
     this.approval = approval;
     this.onEvent = onEvent;
     this.postAuthSetup = postAuthSetup;
+    this.chooseLogin = chooseLogin;
+    this.preferGuest = preferGuest;
     this.nativeImageReceiver = nativeImageReceiver;
     this.nativeMusicReceiver = nativeMusicReceiver;
     this.limits = limits;
@@ -1114,16 +1118,38 @@ export class AgentRuntime {
     });
 
     let authState = await this.adapter.getAuthState();
-    if (authState !== "authenticated") {
+    let guestAvailable = false;
+    if (authState !== "authenticated" && this.preferGuest && !this.nativeMusicReceiver) {
+      guestAvailable = Boolean(await this.adapter.canUseGuest?.());
+    }
+    if (authState !== "authenticated" && !guestAvailable) {
       try {
         await this.adapter.waitForManualLogin({ timeoutMs: 8_000 });
         authState = "authenticated";
-      } catch {
+      } catch (error) {
+        if (error?.code !== "LOGIN_TIMEOUT") throw error;
         // A signed-in ChatGPT page can briefly render its guest shell. Only
         // prompt the user after a short grace period fails.
       }
     }
+    let usingGuest = false;
     if (authState !== "authenticated") {
+      guestAvailable ||= !this.nativeMusicReceiver && Boolean(await this.adapter.canUseGuest?.());
+      const choice = this.chooseLogin ? await this.chooseLogin({ guestAvailable }) : "login";
+      if (choice === "guest" && !guestAvailable) {
+        throw new BrowserAdapterError(
+          `${this.adapter.providerName} does not expose a guest composer for this request. Sign in to continue.`,
+          { code: "GUEST_UNAVAILABLE" },
+        );
+      }
+      if (choice !== "login" && choice !== "guest") {
+        throw new BrowserAdapterError("Turn cancelled by user.", { code: "TURN_CANCELLED" });
+      }
+      usingGuest = choice === "guest";
+    }
+    if (usingGuest) {
+      await this.emit("browser.guest");
+    } else if (authState !== "authenticated") {
       await this.session.update({ phase: "auth_required" });
       await this.emit("browser.auth_required");
       // The window may be minimized; bring it forward so the user can log in,
@@ -1228,7 +1254,7 @@ export class AgentRuntime {
     // Existing conversations keep their model context. A verified fresh rebuild
     // is a genuinely new web chat, so interactive runs offer the same browser-side
     // model choice as an ordinary bootstrap.
-    if (restoration.status === "verified-fresh" && this.postAuthSetup) {
+    if (!usingGuest && restoration.status === "verified-fresh" && this.postAuthSetup) {
       await this.postAuthSetup({ adapter: this.adapter });
       // Browser-side setup is user-controlled and can navigate the tab. Reopen
       // and re-verify an empty chat after it returns so the bootstrap can never

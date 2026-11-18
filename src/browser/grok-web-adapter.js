@@ -72,6 +72,12 @@ export class GrokWebAdapter extends BaseWebAdapter {
     return /sign in to grok|log in to grok|continue with x|continue with google|登录 Grok|登入 Grok/i;
   }
 
+  async isGuestAccessBlocked() {
+    return Boolean(await firstVisible([
+      this.page.locator('[data-testid="anon-paywall-sign-up-card"]'),
+    ]));
+  }
+
   assistantMessages() {
     return this.page.locator('[data-testid="assistant-message"]');
   }

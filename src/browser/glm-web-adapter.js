@@ -4,6 +4,7 @@ import { isUsageLimitNotice } from "../shared/usage-limit.js";
 export { isConnectionLostError } from "./base-web-adapter.js";
 
 const GLM_URL = "https://chat.z.ai/";
+const GLM_CHINA_URL = "https://zchat.z.ai/";
 
 // GLM / Z.ai (chat.z.ai) adapter.
 //
@@ -28,6 +29,33 @@ export class GLMWebAdapter extends BaseWebAdapter {
       baseUrl: options.baseUrl ?? GLM_URL,
       providerName: "GLM",
     });
+  }
+
+  async launch(preferredUrl = null, options = {}) {
+    const starting = !this.context;
+    if (starting && this.baseUrl === GLM_URL && String(preferredUrl ?? "").startsWith(`${GLM_CHINA_URL}c/`)) {
+      this.baseUrl = GLM_CHINA_URL;
+    }
+    await super.launch(preferredUrl, options);
+    if (!starting || preferredUrl || this.baseUrl !== GLM_URL) return;
+
+    const current = new URL(this.page.url());
+    if (current.origin === new URL(GLM_CHINA_URL).origin && current.pathname === "/") {
+      this.baseUrl = GLM_CHINA_URL;
+      return;
+    }
+    if (current.origin !== new URL(GLM_URL).origin || current.pathname !== "/") return;
+
+    // The global page can route a signed-out visitor to the China site on
+    // Send. Follow its explicit regional link before filling any prompt.
+    const regionalLink = this.page.locator(
+      'a[href="https://zchat.z.ai/"]:visible, a[href="https://zchat.z.ai"]:visible',
+    ).first();
+    const recommendsRegion = await regionalLink.waitFor({ state: "visible", timeout: 3_500 })
+      .then(() => true, () => false);
+    if (!recommendsRegion || await this.getAuthState() === "authenticated") return;
+    await this.page.goto(GLM_CHINA_URL, { waitUntil: "domcontentloaded" });
+    this.baseUrl = GLM_CHINA_URL;
   }
 
   conversationUrlPattern() {

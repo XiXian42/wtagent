@@ -116,6 +116,9 @@ test("exposes Kimi's base URL and conversation URL pattern", () => {
   assert.equal(adapter.baseUrl, "https://www.kimi.com/");
   assert.ok(adapter.conversationUrlPattern().test("/chat/1a00f5ca-uuid"));
   assert.equal(adapter.conversationUrlPattern().test("/"), false);
+  assert.equal(adapter.classifyConversationUrl("https://www.kimi.com/chat/pc71f8cd6b7a4d9"), "provisional");
+  assert.equal(adapter.classifyConversationUrl("https://www.kimi.com/chat/68d6044d-0447-4b0a-a770-d885afb3a351"), "restorable");
+  assert.equal(adapter.classifyConversationUrl("https://example.com/chat/pc71f8cd6b7a4d9"), "invalid");
 });
 
 test("reads a stable per-message id from data-archer-id", async () => {

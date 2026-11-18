@@ -275,6 +275,9 @@ export class Renderer {
           `${GREEN}${t("renderer.loginDetected", { provider: this.providerLabel })}${RESET}`,
         );
         break;
+      case "browser.guest":
+        this.status(t("renderer.guest", { provider: this.providerLabel }));
+        break;
       case "conversation.started":
         if (this.lifecycleShown.has(type)) {
           break;

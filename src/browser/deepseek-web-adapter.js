@@ -1,4 +1,4 @@
-import { BaseWebAdapter, firstVisible } from "./base-web-adapter.js";
+import { BaseWebAdapter, firstVisible, readRenderedOutboundCorrelationId } from "./base-web-adapter.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
 
 export { isConnectionLostError } from "./base-web-adapter.js";
@@ -13,8 +13,7 @@ const DEEPSEEK_URL = "https://chat.deepseek.com/";
 //   - a single composer: textarea[name="search"] (placeholder "给 DeepSeek 发送消息")
 //   - design-system classes prefixed `ds-`: `.ds-message` wraps each turn, and
 //     assistant turns additionally contain `.ds-assistant-message-main-content`
-//   - a virtualized message list whose row wrappers carry a monotonic
-//     `data-virtual-list-item-key` — used as the per-message turn ordinal
+//   - a virtualized message list whose rows carry `data-virtual-list-item-key`
 //   - a live conversation URL of the form /a/chat/s/<uuid>
 // There is no labeled send button (an unlabeled icon control), so sending
 // relies on the base adapter's Enter fallback; likewise there is no labeled
@@ -131,11 +130,8 @@ export class DeepSeekWebAdapter extends BaseWebAdapter {
   // ordinal, and a reply is "new" once the assistant-row count grows beyond the
   // baseline captured at send time.
   //
-  // messageIdentity is called for both assistant rows (turn-completion loop) and
-  // user rows (#waitForSentUserMessage). It returns a role-scoped ordinal: the
-  // number of rows of the SAME role at or before this one. For the loop's
-  // `.last()` assistant row that is the total assistant count; for a freshly
-  // appended user row it exceeds the user baseline, so the send is detected.
+  // For user rows, a verified transport marker also identifies the specific
+  // send when DeepSeek replaces an older row and the visible count stays flat.
   async messageIdentity(message) {
     const isAssistant = await message
       .locator(".ds-assistant-message-main-content, .ds-think-content")
@@ -143,7 +139,19 @@ export class DeepSeekWebAdapter extends BaseWebAdapter {
       .catch(() => 0) > 0;
     const scope = isAssistant ? this.assistantMessages() : this.userMessages();
     const turn = await scope.count().catch(() => 0);
-    return { id: null, turn };
+    const id = isAssistant ? null : readRenderedOutboundCorrelationId(await this.userMessageText(message));
+    return { id, turn };
+  }
+
+  async userMessageSnapshot() {
+    const messages = this.userMessages();
+    if (typeof messages.allInnerTexts !== "function") return super.userMessageSnapshot();
+    const texts = await messages.allInnerTexts().catch(() => null);
+    return texts?.map((renderedText, index) => ({
+      id: readRenderedOutboundCorrelationId(renderedText),
+      turn: index + 1,
+      renderedText,
+    })) ?? null;
   }
 
   // A reply is genuinely new once the assistant-row count exceeds what existed

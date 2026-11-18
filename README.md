@@ -112,7 +112,7 @@ native image output.
 
 ### Conversation recovery and diagnostics
 
-The ChatGPT adapter supports legacy and modern message layouts, temporary
+The ChatGPT adapter supports signed-in and guest message layouts, temporary
 conversation URLs, and virtualized history. When a send cannot be verified,
 WTAgent preserves the session for recovery. Structural failure reports identify
 the recognized page layout, missing identity fields, and send stage; the CLI
@@ -125,12 +125,23 @@ layout. A click failure does not trigger a second submission through Enter.
 Structural reports also record whether Send is enabled and a draft is present,
 without including the draft text.
 
+The resume command printed by WTAgent carries forward explicit home, profile,
+and Chrome executable paths.
+
 Claude keeps the model selected by claude.ai in its browser profile; WTAgent does not override it.
 Gemini likewise keeps the model selected in its browser profile.
 
-If the provider is not signed in, WTAgent opens its dedicated Chrome profile and asks you to sign in. Each provider has an independent profile, and your task continues automatically after login.
+When the provider is signed out, WTAgent offers to sign in, continue as a guest,
+or cancel. Pass `--guest` to skip the prompt. A run without an interactive
+terminal tries guest access automatically. Guest features depend on the
+provider. ChatGPT guest chats can continue in the open tab, and signing in lets
+you save the conversation on the website.
 
-WTAgent itself does not require an API key. It uses your own web account, available models, and quota.
+When GLM's signed-out global homepage recommends the China site, WTAgent opens
+it before composing the first prompt. Resuming a saved GLM chat uses its
+original site.
+
+WTAgent runs without an API key. The provider and your sign-in state determine the available models and quota.
 
 You can also provide the first task directly:
 
@@ -232,18 +243,22 @@ wtagent --model gemini --type music --once "生成一段舒缓钢琴纯音乐，
 
 ### 会话恢复与兼容诊断
 
-ChatGPT 适配器支持新旧消息结构、临时会话地址和只保留部分消息节点的长对话。无法确认发送结果时，会保留会话供恢复。结构化诊断会记录识别到的页面结构、缺失的消息身份字段和发送阶段；启动、发送确认或恢复失败时，终端会显示诊断文件路径。
+ChatGPT 适配器支持登录与游客模式的消息结构、临时会话地址和只保留部分消息节点的长对话。无法确认发送结果时，会保留会话供恢复。结构化诊断会记录识别到的页面结构、缺失的消息身份字段和发送阶段；启动、发送确认或恢复失败时，终端会显示诊断文件路径。
 
 ChatGPT 折叠长消息并截断页面文本时，WTAgent 会先展开最新的用户消息，再核对发送标记。恢复时会校验已有回复，不会自动重发提交状态不明的消息。
 
 发送时会等待发送按钮可用，并兼容新版 ChatGPT 输入框。点击失败后不会再补按 Enter 提交。结构化诊断还会记录发送按钮是否可用、输入框是否有草稿，不包含草稿内容。
 
+终端显示的续聊命令会保留显式指定的数据目录、Chrome 配置目录和 Chrome 可执行文件路径。
+
 Claude 会沿用 claude.ai 在该浏览器 Profile 中选择的模型，WTAgent 不会自动切换模型。
 Gemini 同样沿用其浏览器 Profile 当前选择的模型。
 
-如果尚未登录对应 provider，WTAgent 会打开它的独立专用 Chrome Profile 并提示登录；登录成功后任务会自动继续。
+如果网页尚未登录，WTAgent 会让你选择登录、以游客身份继续或取消。传入 `--guest` 可以跳过选择。没有交互终端时会自动尝试游客模式。可用功能由各网站决定。ChatGPT 游客对话可以在当前标签页继续，登录后可在网站保存会话。
 
-WTAgent 本身无需 API Key，而是使用你自己的网页账号、可用模型和额度。
+GLM 国际站在未登录时若推荐中国站，WTAgent 会先打开中国站，再填写第一条提示词。续聊时会使用原会话所在的站点。
+
+WTAgent 无需 API Key。可用模型和额度由网站及当前登录状态决定。
 
 也可以在启动时直接附带第一个任务：
 

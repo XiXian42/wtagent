@@ -95,7 +95,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
   // ---- provider primitives ----------------------------------------------
 
   conversationUrlPattern() {
-    return /^\/c\//;
+    return /^\/(?:c|uc)\//;
   }
 
   classifyConversationUrl(value) {
@@ -104,7 +104,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
       return kind;
     }
     const parsed = value instanceof URL ? value : new URL(value);
-    return /^\/c\/(?:WEB:|local-chatgpt(?::|%3[aA]))/.test(parsed.pathname)
+    return /^(?:\/uc\/|\/c\/(?:WEB:|local-chatgpt(?::|%3[aA])))/.test(parsed.pathname)
       ? "provisional"
       : "restorable";
   }
@@ -163,6 +163,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     return [
       this.page.locator(CHATGPT_DOM.send),
       this.page.locator(CHATGPT_DOM.sendModern),
+      this.page.locator(CHATGPT_DOM.sendGuest),
       this.page.getByRole("button", { name: /^(send|发送|傳送|送信|보내기|enviar|envoyer|senden)$/i }),
     ];
   }
@@ -243,12 +244,12 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
     // burned through the protocol-error retry loop; the turn instead sees "no
     // reply" and recovers with the continuation nudge.
     const legacy = this.page.locator(CHATGPT_DOM.assistant.legacy);
-    return legacy.or ? legacy.or(this.page.locator(CHATGPT_DOM.assistant.modern)) : legacy;
+    return legacy.or ? legacy.or(this.page.locator(`${CHATGPT_DOM.assistant.modern}, ${CHATGPT_DOM.assistant.guest}`)) : legacy;
   }
 
   userMessages() {
     const legacy = this.page.locator(CHATGPT_DOM.user.legacy);
-    return legacy.or ? legacy.or(this.page.locator(CHATGPT_DOM.user.modern)) : legacy;
+    return legacy.or ? legacy.or(this.page.locator(`${CHATGPT_DOM.user.modern}, ${CHATGPT_DOM.user.guest}`)) : legacy;
   }
 
   async userMessageSnapshot() {
@@ -283,7 +284,7 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
 
   conversationMessages() {
     const legacy = this.page.locator(CHATGPT_DOM.conversationLegacy);
-    return legacy.or ? legacy.or(this.page.locator(`${CHATGPT_DOM.user.modern}, ${CHATGPT_DOM.assistant.modern}`)) : legacy;
+    return legacy.or ? legacy.or(this.page.locator(CHATGPT_DOM.messages)) : legacy;
   }
 
   requiresOrderedConversationSnapshotForFreshSend() {
@@ -1003,6 +1004,13 @@ export class ChatGPTWebAdapter extends BaseWebAdapter {
 
   async assistantText(message) {
     return readChatGPTAssistantText(message, hasCompleteAgentEnvelope);
+  }
+
+  async isAssistantGenerating(message) {
+    if (this.page?.url?.().startsWith(new URL("/uc/", this.baseUrl).href)) {
+      return await message.getAttribute("data-message-complete").catch(() => null) === null;
+    }
+    return false;
   }
 
   // A plan/usage limit renders as an error card: error-tinted token classes

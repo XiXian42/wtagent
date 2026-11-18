@@ -249,6 +249,7 @@ class ConversationRunner {
     this.nativeImageReceiver = this.nativeMusicReceiver ? null : NativeImageReceiver.forAdapter(provider.id, this.adapter);
     this.interrupted = false;
     this.closed = false;
+    this.guestAccepted = options.guest === true;
   }
 
   #buildRuntime() {
@@ -263,6 +264,22 @@ class ConversationRunner {
       policy: new PolicyEngine({ store: this.approvalStore }),
       session: this.session,
       limits: this.limits,
+      preferGuest: this.guestAccepted,
+      chooseLogin: async () => {
+        if (this.guestAccepted) return "guest";
+        if (!process.stdin.isTTY || !process.stdout.isTTY) return "guest";
+        this.renderer.stopSpinner();
+        const choice = await promptForSelect({
+          message: t("login.choose", { provider: this.provider.label }),
+          choices: [
+            { name: t("login.chooseSignIn"), value: "login" },
+            { name: t("login.chooseGuest"), value: "guest" },
+            { name: t("login.chooseQuit"), value: "quit" },
+          ],
+        });
+        this.guestAccepted = choice === "guest";
+        return choice;
+      },
       postAuthSetup: (
         this.interactive
           ? async ({ adapter }) => {
@@ -512,7 +529,7 @@ export async function executeSession({
       // process.exit skips the finally block, so repeat the session/resume
       // hint here — the user should always know how to continue.
       console.log(t("session.savedAt", { directory: session.directory }));
-      printResumeHint(session.sessionId);
+      printResumeHint(session.sessionId, options);
       process.exit(130);
     }
     runner.interrupted = true;
@@ -644,26 +661,43 @@ export async function executeSession({
     }
     return null;
   } catch (error) {
-    runFailed = true;
+    runFailed = !["GUEST_UNAVAILABLE", "TURN_CANCELLED"].includes(error?.code);
     throw error;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     activeChatInput?.close();
     await runner.close({ keepBrowser: runFailed });
     console.log(t("session.savedAt", { directory: session.directory }));
-    printResumeHint(session.sessionId);
+    printResumeHint(session.sessionId, options);
   }
 }
 
 // A highly visible, blank-line-separated hint for continuing the conversation,
 // printed last so it is not lost in the run output (like Claude Code).
-function printResumeHint(sessionId) {
+function printResumeHint(sessionId, options) {
+  const args = [sessionId];
+  if (options.guest) args.push("--guest");
+  for (const [flag, value] of [
+    ["--home", options.home],
+    ["--profile-dir", options.profileDir],
+    ["--chrome-path", options.chromePath],
+  ]) {
+    if (value == null) continue;
+    args.push(flag, quoteResumePath(value));
+  }
   const rule = "─".repeat(48);
   console.log("");
   console.log(rule);
-  console.log(t("session.resumeWith", { sessionId }));
+  console.log(t("session.resumeWith", { sessionId: args.join(" ") }));
   console.log(rule);
   console.log("");
+}
+
+function quoteResumePath(value) {
+  const absolute = path.resolve(value);
+  if (process.platform !== "win32") return `'${absolute.replaceAll("'", "'\\''")}'`;
+  if (/[!%$`]/.test(absolute)) return `'${absolute.replaceAll("'", "''")}'`;
+  return `"${absolute.replace(/\\+$/, "$&$&")}"`;
 }
 
 // Reads the user's next message from the interactive prompt. Empty input simply
@@ -1004,6 +1038,7 @@ const program = new Command()
     }),
   )
   .option("--once", t("option.once"), false)
+  .option("--guest", t("option.guest"), false)
   .option("--type <type>", t("option.type"))
   .option("--model-turn-timeout-ms <milliseconds>", t("option.timeout"))
   .option("--no-minimize", t("option.noMinimize"))

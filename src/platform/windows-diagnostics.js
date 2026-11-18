@@ -327,10 +327,11 @@ export async function findExecutableOnPath(name, {
   reject = null,
 } = {}) {
   const finder = platform === "win32" ? "where.exe" : "which";
+  const args = platform !== "win32" && reject ? ["-a", name] : [name];
   try {
     const { stdout } = await execFileImpl(
       finder,
-      [name],
+      args,
       { maxBuffer: 1024 * 1024, windowsHide: true, env },
     );
     return stdout

@@ -125,12 +125,16 @@ test("findExecutableOnPath skips bundled Codex tool paths", async () => {
   const result = await findExecutableOnPath("rg", {
     platform: "linux",
     reject: (value) => value.includes("/@openai/codex/"),
-    execFileImpl: async () => ({
-      stdout: [
-        "/opt/homebrew/lib/node_modules/@openai/codex/vendor/rg",
-        "/usr/local/bin/rg",
-      ].join("\n"),
-    }),
+    execFileImpl: async (program, args) => {
+      assert.equal(program, "which");
+      assert.deepEqual(args, ["-a", "rg"]);
+      return {
+        stdout: [
+          "/opt/homebrew/lib/node_modules/@openai/codex/vendor/rg",
+          "/usr/local/bin/rg",
+        ].join("\n"),
+      };
+    },
   });
   assert.equal(result, "/usr/local/bin/rg");
 });

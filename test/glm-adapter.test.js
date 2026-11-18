@@ -88,6 +88,45 @@ test("exposes GLM's base URL and conversation URL pattern", () => {
   assert.equal(adapter.conversationUrlPattern().test("/"), false);
 });
 
+for (const [name, authenticated, linkVisible, preferredUrl, destinations] of [
+  ["opens the recommended China site before composing", false, true, null, ["https://chat.z.ai/", "https://zchat.z.ai/"]],
+  ["keeps an authenticated global session", true, true, null, ["https://chat.z.ai/"]],
+  ["keeps the global site when no regional link is visible", false, false, null, ["https://chat.z.ai/"]],
+  ["pins a saved China-site conversation before launch", false, false, "https://zchat.z.ai/c/conversation", ["https://zchat.z.ai/"]],
+]) {
+  test(`GLM ${name}`, async () => {
+    const adapter = new GLMWebAdapter({ profileDir: ".", chromePath: process.execPath });
+    const opened = [];
+    const page = {
+      url: () => opened.at(-1) ?? "about:blank",
+      async goto(url) { opened.push(url); },
+      setDefaultTimeout() {},
+      setDefaultNavigationTimeout() {},
+      locator(selector) {
+        assert.match(selector, /zchat\.z\.ai/);
+        return {
+          first() { return this; },
+          async waitFor() {
+            if (!linkVisible) throw new Error("regional link is hidden");
+          },
+        };
+      },
+    };
+    adapter.getAuthState = async () => authenticated ? "authenticated" : "unauthenticated";
+    adapter.launchCdpChrome = async (options) => {
+      assert.equal(options.preferredUrl, preferredUrl);
+      return { page, context: {} };
+    };
+    await adapter.launch(preferredUrl);
+    assert.deepEqual(opened, destinations);
+    assert.equal(adapter.baseUrl, destinations.at(-1));
+    assert.equal(adapter.classifyConversationUrl("https://other.example/c/conversation"), "invalid");
+    if (adapter.baseUrl === "https://zchat.z.ai/") {
+      assert.equal(adapter.classifyConversationUrl("https://chat.z.ai/c/conversation"), "invalid");
+    }
+  });
+}
+
 test("reads a stable per-message id from the message- element id", async () => {
   const adapter = new GLMWebAdapter({ profileDir: "." });
   const row = new GLMRow({ id: "abc-123", role: "assistant", text: "hi" });

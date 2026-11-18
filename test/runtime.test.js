@@ -619,7 +619,7 @@ test("restores the window for manual login, then re-minimizes", async (t) => {
     async waitForManualLogin() {
       this.loginCalls += 1;
       if (this.loginCalls === 1) {
-        throw new Error("still guest");
+        throw new BrowserAdapterError("still guest", { code: "LOGIN_TIMEOUT" });
       }
       // Second (real) call succeeds.
     }
@@ -646,6 +646,54 @@ test("restores the window for manual login, then re-minimizes", async (t) => {
 
   // The window is brought forward for login and sent back afterward.
   assert.deepEqual(adapter.windowStateCalls, ["restore", "minimize"]);
+});
+
+test("continues as a guest only when a composer is available and the user chooses it", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-guest-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  for (const [guestAvailable, choice, expectedError] of [
+    [true, "guest", null],
+    [false, "guest", "GUEST_UNAVAILABLE"],
+    [true, "quit", "TURN_CANCELLED"],
+  ]) {
+    const session = await TaskSession.create({
+      sessionsDir: path.join(root, "sessions"),
+      projectRoot: root,
+      task: "Guest request",
+    });
+    const adapter = new FakeWebModelAdapter([
+      "<agent_response><done>true</done><message>Guest reply</message></agent_response>",
+    ]);
+    adapter.getAuthState = async () => "unauthenticated";
+    adapter.canUseGuest = async () => guestAvailable;
+    adapter.waitForManualLogin = async ({ timeoutMs }) => {
+      assert.equal(timeoutMs, 8_000);
+      throw new BrowserAdapterError("Guest shell", { code: "LOGIN_TIMEOUT" });
+    };
+    const events = [];
+    const runtime = new AgentRuntime({
+      adapter,
+      session,
+      registry: createDefaultToolRegistry(),
+      policy: new PolicyEngine(),
+      approval: async () => false,
+      chooseLogin: async (options) => {
+        assert.equal(options.guestAvailable, guestAvailable);
+        return choice;
+      },
+      postAuthSetup: async () => assert.fail("guest should skip account model selection"),
+      onEvent: (event) => events.push(event.type),
+    });
+
+    if (expectedError) {
+      await assert.rejects(runtime.run(), { code: expectedError });
+    } else {
+      assert.equal((await runtime.run()).message, "Guest reply");
+      assert.ok(events.includes("browser.guest"));
+    }
+    assert.equal(adapter.sentMessages.length, expectedError ? 0 : 1);
+    assert.deepEqual(adapter.windowStateCalls, []);
+  }
 });
 
 test("conversation.started stays model-agnostic for fresh and resumed sessions", async (t) => {

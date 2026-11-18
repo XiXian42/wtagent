@@ -176,6 +176,26 @@ test("identity is a role-scoped count, immune to the volatile row key", async ()
   assert.deepEqual(await adapter.messageIdentity(userRow), { id: null, turn: 1 });
 });
 
+test("correlates a new user message when the virtualized window keeps the same size", async () => {
+  const originalId = "4a735833-a5de-402a-a9f5-880270ce6344";
+  const nextId = "805f026c-f2ea-4f27-ae03-bf357e69c4cb";
+  const reminder = (id) => `<system_reminder>Opaque WTAgent transport correlation ID (do not repeat): ${id}.</system_reminder>`;
+  const row = new DeepSeekRow({ key: -4, role: "user", text: reminder(originalId) });
+  const adapter = new DeepSeekWebAdapter({ profileDir: "." });
+  adapter.page = createDeepSeekPage([row]);
+  const baseline = await adapter.messageIdentity(row);
+  assert.deepEqual(baseline, { id: originalId, turn: 1 });
+
+  let texts = [`<tool_result>OK</tool_result>\n${reminder(nextId)}`];
+  adapter.userMessages = () => ({ allInnerTexts: async () => texts });
+  assert.deepEqual(await adapter.userMessageSnapshot(), [
+    { id: nextId, turn: baseline.turn, renderedText: texts[0] },
+  ]);
+
+  texts = [`${reminder(nextId)}\n${reminder(nextId)}`];
+  assert.equal((await adapter.userMessageSnapshot())[0].id, null);
+});
+
 test("generation is detected structurally via the reply action bar", async () => {
   const adapter = new DeepSeekWebAdapter({ profileDir: "." });
   // Think-only phase: no action bar yet → generating (no text matching).

@@ -19,6 +19,7 @@ test("ChatGPT recognizes both temporary route families", () => {
   for (const route of ["WEB:test", "local-chatgpt:test", "local-chatgpt%3Atest", "local-chatgpt%3atest"]) {
     assert.equal(adapter.classifyConversationUrl(`https://chatgpt.com/c/${route}`), "provisional");
   }
+  assert.equal(adapter.classifyConversationUrl("https://chatgpt.com/uc/guest-id"), "provisional");
   assert.equal(adapter.classifyConversationUrl("https://chatgpt.com/c/canonical-id"), "restorable");
 });
 
@@ -34,6 +35,22 @@ test("ChatGPT real DOM supports modern identities and strict recovery", {
   adapter.page = page;
   adapter.context = page.context();
   adapter.cdpChrome = { targetId: "fixture-target", exactTargetOnly: true };
+
+  await t.test("login copy in chat history does not make a conversation look signed out", async () => {
+    await page.setContent(modernRows.replace("OK&lt;", "Log in or sign up&lt;"));
+    assert.equal(await adapter.getAuthState(), "authenticated");
+
+    await page.locator('[data-composer-markdown]').evaluate((composer) => composer.setAttribute("contenteditable", "false"));
+    assert.equal(await adapter.getAuthState(), "unauthenticated");
+
+    await page.setContent(`<main>Log in or sign up
+      <div data-composer-markdown contenteditable="true"></div>
+    </main>`);
+    assert.equal(await adapter.getAuthState(), "unauthenticated");
+
+    await page.setContent(modernRows.replace("</main>", "<button>Log in</button></main>"));
+    assert.equal(await adapter.getAuthState(), "unauthenticated");
+  });
 
   await t.test("reads modern roles, stable IDs, and turn groups without using block offsets", async () => {
     await page.setContent(modernRows);
@@ -55,6 +72,30 @@ test("ChatGPT real DOM supports modern identities and strict recovery", {
     assert.equal(recovered.assistantMessageId, "assistant-1");
   });
 
+  await t.test("recovers an existing reply from UUID-keyed turn groups", async () => {
+    const group = "68d6044d-0447-4b0a-a770-d885afb3a351";
+    const html = modernRows
+      .replace("<section", `<div data-content-search-turn-key="${group}"><section`)
+      .replace("</section>\n<div data-composer", "</section></div>\n<div data-composer")
+      .replaceAll("fallback-turn-0", group)
+      .replace('data-chatgpt-search-message-ids="assistant-1"', 'data-chatgpt-search-message-ids="assistant-1 assistant-1"');
+    await page.setContent(html);
+    const report = await adapter.structuralDiagnostics();
+    assert.equal(report.status, "recognized");
+    assert.equal(report.capabilities.unknownSearchUnits, 0);
+    const recovered = await adapter.reconcilePendingOutbound({
+      pendingOutbound: { kind: "bootstrap", outboundId },
+      conversationTargetId: "fixture-target", timeoutMs: 3000, stableWindowMs: 10,
+    });
+    assert.equal(recovered.status, "complete");
+    assert.equal(recovered.userTurn, 1);
+    assert.equal(recovered.assistantTurn, 2);
+    assert.equal(recovered.rawResponse, response);
+
+    await page.setContent(html.replace(`data-content-search-turn-key="${group}"`, 'data-content-search-turn-key="foreign-group"'));
+    assert.equal((await adapter.structuralDiagnostics()).capabilities.unknownSearchUnits, 2);
+  });
+
   await t.test("does not double count legacy messages inside modern wrappers", async () => {
     await page.setContent(await fixture("mixed"));
     assert.equal(await adapter.userMessages().count(), 1);
@@ -71,6 +112,33 @@ test("ChatGPT real DOM supports modern identities and strict recovery", {
       pendingOutbound: { kind: "bootstrap", outboundId },
       conversationTargetId: "fixture-target", timeoutMs: 100, stableWindowMs: 10,
     }), { code: "OUTBOUND_COMMIT_UNCERTAIN" });
+  });
+
+  await t.test("reads guest messages and waits for their completion flag", async () => {
+    await page.goto("https://chatgpt.com/uc/guest-id");
+    await page.setContent(`<main><button>Log in</button>
+      <ol data-conversation-transcript>
+        <li id="guest-user" data-message-role="user"><p data-user-message-copy>Guest prompt</p></li>
+        <li id="guest-assistant" data-message-role="assistant">
+          <div data-assistant-markdown-root>Guest reply</div>
+          <button>Copy response</button>
+        </li>
+      </ol>
+      <form data-mobile-composer><textarea data-mobile-composer-prompt></textarea>
+        <button type="submit" data-composer-submit>Send</button>
+      </form></main>`);
+    assert.equal(await adapter.getAuthState(), "unauthenticated");
+    assert.equal(await adapter.canUseGuest(), true);
+    assert.deepEqual((await adapter.orderedConversationSnapshot()).entries.map(({ role, id, turn, renderedText }) => [role, id, turn, renderedText]), [
+      ["user", "guest-user", 1, "Guest prompt"],
+      ["assistant", "guest-assistant", 2, "Guest reply"],
+    ]);
+    const reply = adapter.assistantMessages().last();
+    assert.deepEqual(await adapter.messageIdentity(reply), { id: "guest-assistant", turn: 2 });
+    assert.equal(await adapter.assistantText(reply), "Guest reply");
+    assert.equal(await adapter.isAssistantGenerating(reply), true);
+    await reply.evaluate((element) => element.setAttribute("data-message-complete", ""));
+    assert.equal(await adapter.isAssistantGenerating(reply), false);
   });
 });
 

@@ -137,6 +137,15 @@ export function renderedMessageContainsOutboundMarker(rendered, outboundId) {
   return renderedMessageContains(rendered, expected, outboundId);
 }
 
+export function readRenderedOutboundCorrelationId(rendered) {
+  const text = comparableMessageText(rendered);
+  const start = text.lastIndexOf(OUTBOUND_MARKER_PREFIX);
+  if (start < 0) return null;
+  const suffix = text.slice(start + OUTBOUND_MARKER_PREFIX.length);
+  const id = suffix.match(/^([0-9a-f-]+)\.<\/system_reminder>/)?.[1];
+  return renderedMessageContainsOutboundMarker(text, id) ? id : null;
+}
+
 // Provider-independent orchestration for a web-AI conversation driven over CDP.
 //
 // The runtime talks to this class only through its public methods; everything
@@ -446,6 +455,19 @@ export class BaseWebAdapter {
   // complete on a mid-tool failure and then try to send into a live reply.
   async isAssistantGenerating(_message) {
     return false;
+  }
+
+  async isGuestAccessBlocked() {
+    return false;
+  }
+
+  async #assertGuestAccess() {
+    if (await this.isGuestAccessBlocked()) {
+      throw new BrowserAdapterError(
+        `${this.providerName} requires sign-in before it can return this reply. Sign in before starting a new request.`,
+        { code: "GUEST_SIGN_IN_REQUIRED" },
+      );
+    }
   }
 
   // Extra time the latest assistant text must stay unchanged before the turn
@@ -1608,12 +1630,21 @@ export class BaseWebAdapter {
       return "unauthenticated";
     }
 
-    const body = await this.page.locator("body").innerText().catch(() => "");
-    if (this.authTextPattern().test(body)) {
+    const [body, composer] = await Promise.all([
+      this.page.locator("body").innerText().catch(() => ""),
+      this.#findComposer(),
+    ]);
+    // Conversation content can quote login copy. Only use that copy as a
+    // fallback when the page does not already expose an active conversation.
+    if (this.authTextPattern().test(body) && !(
+      composer
+      && await this.conversationMessages().count().catch(() => 0) > 0
+      && await composer.isEditable().catch(() => false)
+    )) {
       return "unauthenticated";
     }
 
-    return await this.#findComposer() ? "authenticated" : "unknown";
+    return composer ? "authenticated" : "unknown";
   }
 
   async waitForManualLogin({ timeoutMs }) {
@@ -1638,6 +1669,13 @@ export class BaseWebAdapter {
       `Login was not detected within ${Math.round(timeoutMs / 60_000)} minutes.`,
       { code: "LOGIN_TIMEOUT" },
     );
+  }
+
+  async canUseGuest() {
+    const kind = this.classifyConversationUrl(this.page.url());
+    if (!["fresh", "provisional", "restorable"].includes(kind)) return false;
+    const composer = await this.#findComposer();
+    return Boolean(composer && await composer.isEditable().catch(() => false));
   }
 
   async startConversation(
@@ -2259,6 +2297,7 @@ export class BaseWebAdapter {
         }
 
         await this.throwIfBlockedPage();
+        await this.#assertGuestAccess();
 
         if (this.escCancelRequested) {
           // ESC or Ctrl+C during processing: stop generating and hand control
@@ -2822,6 +2861,7 @@ export class BaseWebAdapter {
 
     while (this.monotonicNow() < deadline) {
       this.#throwIfCancelRequested();
+      await withinDeadline(this.#assertGuestAccess());
       const pageState = await withinDeadline(this.#submittedPageState({
         allowPendingFreshTransition,
       }));

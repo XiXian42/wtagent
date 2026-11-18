@@ -1,6 +1,6 @@
 {
   "name": "wtagent",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Turn ChatGPT Web (including Pro) into Codex. Turn Claude Web into Claude Code. Also DeepSeek, Gemini, Grok, Kimi, GLM. No API key, no MCP, no tunnel, no plugin.",
   "repository": {
     "type": "git",

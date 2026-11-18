@@ -34,6 +34,17 @@ export class KimiWebAdapter extends BaseWebAdapter {
     return /^\/chat\//;
   }
 
+  classifyConversationUrl(value) {
+    const kind = super.classifyConversationUrl(value);
+    if (kind !== "restorable") return kind;
+    // Kimi opens a temporary p-prefixed chat before replacing it with the
+    // server's conversation UUID. The shared send proof verifies the marker
+    // before trusting either route.
+    return /^\/chat\/p[a-z0-9_-]+\/?$/i.test(new URL(value).pathname)
+      ? "provisional"
+      : kind;
+  }
+
   composerLocators() {
     return [
       this.page.locator(".chat-input-editor"),
@@ -77,6 +88,12 @@ export class KimiWebAdapter extends BaseWebAdapter {
 
   authTextPattern() {
     return /手机号快捷登录|手机号登录|发送验证码|登录以同步|log in to sync|sign in/i;
+  }
+
+  async isGuestAccessBlocked() {
+    return Boolean(await firstVisible([
+      this.page.locator('[data-testid="login-phone-input"]'),
+    ]));
   }
 
   assistantMessages() {
