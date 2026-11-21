@@ -38,7 +38,7 @@ you › Create hello.js that writes "Hello from WTAgent" to hello.txt. Run it wi
 
 WTAgent creates the files in the current directory, runs the script locally, and checks its output. You can continue chatting in the same terminal after the task finishes.
 
-Choose a provider with `--model` (ChatGPT is the default). Supported values are `chatgpt`, `claude`, `deepseek`, `gemini`, `grok`, `kimi`, and `glm`:
+Choose a provider with `--model` (ChatGPT is the default). Supported values are `chatgpt`, `claude`, `deepseek`, `gemini`, `grok`, `kimi`, `glm`, and `qwen`:
 
 ```bash
 wtagent --model claude "inspect this project and summarize its architecture"
@@ -189,7 +189,7 @@ you › 创建 hello.js，将“Hello from WTAgent”写入 hello.txt。用 Node
 
 WTAgent 会在当前目录创建文件、运行本地脚本并检查输出。任务完成后，可以继续在同一个终端中对话。
 
-通过 `--model` 选择 provider（默认是 ChatGPT）。可选值包括 `chatgpt`、`claude`、`deepseek`、`gemini`、`grok`、`kimi` 和 `glm`：
+通过 `--model` 选择 provider（默认是 ChatGPT）。可选值包括 `chatgpt`、`claude`、`deepseek`、`gemini`、`grok`、`kimi`、`glm` 和 `qwen`：
 
 ```bash
 wtagent --model claude "分析这个项目并总结架构"

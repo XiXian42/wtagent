@@ -332,6 +332,30 @@ test("--model grok is recognized as an active provider", async () => {
   );
 });
 
+test("--model qwen is recognized as an active provider", async () => {
+  const entry = path.join(repositoryRoot, "src", "cli", "main.js");
+  const missingProject = path.join(
+    repositoryRoot,
+    "test",
+    `missing-qwen-${process.pid}`,
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [
+      entry, "--once", "--model", "qwen", "-C", missingProject, "hi",
+    ]),
+    (error) => {
+      assert.doesNotMatch(error.stderr, /not supported yet/);
+      assert.ok(
+        error.stderr.includes(
+          `Project directory does not exist: ${missingProject}`,
+        ),
+      );
+      return true;
+    },
+  );
+});
+
 test("a task is accepted directly without a run subcommand", async () => {
   const entry = path.join(repositoryRoot, "src", "cli", "main.js");
   const missingProject = path.join(
