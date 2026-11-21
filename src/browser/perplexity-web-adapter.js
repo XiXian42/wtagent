@@ -16,7 +16,7 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
   }
 
   conversationUrlPattern() {
-    return /^\/(?:search|p)\//;
+    return /^\/(?:search|p|session)\//;
   }
 
   classifyConversationUrl(value) {
@@ -30,10 +30,16 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
     if (!["www.perplexity.ai", "perplexity.ai"].includes(parsed.hostname)) {
       return "invalid";
     }
-    const pattern = this.conversationUrlPattern();
     if (this.authUrlPattern()?.test(parsed.pathname)) {
       return "unknown";
     }
+    // Perplexity creates a temporary /search/new/<uuid> route before replacing
+    // it with the durable /session/<uuid> conversation. Classify /search/new/
+    // as provisional so BaseWebAdapter tracks the transition cleanly.
+    if (/^\/search\/new\//i.test(parsed.pathname)) {
+      return "provisional";
+    }
+    const pattern = this.conversationUrlPattern();
     if (pattern?.test(parsed.pathname)) {
       return "restorable";
     }
@@ -43,11 +49,12 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
 
   composerLocators() {
     return [
+      this.page.locator('div[contenteditable="true"].composer-editable').first(),
+      this.page.locator('div[contenteditable="true"]').first(),
       this.page.locator('textarea[placeholder*="Ask anything" i]').first(),
       this.page.locator('textarea[placeholder*="Ask follow-up" i]').first(),
       this.page.locator('textarea[placeholder*="Ask a question" i]').first(),
       this.page.locator('textarea[placeholder*="Search" i]').first(),
-      this.page.locator('div[contenteditable="true"]').first(),
       this.page.locator("main textarea").first(),
       this.page.locator("textarea").first(),
     ];
@@ -64,9 +71,11 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
 
   stopButtonLocators() {
     return [
-      this.page.locator('button[aria-label*="Stop" i]'),
-      this.page.locator('button[title*="Stop" i]'),
-      this.page.getByRole("button", { name: /^(stop|停止)$/i }),
+      this.page.locator('button[aria-label="Stop generating" i]'),
+      this.page.locator('button[aria-label="Stop" i]'),
+      this.page.locator('button[title="Stop generating" i]'),
+      this.page.locator('button[title="Stop" i]'),
+      this.page.getByRole("button", { name: /^(stop|stop generating|停止|停止生成)$/i }),
     ];
   }
 
@@ -95,7 +104,7 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
   }
 
   authUrlPattern() {
-    return /^\/(?:login|signin|auth|join|session)(?:\/|$)/i;
+    return /^\/(?:login|signin|auth|join)(?:\/|$)/i;
   }
 
   authTextPattern() {
@@ -108,25 +117,33 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
 
   assistantMessages() {
     return this.page.locator(
-      '[data-testid="answer"], [data-testid="assistant-message"], div.prose, [dir="auto"].prose',
+      'div.prose, [data-testid="answer"], [data-testid="assistant-message"], [dir="auto"].prose',
     );
   }
 
   userMessages() {
     return this.page.locator(
-      '[data-testid="user-query"], [data-testid="user-message"], [data-testid="message-user"]',
+      '.group\\/user-bubble, [data-testid="user-query"], [data-testid="user-message"], [data-testid="message-user"]',
     );
   }
 
   conversationMessages() {
     return this.page.locator(
-      '[data-testid="user-query"], [data-testid="user-message"], [data-testid="message-user"], [data-testid="answer"], [data-testid="assistant-message"], div.prose',
+      '.group\\/user-bubble, div.prose, [data-testid="user-query"], [data-testid="user-message"], [data-testid="message-user"], [data-testid="answer"], [data-testid="assistant-message"]',
     );
   }
 
   async messageIdentity(message) {
-    const testId = await message.getAttribute("data-testid").catch(() => null);
-    const isUser = testId === "user-query" || testId === "user-message" || testId === "message-user";
+    const [testId, className] = await Promise.all([
+      message.getAttribute("data-testid").catch(() => null),
+      message.getAttribute("class").catch(() => null),
+    ]);
+    const isUser = Boolean(
+      (className && className.includes("group/user-bubble"))
+      || testId === "user-query"
+      || testId === "user-message"
+      || testId === "message-user",
+    );
     const scope = isUser ? this.userMessages() : this.assistantMessages();
     const id = await message.getAttribute("id").catch(() => null)
       ?? await message.getAttribute("data-message-id").catch(() => null);

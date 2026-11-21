@@ -34,6 +34,7 @@ class PerplexityMessage extends EmptyLocator {
 
   async getAttribute(name) {
     if (name === "id") return this.idAttr ?? null;
+    if (name === "class") return this.role === "user" ? "group/user-bubble" : "prose";
     if (name === "data-testid") return this.testIdAttr ?? (this.role === "user" ? "user-query" : "answer");
     return null;
   }
@@ -72,7 +73,7 @@ function createPerplexityPage({ url = "https://www.perplexity.ai/", messages = [
     url() { return url; },
     async title() { return "Perplexity"; },
     locator(selector) {
-      if (selector.includes('button[aria-label*="Stop" i]')) {
+      if (selector.includes('button[aria-label="Stop" i]')) {
         return stopVisible ? new VisibleLocator() : new EmptyLocator();
       }
       if (selector.includes('[data-testid="user-query"]') && !selector.includes('[data-testid="answer"]')) {
@@ -108,6 +109,8 @@ test("exposes Perplexity base URL and conversation URL classification", () => {
   // Classification
   assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/"), "fresh");
   assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/search"), "fresh");
+  assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/search/new/eda0da4d-a693-4c10-933e-7899c381bd39"), "provisional");
+  assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/session/ee4650e0-437c-406d-9b16-7540d3ac3b76"), "restorable");
   assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/search/my-query-123"), "restorable");
   assert.equal(adapter.classifyConversationUrl("https://perplexity.ai/p/abc-456"), "restorable");
 
@@ -155,10 +158,9 @@ test("declares reliable completion and dead request grace multiplier", () => {
 test("declares guest mode unavailable and checks auth patterns", async () => {
   const adapter = new PerplexityWebAdapter({ profileDir: "." });
   assert.equal(await adapter.canUseGuest(), false);
-  assert.ok(adapter.authUrlPattern().test("/session/9dec59d0-ebba-426c-94ef-7195ae728c75"));
   assert.ok(adapter.authUrlPattern().test("/login"));
   assert.ok(adapter.authUrlPattern().test("/signin"));
   assert.ok(adapter.authTextPattern().test("Sign up below to unlock the full potential of Perplexity"));
   assert.ok(adapter.authTextPattern().test("Continue with Google"));
-  assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/session/abc-123"), "unknown");
+  assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/session/abc-123"), "restorable");
 });
