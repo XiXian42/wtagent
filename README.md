@@ -3,7 +3,7 @@
 Turn ChatGPT Web (including Pro) into Codex.
 Turn Claude Web into Claude Code.
 
-Also DeepSeek, Gemini, Grok, Kimi, GLM.
+Also DeepSeek, Gemini, Grok, Kimi, GLM, Perplexity.
 
 No API key. No MCP. No tunnel. No plugin.
 
@@ -38,7 +38,7 @@ you › Create hello.js that writes "Hello from WTAgent" to hello.txt. Run it wi
 
 WTAgent creates the files in the current directory, runs the script locally, and checks its output. You can continue chatting in the same terminal after the task finishes.
 
-Choose a provider with `--model` (ChatGPT is the default). Supported values are `chatgpt`, `claude`, `deepseek`, `gemini`, `grok`, `kimi`, and `glm`:
+Choose a provider with `--model` (ChatGPT is the default). Supported values are `chatgpt`, `claude`, `deepseek`, `gemini`, `grok`, `kimi`, `glm`, and `perplexity`:
 
 ```bash
 wtagent --model claude "inspect this project and summarize its architecture"
