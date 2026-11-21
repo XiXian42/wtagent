@@ -108,10 +108,89 @@ test("locates user and assistant messages", () => {
     },
   };
 
+  adapter.conversationMessages();
+  assert.equal(selectors[0], ".qwen-chat-message");
+
+  selectors.length = 0;
   adapter.assistantMessages();
   assert.ok(selectors[0].includes("assistant"));
 
   selectors.length = 0;
   adapter.userMessages();
   assert.ok(selectors[0].includes("user"));
+});
+
+test("assistantText extracts markdown response excluding thinking", async () => {
+  const adapter = new QwenWebAdapter({ profileDir: "." });
+  const message = new EmptyLocator();
+  const contentLocator = new EmptyLocator();
+  contentLocator.count = async () => 1;
+  contentLocator.last = () => ({
+    async innerText() { return "<agent_response>\u00a0<done>true</done>\u00a0<tool_call\u00a0name=\"fs.write\"></tool_call></agent_response>"; },
+  });
+  message.locator = (selector) => {
+    if (selector.includes("response-message-content")) {
+      return contentLocator;
+    }
+    return new EmptyLocator();
+  };
+
+  const text = await adapter.assistantText(message);
+  assert.ok(text.includes("<done>true</done>"));
+  assert.ok(text.includes('<tool_call name="fs.write">'));
+  assert.equal(text.includes("\u00a0"), false);
+});
+
+test("classifies fresh, provisional, and restorable URLs", () => {
+  const adapter = new QwenWebAdapter({ profileDir: "." });
+  assert.equal(adapter.classifyConversationUrl("https://chat.qwen.ai/"), "fresh");
+  assert.equal(adapter.classifyConversationUrl("https://chat.qwen.ai/c/new-chat"), "provisional");
+  assert.equal(adapter.classifyConversationUrl("https://chat.qwen.ai/c/new"), "provisional");
+  assert.equal(adapter.classifyConversationUrl("https://chat.qwen.ai/c/997e-2ff119afa8ee"), "restorable");
+  assert.equal(adapter.classifyConversationUrl("https://other.ai/c/123"), "invalid");
+});
+
+test("extracts message identities for user and assistant messages", async () => {
+  const adapter = new QwenWebAdapter({ profileDir: "." });
+
+  const userMsg = new EmptyLocator();
+  userMsg.evaluate = async (fn) => fn({
+    classList: { contains: (cls) => cls === "qwen-chat-message-user" },
+    getAttribute: () => null,
+    querySelector: (sel) => sel.includes("chat-user-message-container")
+      ? { getAttribute: (attr) => attr === "data-msg-id" ? "usr-1234" : null }
+      : null,
+  });
+  const users = new EmptyLocator();
+  users.count = async () => 2;
+  adapter.userMessages = () => users;
+
+  const userIdentity = await adapter.messageIdentity(userMsg);
+  assert.deepEqual(userIdentity, { id: "usr-1234", turn: 2 });
+
+  const assistantMsg = new EmptyLocator();
+  assistantMsg.evaluate = async (fn) => fn({
+    classList: { contains: (cls) => cls === "qwen-chat-message-assistant" },
+    getAttribute: () => null,
+    querySelector: (sel) => sel.includes("chat-response-message")
+      ? { id: "chat-response-message-asst-5678" }
+      : null,
+  });
+  const assistants = new EmptyLocator();
+  assistants.count = async () => 1;
+  adapter.assistantMessages = () => assistants;
+
+  const assistantIdentity = await adapter.messageIdentity(assistantMsg);
+  assert.deepEqual(assistantIdentity, { id: "asst-5678", turn: 1 });
+});
+
+test("detects new assistant identity and reliable completion signal", () => {
+  const adapter = new QwenWebAdapter({ profileDir: "." });
+  adapter.assistantIdsBeforeSend = new Set(["old-asst"]);
+  adapter.assistantCountBeforeSend = 1;
+
+  assert.equal(adapter.isNewAssistantIdentity({ id: "new-asst", turn: 1 }), true);
+  assert.equal(adapter.isNewAssistantIdentity({ id: "old-asst", turn: 2 }), true);
+  assert.equal(adapter.isNewAssistantIdentity({ id: "old-asst", turn: 1 }), false);
+  assert.equal(adapter.hasReliableCompletionSignal(), true);
 });
