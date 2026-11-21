@@ -15,6 +15,7 @@ import { ChatGPTWebAdapter } from "../src/browser/chatgpt-web-adapter.js";
 import { ClaudeWebAdapter } from "../src/browser/claude-web-adapter.js";
 import { GeminiWebAdapter } from "../src/browser/gemini-web-adapter.js";
 import { GrokWebAdapter } from "../src/browser/grok-web-adapter.js";
+import { QwenWebAdapter } from "../src/browser/qwen-web-adapter.js";
 
 test("chatgpt is the default active provider", () => {
   assert.equal(DEFAULT_PROVIDER, "chatgpt");
@@ -44,17 +45,18 @@ test("resolveProvider rejects an unknown model with the known list", () => {
   );
 });
 
-test("claude, deepseek, gemini, kimi, and glm are active with working adapters", () => {
-  for (const id of ["claude", "deepseek", "gemini", "grok", "kimi", "glm"]) {
+test("claude, deepseek, gemini, kimi, glm, and qwen are active with working adapters", () => {
+  for (const id of ["claude", "deepseek", "gemini", "grok", "kimi", "glm", "qwen"]) {
     assert.equal(PROVIDERS[id].status, "active");
     assert.ok(PROVIDERS[id].adapter, id + " should have an adapter");
     assert.equal(resolveProvider(id).id, id);
   }
   assert.deepEqual(
     listActiveProviderIds().sort(),
-    ["chatgpt", "claude", "deepseek", "gemini", "glm", "grok", "kimi"],
+    ["chatgpt", "claude", "deepseek", "gemini", "glm", "grok", "kimi", "qwen"],
   );
   assert.equal(PROVIDERS.grok.adapter, GrokWebAdapter);
+  assert.equal(PROVIDERS.qwen.adapter, QwenWebAdapter);
 });
 
 test("getProvider returns registered providers but rejects unknown", () => {
@@ -113,4 +115,9 @@ test("createWebAdapter builds the provider's adapter with its base URL", () => {
   assert.ok(grok instanceof GrokWebAdapter);
   assert.equal(grok.providerName, "Grok");
   assert.equal(grok.baseUrl, "https://grok.com/");
+
+  const qwen = createWebAdapter({ provider: "qwen", profileDir: "/tmp/qwen" });
+  assert.ok(qwen instanceof QwenWebAdapter);
+  assert.equal(qwen.providerName, "Qwen");
+  assert.equal(qwen.baseUrl, "https://chat.qwen.ai/");
 });
