@@ -151,3 +151,14 @@ test("declares reliable completion and dead request grace multiplier", () => {
   assert.equal(adapter.hasReliableCompletionSignal(), true);
   assert.equal(adapter.deadRequestGraceMultiplier(), 3);
 });
+
+test("declares guest mode unavailable and checks auth patterns", async () => {
+  const adapter = new PerplexityWebAdapter({ profileDir: "." });
+  assert.equal(await adapter.canUseGuest(), false);
+  assert.ok(adapter.authUrlPattern().test("/session/9dec59d0-ebba-426c-94ef-7195ae728c75"));
+  assert.ok(adapter.authUrlPattern().test("/login"));
+  assert.ok(adapter.authUrlPattern().test("/signin"));
+  assert.ok(adapter.authTextPattern().test("Sign up below to unlock the full potential of Perplexity"));
+  assert.ok(adapter.authTextPattern().test("Continue with Google"));
+  assert.equal(adapter.classifyConversationUrl("https://www.perplexity.ai/session/abc-123"), "unknown");
+});

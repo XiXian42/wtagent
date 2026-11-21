@@ -265,17 +265,26 @@ class ConversationRunner {
       session: this.session,
       limits: this.limits,
       preferGuest: this.guestAccepted,
-      chooseLogin: async () => {
-        if (this.guestAccepted) return "guest";
-        if (!process.stdin.isTTY || !process.stdout.isTTY) return "guest";
+      chooseLogin: async ({ guestAvailable = true } = {}) => {
+        if (guestAvailable && this.guestAccepted) return "guest";
+        if (!guestAvailable && this.guestAccepted) {
+          throw new BrowserAdapterError(
+            `${this.provider.label} does not expose a guest composer for this request. Sign in to continue.`,
+            { code: "GUEST_UNAVAILABLE" },
+          );
+        }
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+          return guestAvailable ? "guest" : "login";
+        }
         this.renderer.stopSpinner();
+        const choices = [
+          { name: t("login.chooseSignIn"), value: "login" },
+          ...(guestAvailable ? [{ name: t("login.chooseGuest"), value: "guest" }] : []),
+          { name: t("login.chooseQuit"), value: "quit" },
+        ];
         const choice = await promptForSelect({
           message: t("login.choose", { provider: this.provider.label }),
-          choices: [
-            { name: t("login.chooseSignIn"), value: "login" },
-            { name: t("login.chooseGuest"), value: "guest" },
-            { name: t("login.chooseQuit"), value: "quit" },
-          ],
+          choices,
         });
         this.guestAccepted = choice === "guest";
         return choice;

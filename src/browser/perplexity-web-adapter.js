@@ -31,6 +31,9 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
       return "invalid";
     }
     const pattern = this.conversationUrlPattern();
+    if (this.authUrlPattern()?.test(parsed.pathname)) {
+      return "unknown";
+    }
     if (pattern?.test(parsed.pathname)) {
       return "restorable";
     }
@@ -78,19 +81,29 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
 
   loginControlLocators() {
     return [
+      this.page.locator('button:has-text("Continue with Google")'),
+      this.page.locator('button:has-text("Continue with Apple")'),
+      this.page.locator('button:has-text("Sign in")'),
+      this.page.locator('button:has-text("Log in")'),
+      this.page.locator('button:has-text("Sign Up")'),
       this.page.locator('a[href*="/login"]'),
       this.page.locator('a[href*="/signin"]'),
-      this.page.getByRole("button", { name: /^(sign in|log in|登录|登入)$/i }),
-      this.page.getByRole("link", { name: /^(sign in|log in|登录|登入)$/i }),
+      this.page.locator('input[type="email"]'),
+      this.page.getByRole("button", { name: /^(sign in|log in|sign up|continue with google|continue with apple|登录|登入)$/i }),
+      this.page.getByRole("link", { name: /^(sign in|log in|sign up|登录|登入)$/i }),
     ];
   }
 
   authUrlPattern() {
-    return /^\/(?:login|signin|auth|join)(?:\/|$)/i;
+    return /^\/(?:login|signin|auth|join|session)(?:\/|$)/i;
   }
 
   authTextPattern() {
-    return /sign in to perplexity|continue with google|continue with apple|log in to perplexity|登录 Perplexity/i;
+    return /sign up below to unlock|sign in to perplexity|continue with google|continue with apple|log in to perplexity|enter your email|登录 Perplexity/i;
+  }
+
+  async canUseGuest() {
+    return false;
   }
 
   assistantMessages() {
