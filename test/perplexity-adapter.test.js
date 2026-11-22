@@ -64,6 +64,9 @@ class MessageCollection extends EmptyLocator {
   nth(index) { return this.messages[index] ?? new EmptyLocator(); }
   first() { return this.messages[0] ?? new EmptyLocator(); }
   last() { return this.messages.at(-1) ?? new EmptyLocator(); }
+  async allInnerTexts() {
+    return Promise.all(this.messages.map((m) => m.innerText()));
+  }
 }
 
 function createPerplexityPage({ url = "https://www.perplexity.ai/", messages = [], stopVisible = false } = {}) {
@@ -138,6 +141,11 @@ test("tracks Perplexity message identities and normalizes whitespace", async () 
   const assistantId = await adapter.messageIdentity(messages[1]);
   assert.equal(assistantId.id, "a-1");
   assert.equal(assistantId.turn, 1);
+
+  const snapshot = await adapter.userMessageSnapshot();
+  assert.equal(snapshot.length, 1);
+  assert.equal(snapshot[0].turn, 1);
+  assert.equal(snapshot[0].renderedText, "What is WTAgent?");
 });
 
 test("detects assistant generating state via stop button", async () => {
@@ -153,6 +161,7 @@ test("declares reliable completion and dead request grace multiplier", () => {
   const adapter = new PerplexityWebAdapter({ profileDir: "." });
   assert.equal(adapter.hasReliableCompletionSignal(), true);
   assert.equal(adapter.deadRequestGraceMultiplier(), 3);
+  assert.equal(adapter.sendConfirmationTimeoutMs(), 30_000);
 });
 
 test("declares guest mode unavailable and checks auth patterns", async () => {

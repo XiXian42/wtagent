@@ -1,4 +1,9 @@
-import { BaseWebAdapter, firstVisible } from "./base-web-adapter.js";
+import {
+  BaseWebAdapter,
+  firstVisible,
+  readRenderedOutboundCorrelationId,
+  renderedMessageContainsOutboundMarker,
+} from "./base-web-adapter.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
 
 export { isConnectionLostError } from "./base-web-adapter.js";
@@ -62,9 +67,12 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
 
   sendButtonLocators() {
     return [
-      this.page.locator('button[aria-label*="Submit" i]'),
-      this.page.locator('button[aria-label*="Send" i]'),
-      this.page.locator('button[aria-label*="Ask" i]'),
+      this.page.locator('button[aria-label="Submit" i]'),
+      this.page.locator('button[aria-label="Send" i]'),
+      this.page.locator('button[aria-label="Ask" i]'),
+      this.page.locator('button[title="Submit" i]'),
+      this.page.locator('button[title="Send" i]'),
+      this.page.locator('button[title="Ask" i]'),
       this.page.getByRole("button", { name: /^(submit|send|ask|发送)$/i }),
     ];
   }
@@ -133,6 +141,31 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
     );
   }
 
+  async userMessageSnapshot() {
+    const messages = this.userMessages();
+    if (typeof messages.allInnerTexts !== "function") return super.userMessageSnapshot();
+    const texts = await messages.allInnerTexts().catch(() => null);
+    return texts?.map((rawText, index) => {
+      const renderedText = rawText.replaceAll("\u00a0", " ");
+      return {
+        id: readRenderedOutboundCorrelationId(renderedText),
+        turn: index + 1,
+        renderedText,
+      };
+    }) ?? null;
+  }
+
+  async prepareOutboundConfirmation({ outboundId, deadline } = {}) {
+    const message = this.userMessages().last();
+    const expand = message.locator('button:has-text("Read more"), button[aria-label="Read more" i]');
+    if (await expand.count().catch(() => 0) !== 1) return;
+    const text = await message.innerText({ timeout: 1000 }).catch(() => "");
+    if (renderedMessageContainsOutboundMarker(text, outboundId)) return;
+    const remaining = deadline - this.monotonicNow();
+    if (!(remaining > 0)) return;
+    await expand.click({ timeout: Math.min(1000, Math.ceil(remaining)) }).catch(() => {});
+  }
+
   async messageIdentity(message) {
     const [testId, className] = await Promise.all([
       message.getAttribute("data-testid").catch(() => null),
@@ -145,12 +178,18 @@ export class PerplexityWebAdapter extends BaseWebAdapter {
       || testId === "message-user",
     );
     const scope = isUser ? this.userMessages() : this.assistantMessages();
-    const id = await message.getAttribute("id").catch(() => null)
+    const rawId = await message.getAttribute("id").catch(() => null)
       ?? await message.getAttribute("data-message-id").catch(() => null);
+    const text = isUser ? await this.userMessageText(message) : "";
+    const outboundId = isUser ? readRenderedOutboundCorrelationId(text) : null;
     return {
-      id: id || null,
+      id: rawId || outboundId || null,
       turn: await scope.count().catch(() => 0),
     };
+  }
+
+  sendConfirmationTimeoutMs() {
+    return 30_000;
   }
 
   isNewAssistantIdentity({ id, turn, text }) {
