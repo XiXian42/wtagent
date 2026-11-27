@@ -265,6 +265,13 @@ class ConversationRunner {
       session: this.session,
       limits: this.limits,
       preferGuest: this.guestAccepted,
+      confirmToolResultRetry: this.interactive ? async () => {
+        this.renderer.stopSpinner();
+        return await promptForConfirm({
+          message: t("session.confirmSavedResult", { provider: this.provider.label }),
+          default: false,
+        });
+      } : null,
       chooseLogin: async () => {
         if (this.guestAccepted) return "guest";
         if (!process.stdin.isTTY || !process.stdout.isTTY) return "guest";
@@ -420,7 +427,7 @@ class ConversationRunner {
   // browser is kept alive so the page state can be inspected: the saved CDP
   // state lets the next `wtagent resume` reuse the same window, and a later
   // launch reaps it if it has died in the meantime.
-  async close({ keepBrowser = false } = {}) {
+  async close({ keepBrowser = false, runFailed = keepBrowser } = {}) {
     if (this.closed) {
       return;
     }
@@ -437,11 +444,13 @@ class ConversationRunner {
       await this.adapter.detach().catch((error) => {
         console.error(`Warning: ${error.message}`);
       });
-      console.log(
-        "The run failed; Chrome was left open for debugging. "
-          + "Inspect the page and close it manually, or just run "
-          + "`wtagent resume` again — it will reuse this window.",
-      );
+      if (runFailed) {
+        console.log(
+          "The run failed; Chrome was left open for debugging. "
+            + "Inspect the page and close it manually, or just run "
+            + "`wtagent resume` again — it will reuse this window.",
+        );
+      }
       return;
     }
     await this.adapter.close().catch((error) => {
@@ -546,6 +555,7 @@ export async function executeSession({
   }
 
   let runFailed = false;
+  let recoveryDeferred = false;
 
   try {
     runner.renderer.hint(`Session ID: ${session.sessionId}`);
@@ -577,6 +587,12 @@ export async function executeSession({
         throw error;
       }
       if (runner.interrupted) {
+        break;
+      }
+      if (result?.toolResultRetryDeferred) {
+        recoveryDeferred = true;
+        runner.renderer.hint(t(interactive ? "session.savedResultDeferred" : "session.savedResultNeedsTerminal"));
+        if (!interactive) process.exitCode = 1;
         break;
       }
       if (result?.cancelled) {
@@ -666,7 +682,7 @@ export async function executeSession({
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     activeChatInput?.close();
-    await runner.close({ keepBrowser: runFailed });
+    await runner.close({ keepBrowser: runFailed || recoveryDeferred, runFailed });
     console.log(t("session.savedAt", { directory: session.directory }));
     printResumeHint(session.sessionId, options);
   }

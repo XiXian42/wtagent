@@ -74,6 +74,21 @@ test("quitting the prompt after ESC does not run another turn", async (t) => {
   assert.equal(closed, true);
 });
 
+test("declining a saved result resend leaves the browser open without a failure", async (t) => {
+  const { home, session } = await sessionHarness(t);
+  let closeOptions;
+  await executeSession({ session, options: { home }, resume: true, chatInput: { close() {} } }, {
+    interactive: true,
+    createRunner: () => ({
+      renderer: { hint() {} },
+      async runTurn() { return { toolResultRetryDeferred: true }; },
+      async close(options) { closeOptions = options; },
+    }),
+    readNextMessage: async () => assert.fail("declining should exit cleanly instead of opening another prompt"),
+  });
+  assert.deepEqual(closeOptions, { keepBrowser: true, runFailed: false });
+});
+
 test("interactive pending recovery ignores instructions until bare retry", async (t) => {
   const { home, session } = await sessionHarness(t);
   const outboundId = "11111111-1111-4111-8111-111111111111";

@@ -42,7 +42,7 @@ function normalizedPathname(value) {
   return pathname || "/";
 }
 
-function normalizedConversationUrl(value) {
+export function normalizedConversationUrl(value) {
   try {
     const parsed = value instanceof URL ? value : new URL(value);
     return `${parsed.origin}${normalizedPathname(parsed.pathname)}`;
@@ -354,6 +354,10 @@ export class BaseWebAdapter {
   // before sampling the transport marker; never infer a commit from the expand
   // action itself. The caller's send/recovery deadline still bounds this work.
   async prepareOutboundConfirmation(_options = {}) {}
+
+  // Resolve provider-specific Send readiness while failure is still provably
+  // pre-submission. The returned control is passed to submitComposer.
+  async prepareComposerSubmission(_composer, _options = {}) {}
 
   // Providers with a shared user/assistant turn order return one atomic snapshot.
   // null keeps legacy normal-send behavior but cannot support ambiguous recovery.
@@ -1478,7 +1482,7 @@ export class BaseWebAdapter {
     } catch (error) {
       await connection?.detach?.().catch(() => null);
       this.#dropPageState();
-      if (error instanceof BrowserAdapterError) {
+      if (error instanceof BrowserAdapterError || error?.code === "PROFILE_LOCKED") {
         throw error;
       }
       throw new BrowserAdapterError(
@@ -2089,6 +2093,10 @@ export class BaseWebAdapter {
       };
     }
 
+    const preparedSubmission = await this.prepareComposerSubmission(composer, { text });
+    await this.#assertTrustedPageForSend(urlBeforeSend, {
+      allowPendingFreshTransition: sendStartedFresh,
+    });
     // From this point onward a transport failure cannot prove whether the
     // provider committed the message. Runtime must never resend it blindly. One
     // monotonic deadline includes the submission itself and every proof sample.
@@ -2107,6 +2115,7 @@ export class BaseWebAdapter {
     const submission = Promise.resolve().then(() => this.submitComposer(composer, {
       assertActive,
       timeoutMs: Math.max(1, Math.ceil(sendProof.deadline - this.monotonicNow())),
+      preparedSubmission,
     }));
     this.pendingSubmission = submission;
     const settled = () => {
@@ -2909,6 +2918,11 @@ export class BaseWebAdapter {
           ?? await withinDeadline(messages.count().catch(() => 0));
         if (this.activeSendProof) {
           this.activeSendProof.sample = { userMessageCount: count, markerMatched: false };
+          const latest = snapshot?.at(-1);
+          if (latest && !latest.id && count > baseline.count
+            && renderedMessageContainsOutboundMarker(latest.renderedText, outboundId)) {
+            this.activeSendProof.sawMatchingUnnumberedUser = true;
+          }
         }
         for (let index = count - 1; index >= 0; index -= 1) {
           const message = messages?.nth(index);

@@ -451,6 +451,7 @@ export async function launchAndConnectCdpChrome({
       candidate.url?.() ?? ""
     ));
     let page;
+    let ownsPage = false;
     let preferredTabMatched = false;
     let preferredTargetMatched = false;
     let preferredTabAmbiguous = false;
@@ -498,7 +499,10 @@ export async function launchAndConnectCdpChrome({
           preferredTabAmbiguous = true;
         }
       }
-      page ??= await context.newPage();
+      if (!page) {
+        page = await context.newPage();
+        ownsPage = true;
+      }
     } else {
       page = pages[0] ?? await context.newPage();
     }
@@ -563,9 +567,12 @@ export async function launchAndConnectCdpChrome({
         if (closePromise) {
           return await closePromise;
         }
-        if (exactTargetOnly) {
+        if (exactTargetOnly || reused) {
           closePromise = (async () => {
             try {
+              if (ownsPage) {
+                await settleWithin(Promise.resolve().then(() => page.close()), transportCloseTimeoutMs);
+              }
               await settleWithin(
                 Promise.resolve().then(() => browser.close()),
                 transportCloseTimeoutMs,

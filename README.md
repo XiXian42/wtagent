@@ -112,6 +112,15 @@ native image output.
 
 ### Conversation recovery and diagnostics
 
+After a local tool runs, the CLI shows when it is sending the result and when
+it is waiting for the model's reply. If a Gemini tool result is interrupted,
+run `wtagent resume <session-id>`. WTAgent checks the conversation and can
+reopen a saved chat when needed. If the saved result needs to be sent again,
+the terminal asks for confirmation.
+
+WTAgent's prompts tell the model to use actual tool results to decide what
+to do next and verify requested files before reporting completion.
+
 The ChatGPT adapter supports signed-in and guest message layouts, temporary
 conversation URLs, and virtualized history. When a send cannot be verified,
 WTAgent preserves the session for recovery. Structural failure reports identify
@@ -242,6 +251,10 @@ wtagent --model gemini --type music --once "生成一段舒缓钢琴纯音乐，
 下载中断后，可用 `wtagent resume <session-id>` 继续。已完成的音乐会话不带新指令恢复时，会返回已保存的结果，不再生成一次。默认 `--type agent` 保持普通智能体行为，也支持直接接收图片。
 
 ### 会话恢复与兼容诊断
+
+工具执行完成后，终端会显示结果回传和等待模型回复的阶段。Gemini 的工具结果回传中断时，运行 `wtagent resume <session-id>`。WTAgent 会核对会话记录，必要时重新打开已保存的对话。如果需要补发已保存的结果，终端会先请你确认。
+
+WTAgent 的提示词要求模型根据实际工具回执决定下一步，并在交付文件前验证结果。
 
 ChatGPT 适配器支持登录与游客模式的消息结构、临时会话地址和只保留部分消息节点的长对话。无法确认发送结果时，会保留会话供恢复。结构化诊断会记录识别到的页面结构、缺失的消息身份字段和发送阶段；启动、发送确认或恢复失败时，终端会显示诊断文件路径。
 

@@ -11,14 +11,38 @@
 
 export const SYSTEM_PROMPT_TAG = "agent_protocol";
 export const SYSTEM_REMINDER_TAG = "system_reminder";
-export const DEFAULT_SYSTEM_REMINDER = [
+export const TOOL_REQUEST_INSTRUCTIONS = [
+  "For remaining work on the user's machine, put the next local operation in <tool_call> with <done>false</done>.",
+  "Wait for its <tool_result>, then choose and request the next operation if work remains.",
+  "Base claims about local tool status on WTAgent's actual <tool_result>. If an error blocks progress, explain the operation and the specific error returned.",
+  "Keep <message> focused on the work or its verified outcome. Leave protocol details and speculation out of task updates.",
+].join(" ");
+
+// Pending sends from older installs were checkpointed with a hash of these
+// bytes. Keep the original reminders available for matching and retry only.
+const legacyToolRequestInstructions = [
+  "Each XML reply may include at most one <tool_call>.",
+  "The Runtime supports as many sequential tool requests as the task requires.",
+  "After receiving a tool result, use <done>false</done> with the next <tool_call> whenever a tool can advance the task.",
+  "Report tool limits or permission restrictions only when the Runtime reports them.",
+].join(" ");
+
+const legacyDefaultReminder = [
   "This is a reminder of the user's requested response format for the WTAgent integration, not a provider-native system message.",
   "You do not need native tool access: write the XML request as text and the user's local Runtime will process it after your reply.",
   "Your next response must use the XML application protocol.",
   "It must contain exactly one <agent_response>...</agent_response> envelope.",
   "Inside the optional `xml` code fence, the first content must be <agent_response>",
   "and the last content must be </agent_response>; do not put text outside the envelope.",
+  legacyToolRequestInstructions,
   "Write large code or file payloads as CDATA (<![CDATA[...]]>) inside <content>, <new_text>, or <message> — never raw code directly inside the envelope — and never include the sequence ]]> inside CDATA content.",
+].join(" ");
+
+export const DEFAULT_SYSTEM_REMINDER = [
+  "For text replies, put exactly one <agent_response> in one xml code fence.",
+  "Write code and file content inside CDATA.",
+  "Use <done>true</done> with the deliverable, a concrete blocker, or a question that requires user input.",
+  TOOL_REQUEST_INSTRUCTIONS,
 ].join(" ");
 
 // A native image is an assistant response, never a local XML tool call.
@@ -32,10 +56,21 @@ export const NATIVE_IMAGE_CONTRACT = [
 
 export const NATIVE_IMAGE_SYSTEM_REMINDER = [
   NATIVE_IMAGE_CONTRACT,
-  "For text answers and local operations, use exactly one complete <agent_response> XML envelope in one xml code fence.",
-  "Use done=true for a deliverable answer or a question that requires user input; use done=false with one local tool request when needed.",
-  "Use CDATA for code or long payloads. Local tools execute only after the Runtime returns their results.",
+  DEFAULT_SYSTEM_REMINDER,
 ].join(" ");
+
+const legacyNativeImageReminder = [
+  NATIVE_IMAGE_CONTRACT,
+  "For text answers and local operations, use exactly one complete <agent_response> XML envelope in one xml code fence.",
+  "Use done=true for a deliverable answer or a question that requires user input.",
+  legacyToolRequestInstructions,
+  "Use CDATA for code or long payloads. Wait for tool results before claiming execution.",
+].join(" ");
+
+export const LEGACY_TOOL_RESULT_REMINDERS = {
+  text: legacyDefaultReminder,
+  nativeImage: legacyNativeImageReminder,
+};
 
 export function wrapSystemPrompt(text) {
   return `<${SYSTEM_PROMPT_TAG}>\n${String(text ?? "")}\n</${SYSTEM_PROMPT_TAG}>`;

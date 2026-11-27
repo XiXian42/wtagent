@@ -426,7 +426,9 @@ export function parseAgentResponse(rawText) {
   const rawToolCall = response.tool_call;
 
   if (Array.isArray(rawToolCall)) {
-    throw new ProtocolError("V1 allows at most one <tool_call> per turn.");
+    throw new ProtocolError(
+      "The XML reply contains multiple <tool_call> elements. Request the next operation and wait for its result before requesting another.",
+    );
   }
 
   let toolCall = null;

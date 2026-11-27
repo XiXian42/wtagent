@@ -1,5 +1,12 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { BaseWebAdapter, firstVisible } from "./base-web-adapter.js";
+import {
+  BaseWebAdapter,
+  firstVisible,
+  isValidOutboundCorrelationId,
+  normalizedConversationUrl,
+  renderedMessageContainsOutboundMarker,
+} from "./base-web-adapter.js";
 import { BrowserAdapterError } from "../shared/errors.js";
 import { isUsageLimitNotice } from "../shared/usage-limit.js";
 import { readRenderedBlocks } from "./rendered-text.js";
@@ -7,6 +14,34 @@ import { readRenderedBlocks } from "./rendered-text.js";
 export { isConnectionLostError } from "./base-web-adapter.js";
 
 const GEMINI_URL = "https://gemini.google.com/app";
+const GEMINI_PENDING_USER_ID = "user-query-content-undefined";
+const GEMINI_MESSAGE_CONTENT = {
+  user: `.query-content[id^="user-query-content-"]:not([id="${GEMINI_PENDING_USER_ID}"])`,
+  assistant: 'message-content[id^="message-content-id-"]',
+};
+
+function readGeminiRows(rows, selectors) {
+  return {
+    url: globalThis.location?.href,
+    entries: rows.map((row) => {
+      const user = row.tagName === "USER-QUERY";
+      const content = row.querySelector(user ? selectors.user : selectors.assistant);
+      return {
+        role: user ? "user" : "assistant",
+        id: content?.id ?? null,
+        turn: null,
+        renderedText: user ? row.innerText : "",
+      };
+    }),
+  };
+}
+
+function uncertainGeminiOutbound(message) {
+  return new BrowserAdapterError(message, {
+    code: "OUTBOUND_COMMIT_UNCERTAIN",
+    recoverable: false,
+  });
+}
 
 // Gemini Web adapter. The live application exposes stable custom elements for
 // user and model turns. Each model response also owns a response-specific
@@ -98,9 +133,288 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     return this.page.locator("user-query, model-response");
   }
 
+  async userMessageSnapshot() {
+    const users = this.userMessages();
+    if (typeof users.evaluateAll !== "function") return super.userMessageSnapshot();
+    // Capture the ID and its text together, even if Gemini remounts rows while
+    // the send is being confirmed.
+    return await users.evaluateAll(readGeminiRows, GEMINI_MESSAGE_CONTENT).then(({ entries }) => entries)
+      .catch(() => null);
+  }
+
+  supportsPendingOutboundRecovery() {
+    return true;
+  }
+
+  sendConfirmationTimeoutMs() {
+    // Gemini can take several minutes to assign a durable user-message ID.
+    return 10 * 60_000;
+  }
+
+  async reopenSavedToolResultConversation({ conversationUrl, lastUserMessageId, lastAssistantMessageId, responseHash }) {
+    const url = normalizedConversationUrl(conversationUrl);
+    if (this.classifyConversationUrl(url) !== "restorable" || !lastUserMessageId || !lastAssistantMessageId || !responseHash) {
+      throw uncertainGeminiOutbound("The saved Gemini conversation lacks a durable archive boundary for recovery.");
+    }
+    await this.launch();
+    const restored = await this.startConversation(url, {
+      expectedUserMessageId: lastUserMessageId, expectedAssistantMessageId: lastAssistantMessageId,
+    });
+    if (restored.status !== "restored-existing" || !restored.targetId) {
+      throw uncertainGeminiOutbound("Gemini could not reopen the saved conversation for tool result recovery.");
+    }
+    await this.launchRecoveryTarget(restored.targetId);
+    const { url: sampledUrl, entries } = await this.conversationMessages().evaluateAll(readGeminiRows, GEMINI_MESSAGE_CONTENT);
+    const replyIndex = entries.findIndex((entry) => entry.role === "assistant" && entry.id === lastAssistantMessageId);
+    const user = entries[replyIndex - 1];
+    if (normalizedConversationUrl(sampledUrl) !== url || user?.role !== "user" || user.id !== lastUserMessageId
+      || entries.filter((entry) => entry.id === lastAssistantMessageId).length !== 1) {
+      throw uncertainGeminiOutbound("Gemini's archived conversation does not contain the saved tool call boundary.");
+    }
+    const assistantIndex = entries.slice(0, replyIndex).filter((entry) => entry.role === "assistant").length;
+    const reply = this.assistantMessages().nth(assistantIndex);
+    const identity = await this.messageIdentity(reply);
+    if (identity.id !== lastAssistantMessageId || createHash("sha256").update((await this.assistantText(reply)).trimEnd()).digest("hex") !== responseHash
+      || normalizedConversationUrl(this.page.url()) !== url) {
+      throw uncertainGeminiOutbound("Gemini's archived reply no longer matches the saved tool call.");
+    }
+    return restored.targetId;
+  }
+
+  async #readToolResultRetryHistory(anchor) {
+    const { url, entries } = await this.conversationMessages().evaluateAll(readGeminiRows, GEMINI_MESSAGE_CONTENT);
+    const priorUser = entries.at(-2);
+    const priorReply = entries.at(-1);
+    if (!this.hasExactRecoveryTarget(anchor.conversationTargetId)
+      || normalizedConversationUrl(url) !== anchor.conversationUrl
+      || normalizedConversationUrl(this.page.url()) !== anchor.conversationUrl
+      || priorUser?.role !== "user" || priorUser.id !== anchor.lastUserMessageId
+      || priorReply?.role !== "assistant" || priorReply.id !== anchor.lastAssistantMessageId
+      || entries.some((entry) => !entry.id || renderedMessageContainsOutboundMarker(entry.renderedText, anchor.outboundId))
+      || await this.page.locator("pending-request").count() > 0
+      || await firstVisible(this.stopButtonLocators())) {
+      throw uncertainGeminiOutbound("Gemini's original conversation is no longer at the saved tool call. Review the tab before continuing.");
+    }
+    if (anchor.responseHash) {
+      const reply = await this.assistantText(this.assistantMessages().last());
+      if (createHash("sha256").update(reply.trimEnd()).digest("hex") !== anchor.responseHash) {
+        throw uncertainGeminiOutbound("Gemini's previous reply no longer matches the saved tool call.");
+      }
+    }
+    return entries.filter((entry) => entry.role === "assistant").map((entry) => entry.id);
+  }
+
+  async prepareToolResultRetry({ pendingOutbound, conversationTargetId, lastUserMessageId, lastAssistantMessageId, responseHash }) {
+    const anchor = {
+      conversationUrl: normalizedConversationUrl(pendingOutbound.conversationUrl),
+      conversationTargetId, outboundId: pendingOutbound.outboundId, lastUserMessageId, lastAssistantMessageId, responseHash,
+    };
+    const ids = await this.#readToolResultRetryHistory(anchor);
+    const composer = await firstVisible(this.composerLocators());
+    const draft = composer ? await this.#readComposerText(composer) : null;
+    if (draft == null || await firstVisible(this.pendingAttachmentLocators())
+      || (draft.trim() && !await this.#matchesSavedDraft(anchor, pendingOutbound.messageHash))) {
+      throw uncertainGeminiOutbound("Gemini's composer contains another draft or attachments. Check the original tab before retrying the saved result.");
+    }
+    this.acceptRecoveredOutboundAnchor({
+      conversationUrl: anchor.conversationUrl, conversationTargetId,
+      userMessageId: lastUserMessageId, assistantBaseline: { ids, count: ids.length },
+    });
+    return async (message, options) => {
+      this.toolResultRetryAnchor = anchor;
+      try {
+        return await this.sendMessage(message, options);
+      } finally {
+        this.toolResultRetryAnchor = null;
+      }
+    };
+  }
+
+  async #matchesSavedDraft(anchor, messageHash) {
+    const composer = await firstVisible(this.composerLocators());
+    if (!composer) return false;
+    const draft = await this.#readComposerText(composer);
+    if (draft == null || !renderedMessageContainsOutboundMarker(draft, anchor.outboundId)) return false;
+    // Quill can substitute nonbreaking spaces and append one layout newline.
+    // Accept those representations only when the result matches the saved hash.
+    const plainSpaces = draft.replaceAll("\u00a0", " ");
+    return [draft, plainSpaces].some((text) => [text, text.replace(/\n$/, "")]
+      .some((value) => createHash("sha256").update(value).digest("hex") === messageHash));
+  }
+
+  async #readRecoveredBoundary(anchor, { waitForIdentity = false, draftHash = null } = {}) {
+    const snapshot = await this.conversationMessages().evaluateAll(readGeminiRows, GEMINI_MESSAGE_CONTENT);
+    const { entries } = snapshot;
+    if (!this.hasExactRecoveryTarget(anchor.conversationTargetId)
+      || normalizedConversationUrl(snapshot.url) !== anchor.conversationUrl
+      || normalizedConversationUrl(this.page.url()) !== anchor.conversationUrl) {
+      throw uncertainGeminiOutbound("Gemini could not verify the saved target and conversation URL.");
+    }
+    const matching = entries.filter((entry) => entry.role === "user"
+      && renderedMessageContainsOutboundMarker(entry.renderedText, anchor.outboundId));
+    if (matching.length === 0 && draftHash && anchor.lastUserMessageId && anchor.lastAssistantMessageId
+      && entries.at(-2)?.id === anchor.lastUserMessageId
+      && entries.at(-1)?.id === anchor.lastAssistantMessageId
+      && await this.#matchesSavedDraft(anchor, draftHash)
+      && this.hasExactRecoveryTarget(anchor.conversationTargetId)
+      && normalizedConversationUrl(this.page.url()) === anchor.conversationUrl) {
+      throw new BrowserAdapterError(
+        "Gemini still has the exact saved draft in the original tab. Check the conversation, send that draft once in the browser, then resume this session.",
+        { code: "OUTBOUND_DRAFT_PRESENT", recoverable: false },
+      );
+    }
+    const user = matching[0];
+    if (matching.length === 0) {
+      throw new BrowserAdapterError("Gemini has no sent message matching the pending outbound in the saved conversation.", {
+        code: "OUTBOUND_TRACE_MISSING", recoverable: false,
+      });
+    }
+    if (matching.length !== 1 || (anchor.userMessageId && user.id !== anchor.userMessageId)) {
+      throw uncertainGeminiOutbound("Gemini could not identify exactly one user message for the pending send.");
+    }
+    const index = entries.indexOf(user);
+    const prefix = entries.slice(0, index);
+    const suffix = entries.slice(index + 1);
+    const assistant = suffix[0] ?? null;
+    const ids = entries.map((entry) => entry.id).filter(Boolean);
+    if (prefix.some((entry) => !entry.id) || new Set(ids).size !== ids.length
+      || (anchor.requiresEmptyPrefix ? prefix.length !== 0 : !prefix.some((entry) => anchor.preOutboundIds.has(entry.id)))
+      || suffix.length > 1
+      || (assistant && assistant.role !== "assistant")
+      || (anchor.assistantCandidateMessageId && assistant?.id !== anchor.assistantCandidateMessageId)) {
+      throw uncertainGeminiOutbound("Gemini's conversation history or adjacent reply changed during recovery.");
+    }
+    if (!user.id || (assistant && !assistant.id)) {
+      if (waitForIdentity) return null;
+      throw uncertainGeminiOutbound("Gemini has not assigned stable identities to the recovered turn.");
+    }
+    return { user, assistant, prefix };
+  }
+
+  async reconcilePendingOutbound({
+    pendingOutbound = null,
+    priorHandoff = null,
+    conversationTargetId,
+    lastUserMessageId = null,
+    lastAssistantMessageId = null,
+    timeoutMs = this.sendConfirmationTimeoutMs(),
+    stableWindowMs = this.restorationCorrelationWindowMs(),
+  } = {}) {
+    this.requirePage();
+    const page = this.page;
+    const outboundId = pendingOutbound?.outboundId ?? priorHandoff?.sourceOutboundId;
+    const kind = pendingOutbound?.kind ?? priorHandoff?.outboundKind;
+    const savedUrl = normalizedConversationUrl(pendingOutbound?.conversationUrl ?? priorHandoff?.conversationUrl);
+    const conversationUrl = normalizedConversationUrl(page.url());
+    const requiresEmptyPrefix = ["bootstrap", "fresh_rebuild"].includes(kind);
+    if (!this.hasExactRecoveryTarget(conversationTargetId)
+      || !isValidOutboundCorrelationId(outboundId)
+      || this.classifyConversationUrl(conversationUrl) !== "restorable"
+      || (conversationUrl !== savedUrl && !(requiresEmptyPrefix && this.classifyConversationUrl(savedUrl) === "fresh"))) {
+      throw uncertainGeminiOutbound("Gemini recovery requires the exact saved browser target and conversation.");
+    }
+    // Older versions could persist the optimistic Angular row identity.
+    // Rebind it only with the nonce and verified preceding messages.
+    const savedUserId = priorHandoff?.userMessageId;
+    const userMessageId = savedUserId && savedUserId !== GEMINI_PENDING_USER_ID ? savedUserId : null;
+    const assistantCandidateMessageId = priorHandoff?.assistantMessageId
+      ?? priorHandoff?.assistantCandidateMessageId ?? null;
+    if (priorHandoff?.status === "complete" && (!priorHandoff.assistantMessageId || !priorHandoff.responseHash)) {
+      throw uncertainGeminiOutbound("Gemini's completed handoff is missing its reply identity or hash.");
+    }
+    const preOutboundIds = new Set([
+      lastUserMessageId, lastAssistantMessageId,
+      ...(priorHandoff?.preOutboundMarkerIds ?? []),
+      ...(priorHandoff?.assistantBaseline?.ids ?? []),
+    ].filter((id) => id && id !== GEMINI_PENDING_USER_ID
+      && id !== userMessageId && id !== assistantCandidateMessageId));
+    const anchor = {
+      conversationUrl, conversationTargetId, outboundId, requiresEmptyPrefix,
+      preOutboundIds, userMessageId, assistantCandidateMessageId, lastUserMessageId, lastAssistantMessageId,
+    };
+    const initialReadOptions = {
+      waitForIdentity: true,
+      draftHash: priorHandoff ? null : pendingOutbound?.messageHash,
+    };
+    let invalidated = false;
+    let timer;
+    const onNavigation = (frame) => {
+      if (frame === page.mainFrame()) invalidated = true;
+    };
+    page.on("framenavigated", onNavigation);
+    try {
+      return await Promise.race([
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            invalidated = true;
+            reject(uncertainGeminiOutbound("Gemini could not verify the pending send before the recovery deadline."));
+          }, timeoutMs);
+        }),
+        (async () => {
+          let first = await this.#readRecoveredBoundary(anchor, initialReadOptions);
+          while (!first && !invalidated && this.page === page) {
+            await this.waitForPoll(250);
+            if (!invalidated && this.page === page) {
+              first = await this.#readRecoveredBoundary(anchor, initialReadOptions);
+            }
+          }
+          if (!first || invalidated || this.page !== page) {
+            throw uncertainGeminiOutbound("Gemini's pending turn could not be bound to the saved conversation.");
+          }
+          anchor.userMessageId = first.user.id;
+          anchor.assistantCandidateMessageId = first.assistant?.id ?? null;
+          await this.waitForPoll(stableWindowMs);
+          let complete = null;
+          if (priorHandoff?.status === "complete") {
+            const reply = this.assistantMessages().last();
+            const rawResponse = await this.assistantText(reply);
+            const responseHash = createHash("sha256").update(rawResponse).digest("hex");
+            if (responseHash !== priorHandoff.responseHash
+              || await this.isAssistantGenerating(reply)) {
+              throw uncertainGeminiOutbound("Gemini's saved reply changed before recovery.");
+            }
+            complete = { assistantMessageId: first.assistant?.id, rawResponse, responseHash };
+          }
+          const { assistant, prefix } = await this.#readRecoveredBoundary(anchor);
+          if (invalidated || this.page !== page) {
+            throw uncertainGeminiOutbound("Gemini navigated while verifying the pending send.");
+          }
+          anchor.assistantCandidateMessageId = assistant?.id ?? null;
+          const ids = prefix.filter((entry) => entry.role === "assistant").map((entry) => entry.id);
+          const outcome = {
+            status: complete ? "complete" : "waiting",
+            conversationUrl,
+            conversationTargetId,
+            userMessageId: anchor.userMessageId,
+            assistantCandidateMessageId: anchor.assistantCandidateMessageId,
+            assistantBaseline: { ids, count: ids.length },
+            preOutboundMarkerIds: prefix.filter((entry) => preOutboundIds.has(entry.id)).map((entry) => entry.id),
+            ...complete,
+          };
+          this.acceptRecoveredOutboundAnchor(outcome);
+          this.recoveredGeminiAnchor = anchor;
+          return outcome;
+        })(),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      page.off("framenavigated", onNavigation);
+    }
+  }
+
+  async assertRecoveredTurnTopology({ assistantPresent = false, assistantMessageId = null } = {}) {
+    const anchor = this.recoveredGeminiAnchor;
+    if (!anchor) return;
+    const { assistant } = await this.#readRecoveredBoundary(anchor);
+    if (assistantPresent && assistant?.id !== assistantMessageId) {
+      throw uncertainGeminiOutbound("Gemini's response is outside the recovered user turn.");
+    }
+    anchor.assistantCandidateMessageId ??= assistant?.id ?? null;
+  }
+
   async messageIdentity(message) {
     const modelContent = message.locator(
-      'message-content[id^="message-content-id-"]',
+      GEMINI_MESSAGE_CONTENT.assistant,
     ).first();
     // `getAttribute()` waits for the locator by default. User rows never have
     // message-content, so probing it directly added one full 15-second timeout
@@ -113,7 +427,7 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     }
 
     const userContent = message.locator(
-      '.query-content[id^="user-query-content-"]',
+      GEMINI_MESSAGE_CONTENT.user,
     ).first();
     const userId = await userContent.count().catch(() => 0) > 0
       ? await userContent.getAttribute("id").catch(() => null)
@@ -297,23 +611,42 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     }
   }
 
-  async submitComposer(composer, options = {}) {
-    const sendButton = await firstVisible(this.sendButtonLocators());
-    options.assertActive?.();
-    if (this.musicGeneration && sendButton && await sendButton.isEnabled()) {
-      // Gemini's current Music UI reliably activates through the focused
-      // button's keyboard handler. Submit once; never retry an unknown commit.
-      await sendButton.press("Space", { timeout: options.timeoutMs });
-      return;
+  async prepareComposerSubmission(composer, { text } = {}) {
+    const deadline = this.monotonicNow() + 10_000;
+    while (this.monotonicNow() < deadline) {
+      const button = await firstVisible(this.sendButtonLocators());
+      if (button && await button.isEnabled()
+        && await this.page.locator("pending-request").count() === 0) {
+        if (text != null && await this.#readComposerText(composer, text) !== text) {
+          throw new BrowserAdapterError("Gemini's draft changed before submission. Check the composer before continuing.", {
+            code: "COMPOSER_CHANGED_BEFORE_SEND", recoverable: false,
+          });
+        }
+        if (this.toolResultRetryAnchor) await this.#readToolResultRetryHistory(this.toolResultRetryAnchor);
+        return button;
+      }
+      await this.waitForPoll(100);
     }
-    if (
-      sendButton
-      && await sendButton.isEnabled().catch(() => false)
-      && await this.#clickWithNativePointer(sendButton, options.assertActive)
-    ) {
-      return;
+    throw new BrowserAdapterError("Gemini did not enable its Send button. The draft remains in the composer.", {
+      code: "SEND_BUTTON_NOT_READY", recoverable: false,
+    });
+  }
+
+  async submitComposer(composer, { assertActive = () => {}, timeoutMs, preparedSubmission } = {}) {
+    const button = preparedSubmission ?? await this.prepareComposerSubmission(composer);
+    assertActive();
+    const options = { timeout: Math.min(timeoutMs ?? 10_000, 10_000) };
+    try {
+      if (this.musicGeneration) {
+        await button.press("Space", options);
+      } else {
+        await button.click(options);
+      }
+    } catch (cause) {
+      throw new BrowserAdapterError("Gemini's Send action ended without confirmation. Check the original tab before retrying.", {
+        code: "SEND_COMMIT_UNKNOWN", recoverable: false, cause,
+      });
     }
-    await super.submitComposer(composer, options);
   }
 
   async prepareMusicGeneration() {
@@ -372,7 +705,6 @@ export class GeminiWebAdapter extends BaseWebAdapter {
   }
 
   async findUsageLimitMarker(message) {
-    const rowText = await message.innerText().catch(() => "");
     const alert = this.page.locator('[role="alert"], [data-test-id*="toast"]')
       .last();
     // An absent alert is the normal case. Calling innerText() directly on that
@@ -382,8 +714,10 @@ export class GeminiWebAdapter extends BaseWebAdapter {
       && await alert.isVisible().catch(() => false)
       ? await alert.innerText().catch(() => "")
       : "";
-    const text = [alertText, rowText].filter(Boolean).join(" ");
-    return isUsageLimitNotice(text) ? text.trim().slice(0, 160) : null;
+    if (isUsageLimitNotice(alertText)) return alertText.trim().slice(0, 160);
+    const rowText = await message.innerText().catch(() => "");
+    return !rowText.includes("<agent_response") && isUsageLimitNotice(rowText)
+      ? rowText.trim().slice(0, 160) : null;
   }
 
   async findGenerationErrorMarker(message) {
@@ -395,6 +729,41 @@ export class GeminiWebAdapter extends BaseWebAdapter {
     }
     const text = await error.innerText().catch(() => "");
     return text.trim().slice(0, 160) || "model error";
+  }
+
+  hasStructuralDiagnostics() {
+    return typeof this.page?.evaluate === "function";
+  }
+
+  async structuralDiagnostics() {
+    const dom = await this.page.evaluate((selectors) => {
+      const visible = (node) => node.getClientRects().length > 0;
+      const all = (selector) => [...document.querySelectorAll(selector)];
+      const send = all('button[aria-label="发送"],button[aria-label="Send"],button[aria-label="Send message"]').filter(visible);
+      return {
+        userRows: all("user-query").length,
+        stableUserIds: all(`user-query ${selectors.user}`).length,
+        assistantRows: all("model-response").length,
+        pendingRows: all("pending-request").length,
+        composerHasDraft: all('.ql-editor[contenteditable="true"]').some((node) => visible(node) && node.textContent.trim()),
+        sendVisible: send.length > 0,
+        sendEnabled: send.some((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true"),
+        visibleAlerts: all('[role="alert"],[data-test-id*="toast"]').filter(visible).length,
+      };
+    }, GEMINI_MESSAGE_CONTENT);
+    const sample = this.activeSendProof?.sample;
+    const issues = [];
+    if (dom.pendingRows && dom.userRows > dom.stableUserIds) {
+      issues.push("Gemini is still showing an unconfirmed temporary message");
+    }
+    if (dom.composerHasDraft && dom.sendVisible && !dom.sendEnabled) {
+      issues.push("Gemini's Send button is disabled with a draft in the composer");
+    }
+    return {
+      status: "captured", issues, ...dom,
+      sawMatchingUnnumberedUser: this.activeSendProof?.sawMatchingUnnumberedUser === true,
+      candidateMarkerMatched: sample?.markerMatched ?? null,
+    };
   }
 
   async #readComposerText(composer, expected = null) {

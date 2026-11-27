@@ -1,4 +1,4 @@
-import { NATIVE_IMAGE_CONTRACT, wrapSystemPrompt } from "./markers.js";
+import { NATIVE_IMAGE_CONTRACT, TOOL_REQUEST_INSTRUCTIONS, wrapSystemPrompt } from "./markers.js";
 
 function formatTool(tool) {
   // Flat, so multi-line descriptions (arrays) keep their line breaks instead
@@ -16,12 +16,10 @@ function cdata(value) {
 
 const DONE_SEMANTICS = `Current-run completion semantics:
 - <done>true</done> ends only the current agent run and returns control to the user. It does not close this conversation; the user may send a follow-up later.
-- Set done=true only when the current user request has a complete, deliverable answer, or when you have a specific question that must be answered by the user before useful work can continue.
+- Set done=true for a complete, deliverable answer, a specific question that requires user input, or a concrete blocker that prevents further progress.
 - For informational or conversational tasks (e.g. answering a question, summarizing text, brainstorming), you can reply with done=true and your answer directly — no tool call is required.
 - For tasks that require reading, creating, or modifying files on the user's machine, use the local tools and verify the result before done=true.
-- Base claims about creating, changing, reading, testing, or verifying local state on tool results returned in this run. The Runtime validates the protocol and tracks tool execution; you are responsible for assessing whether the user's request is satisfied.
-- Use done=false only when you are about to call a local tool and need its result before you can continue.
-- Tool count, elapsed turns, or lack of an immediately obvious next action never proves completion.`;
+- When the user asks for a local file, deliver it at the requested path with fs.write or fs.edit and report that path after the tool confirms success.`;
 
 // The protocol + tool catalog are WTAgent-specific transport scaffolding.
 // They are wrapped for the web message and never persisted into the portable
@@ -29,11 +27,9 @@ const DONE_SEMANTICS = `Current-run completion semantics:
 function buildBootstrapScaffold({ projectRoot, tools, nativeImages }) {
   const toolDocs = tools.map(formatTool).join("\n\n");
 
-  return `The user is running WTAgent, a local application that uses this web AI conversation for reasoning. The following is the user's requested application-level response format and collaboration contract; it is not a claim that this web chat has native filesystem or function-call tools.
+  return `The user is running WTAgent, a local application that uses this web AI conversation for reasoning. Use the following application-level response format to work with WTAgent.
 
-You do not need direct filesystem access for local operations. Return local operation requests as XML text. After your reply is complete, the user's local Node.js Runtime will parse the XML, validate the arguments, apply local policy, and may execute the requested operation. Its result will arrive in the next user message as <tool_result>. XML by itself never guarantees execution.
-
-You are not limited to coding tasks. You can answer questions, write text, brainstorm, analyze, summarize, and — when the task requires it — request that the user's Runtime read, create, or modify files or run commands.
+Request local operations by writing XML text. After your reply, WTAgent on the user's machine validates the request, applies local policy, and returns the outcome in the next user message as <tool_result>.
 
 ## Filesystem boundary
 The project filesystem described below is a logical, virtual filesystem namespace exposed by the local Runtime. It is not mounted in the web provider's own environment and cannot be inspected directly from this webpage.
@@ -56,7 +52,7 @@ ${nativeImages ? "Every text reply" : "Every reply"} must contain exactly one co
 \`\`\`
 
 Rules:
-1. Call at most one tool per turn.
+1. ${TOOL_REQUEST_INSTRUCTIONS}
 2. Follow the completion semantics below exactly.
 3. Use CDATA for code, long text, command output, or any content containing < > &.
 4. Do not emit native function calls or JSON tool calls; the entire XML must use exactly one \`xml\` code fence.
@@ -116,9 +112,11 @@ export function buildBootstrapPrompt({
 function buildResumeScaffold({ tools, followUpRule, state, nextInstruction, nativeImages }) {
   const toolDocs = tools.map(formatTool).join("\n\n");
 
-  return `Continue the same WTAgent session using the user's requested XML application protocol. You do not need native tool access: write a <tool_call> request as text, and the user's local Runtime will validate it, may execute it, and will return <tool_result> in the next user message.
+  return `Continue the same WTAgent session using its XML response format. Request local operations as XML text and use the <tool_result> returned by WTAgent on the user's machine.
 
-${nativeImages ? `${NATIVE_IMAGE_CONTRACT}\n\nFor text replies: ` : ""}Still place your single <agent_response> XML inside one \`xml\` code fence with no text outside it and call at most one tool per turn. This preserves JavaScript backticks inside file contents.
+${nativeImages ? `${NATIVE_IMAGE_CONTRACT}\n\nFor text replies: ` : ""}Still place your single <agent_response> XML inside one \`xml\` code fence with no text outside it. This preserves JavaScript backticks inside file contents.
+
+${TOOL_REQUEST_INSTRUCTIONS}
 
 ${DONE_SEMANTICS}
 

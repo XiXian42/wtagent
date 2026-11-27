@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AgentRuntime } from "../src/runtime/agent-runtime.js";
 import { FakeWebModelAdapter } from "../src/browser/fake-web-model-adapter.js";
+import { appendSystemReminder, LEGACY_TOOL_RESULT_REMINDERS } from "../src/protocol/markers.js";
 import { createDefaultToolRegistry } from "../src/tools/default-tools.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import { PolicyEngine } from "../src/policy/policy-engine.js";
@@ -77,13 +78,14 @@ async function createInterruptedResumeSession(t, {
   return { base, projectRoot, sessionsDir, session };
 }
 
-function runtimeForResume(session, adapter, { events = [] } = {}) {
+function runtimeForResume(session, adapter, { events = [], confirmToolResultRetry } = {}) {
   return new AgentRuntime({
     adapter,
     registry: createDefaultToolRegistry(),
     policy: new PolicyEngine(),
     session,
     approval: async () => false,
+    confirmToolResultRetry,
     onEvent: (event) => events.push(event),
   });
 }
@@ -198,18 +200,26 @@ test("runs a full model-tool-model loop", async (t) => {
     projectRoot,
     mode: "Pro",
   });
+  const events = [];
   const runtime = new AgentRuntime({
     adapter,
     registry: createDefaultToolRegistry(),
     policy: new PolicyEngine(),
     session,
     approval: async () => false,
+    onEvent: (event) => events.push(event),
   });
 
   const result = await runtime.run();
   assert.equal(result.message, "Website created and verified.");
   assert.equal(await fs.readFile(path.join(projectRoot, "index.html"), "utf8"), "<h1>Hello</h1>");
-  assert.match(adapter.sentMessages[1], /<tool_result/);
+  assert.equal(adapter.sentMessages.length, 3);
+  assert.deepEqual(events.filter(({ type }) => ["tool.completed", "tool.result_sending", "tool.result_sent"].includes(type))
+    .map(({ type }) => type), ["tool.completed", "tool.result_sending", "tool.result_sent", "tool.completed", "tool.result_sending", "tool.result_sent"]);
+  for (const message of adapter.sentMessages.slice(1)) {
+    assert.match(message, /^<tool_result/);
+    assert.match(message, /request the next operation if work remains/);
+  }
   assert.equal(session.state.phase, "idle");
   assert.equal("status" in session.state, false);
   for (const message of adapter.sentMessages) {
@@ -294,7 +304,7 @@ test("asks ChatGPT to continue after empty replies without resending the task", 
     assert.match(continuation, /previous assistant response was empty/i);
     assert.match(continuation, /Do not repeat any local tool operation/i);
     assert.doesNotMatch(continuation, /UNIQUE_ORIGINAL_TASK/);
-    assert.doesNotMatch(continuation, /<tool_result/);
+    assert.doesNotMatch(continuation, /<tool_result name=/);
     assertOneTrailingReminder(continuation);
   }
   assert.deepEqual(
@@ -400,7 +410,7 @@ test("in-place recovery continues without resending a persisted pending result",
   assert.equal(result.message, "Continued.");
   assert.equal(adapter.sentMessages.length, 1);
   assert.match(adapter.sentMessages[0], /previous assistant response was empty/i);
-  assert.doesNotMatch(adapter.sentMessages[0], /<tool_result/);
+  assert.doesNotMatch(adapter.sentMessages[0], /<tool_result name=/);
   assert.equal(session.state.pendingToolResult, null);
 });
 
@@ -455,6 +465,11 @@ test("continues beyond the former 36-step run limit", async (t) => {
   assert.equal(result.message, "Finished after 37 tools.");
   assert.equal(executions, 37);
   assert.equal(session.state.turn, 38);
+  for (const message of adapter.sentMessages.slice(1)) {
+    assert.match(message, /<tool_result name="debug.step" status="ok">/);
+    assert.match(message, /request the next operation if work remains/);
+    assert.doesNotMatch(message, /Report tool limits/);
+  }
 });
 
 test("runtime never invokes provider model selection", async (t) => {
@@ -2327,7 +2342,7 @@ test("a crash after assistant receipt resumes from the durable raw response", as
   );
 });
 
-test("commit-unknown tool results are checkpointed and never replayed", async (t) => {
+test("resume sends an unconfirmed tool result only after confirmation", async (t) => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "wtagent-runtime-"));
   const projectRoot = path.join(base, "project");
   const sessionsDir = path.join(base, "sessions");
@@ -2378,6 +2393,76 @@ test("commit-unknown tool results are checkpointed and never replayed", async (t
   assert.equal(retryAdapter.launched, true);
   assert.deepEqual(retryAdapter.recoveryTargetCalls, ["fake-target"]);
   assert.notEqual(session.state.pendingOutbound, null);
+
+  const resumed = new FakeWebModelAdapter([
+    "<agent_response><done>true</done><message>Saved result received.</message></agent_response>",
+  ]);
+  const original = session.state.pendingOutbound;
+  resumed.conversationUrl = original.conversationUrl;
+  resumed.prepareToolResultRetry = async () => resumed.sendMessage.bind(resumed);
+  resumed.reconciliationOutcome = ({ conversationTargetId }) => {
+    if (resumed.sentMessages.length === 0) {
+      throw new BrowserAdapterError("Saved result is absent", { code: "OUTBOUND_TRACE_MISSING" });
+    }
+    return {
+      status: "waiting",
+      conversationUrl: original.conversationUrl,
+      conversationTargetId,
+      userMessageId: "retried-result",
+    };
+  };
+  const events = [];
+  const runtime = runtimeForResume(session, resumed, { events });
+  assert.match(original.toolResultReminder, /request the next operation if work remains/);
+  assert.equal((await runtime.run({ resume: true })).toolResultRetryDeferred, true);
+  assert.deepEqual(resumed.sentMessages, []);
+  assert.equal(session.state.phase, "awaiting_user");
+
+  const legacyReminder = LEGACY_TOOL_RESULT_REMINDERS.text;
+  const legacyResult = runtime.buildToolResultMessage(session.state.pendingToolResult, {
+    reminder: legacyReminder,
+  });
+  const legacyMessage = appendSystemReminder(
+    legacyResult,
+    `${legacyReminder} Opaque WTAgent transport correlation ID (do not repeat): ${original.outboundId}.`,
+  );
+  const legacyOutbound = {
+    ...original,
+    messageHash: createHash("sha256").update(legacyMessage).digest("hex"),
+  };
+  delete legacyOutbound.toolResultReminder;
+  await session.update({ pendingOutbound: legacyOutbound });
+  assert.equal((await runtime.run({ resume: true })).toolResultRetryDeferred, true);
+  assert.deepEqual(resumed.sentMessages, []);
+  await session.update({ pendingOutbound: original });
+
+  resumed.targetId = "reopened-target";
+  resumed.reopenSavedToolResultConversation = async ({ conversationUrl, responseHash }) => {
+    assert.equal(conversationUrl, original.conversationUrl);
+    assert.equal(responseHash, createHash("sha256").update(session.state.pendingAssistantTurn.rawResponse.trimEnd()).digest("hex"));
+    return resumed.targetId;
+  };
+  let confirmed = false;
+  let prompts = 0;
+  const interactive = runtimeForResume(session, resumed, {
+    events,
+    confirmToolResultRetry: async () => { prompts += 1; return confirmed; },
+  });
+  assert.equal((await interactive.run({ resume: true })).toolResultRetryDeferred, true);
+  assert.equal(prompts, 1);
+  assert.deepEqual(resumed.sentMessages, []);
+  assert.equal(session.state.conversationTargetId, "reopened-target");
+  assert.equal(session.state.pendingOutbound.outboundId, original.outboundId);
+  assert.ok(events.some((event) => event.type === "browser.started" && event.payload.reopened));
+  assert.equal(session.state.pendingOutbound.retryStartedAt, undefined);
+  confirmed = true;
+  assert.equal((await interactive.run({ resume: true })).message, "Saved result received.");
+  assert.equal(prompts, 2);
+  assert.deepEqual(resumed.sentMessages, [adapter.sentMessages[1]]);
+  assert.deepEqual(resumed.sentOutboundIds, [original.outboundId]);
+  assert.equal(events.filter((e) => e.type === "tool.started").length, 0);
+  assert.equal(session.state.pendingOutbound, null);
+  assert.equal(session.state.conversationTargetId, "reopened-target");
 });
 
 test("direct native text is returned to the agent without an auxiliary query", async (t) => {
@@ -2448,7 +2533,7 @@ test("image generation uses an auxiliary turn and checkpoints it before the tool
   assert.equal(result.message, "Saved.");
   assert.equal(adapter.sentMessages.length, 3);
   assert.match(adapter.sentMessages[1], /internal WTAgent provider operation/);
-  assert.match(adapter.sentMessages[2], /<tool_result/);
+  assert.match(adapter.sentMessages[2], /^<tool_result name=/);
   assert.equal(session.state.pendingAuxiliaryTurn, null);
   assert.equal(session.state.lastUserMessageId, "user-3");
   assert.equal(session.state.lastAssistantMessageId, "assistant-3");
@@ -3158,7 +3243,7 @@ test("asks ChatGPT to continue after a silently dead request", async (t) => {
     assert.match(continuation, /previous request received no reply/i);
     assert.match(continuation, /Do not repeat any local tool operation/i);
     assert.doesNotMatch(continuation, /UNIQUE_ORIGINAL_TASK/);
-    assert.doesNotMatch(continuation, /<tool_result/);
+    assert.doesNotMatch(continuation, /<tool_result name=/);
     assertOneTrailingReminder(continuation);
   }
   const emptyEvents = events.filter(

@@ -118,6 +118,7 @@ test("native reminder is included in the tool-result byte budget", async (t) => 
   const message = runtime.buildToolResultMessage({ name: "fs.read", ok: true, message: "Read", data: { content: "中".repeat(50_000) } });
   await runtime.sendMessage(message);
   assert.ok(Buffer.byteLength(state.adapter.sentMessages[0]) <= runtime.limits.maxBrowserToolResultBytes);
+  assert.match(state.adapter.sentMessages[0], /request the next operation if work remains/);
 });
 
 test("malformed XML with native images enabled still cannot execute a tool", async (t) => {

@@ -25,7 +25,8 @@ function fakeBrowserHarness({
   }],
 } = {}) {
   const existingPage = existingPages[0];
-  const freshPage = { name: "fresh", targetId: "target-fresh" };
+  let freshPageClosed = false;
+  const freshPage = { name: "fresh", targetId: "target-fresh", async close() { freshPageClosed = true; } };
   let closeCommandSent = false;
   let transportClosed = false;
   const context = {
@@ -57,6 +58,9 @@ function fakeBrowserHarness({
     context,
     existingPage,
     freshPage,
+    get freshPageClosed() {
+      return freshPageClosed;
+    },
     get closeCommandSent() {
       return closeCommandSent;
     },
@@ -196,9 +200,10 @@ test("reuses a healthy CDP browser and creates a fresh page", async () => {
   assert.notEqual(connection.page, harness.existingPage);
 
   await connection.close();
-  assert.equal(harness.closeCommandSent, true);
+  assert.equal(harness.freshPageClosed, true);
+  assert.equal(harness.closeCommandSent, false);
   assert.equal(harness.transportClosed, true);
-  assert.equal(controls.stateRemoved, true);
+  assert.equal(controls.stateRemoved, false);
   assert.equal(controls.released, true);
 });
 
@@ -433,6 +438,10 @@ test("reused browser prefers an existing tab on the preferred conversation", asy
   assert.equal(connection.page, harness.existingPage);
   assert.notEqual(connection.page, harness.freshPage);
   assert.equal(connection.preferredTabMatched, true);
+  await connection.close();
+  assert.equal(harness.closeCommandSent, false);
+  assert.equal(harness.transportClosed, true);
+  assert.equal(controls.released, true);
 });
 
 test("reused browser creates a fresh tab when no page matches the preferred URL", async () => {
@@ -450,6 +459,10 @@ test("reused browser creates a fresh tab when no page matches the preferred URL"
 
   assert.equal(connection.page, harness.freshPage);
   assert.equal(connection.preferredTabMatched, false);
+  await connection.close();
+  assert.equal(harness.freshPageClosed, true);
+  assert.equal(harness.closeCommandSent, false);
+  assert.equal(controls.stateRemoved, false);
 });
 
 test("reused browser follows a saved target through provisional canonicalization", async () => {

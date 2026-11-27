@@ -9,6 +9,7 @@ import {
 import {
   appendSystemReminder,
   DEFAULT_SYSTEM_REMINDER,
+  LEGACY_TOOL_RESULT_REMINDERS,
   NATIVE_IMAGE_SYSTEM_REMINDER,
 } from "../protocol/markers.js";
 import {
@@ -159,6 +160,7 @@ export class AgentRuntime {
     onEvent,
     postAuthSetup = null,
     chooseLogin = null,
+    confirmToolResultRetry = null,
     preferGuest = false,
     nativeImageReceiver = null,
     nativeMusicReceiver = null,
@@ -172,6 +174,7 @@ export class AgentRuntime {
     this.onEvent = onEvent;
     this.postAuthSetup = postAuthSetup;
     this.chooseLogin = chooseLogin;
+    this.confirmToolResultRetry = confirmToolResultRetry;
     this.preferGuest = preferGuest;
     this.nativeImageReceiver = nativeImageReceiver;
     this.nativeMusicReceiver = nativeMusicReceiver;
@@ -204,6 +207,15 @@ export class AgentRuntime {
     }
   }
 
+  #replyReminder() {
+    return this.nativeMusicReceiver ? MUSIC_SYSTEM_REMINDER
+      : this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER;
+  }
+
+  #outboundMessage(text, outboundId, reminder = this.#replyReminder()) {
+    return appendSystemReminder(text, `${reminder}${OUTBOUND_CORRELATION_PREFIX}${outboundId}.`);
+  }
+
   async sendMessage(text, {
     files = [],
     maxBytes = null,
@@ -218,12 +230,8 @@ export class AgentRuntime {
     this.#assertProviderReadyForMessage();
     await this.nativeMusicReceiver?.prepare();
     const outboundId = randomUUID();
-    const reminder = this.nativeMusicReceiver ? MUSIC_SYSTEM_REMINDER
-      : this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER;
-    const message = appendSystemReminder(
-      text,
-      `${reminder}${OUTBOUND_CORRELATION_PREFIX}${outboundId}.`,
-    );
+    const reminder = this.#replyReminder();
+    const message = this.#outboundMessage(text, outboundId, reminder);
     const pendingOutbound = {
       kind: outboundKind,
       outboundId,
@@ -235,6 +243,7 @@ export class AgentRuntime {
       conversationUrl: this.session.state.conversationUrl ?? null,
       conversationTargetId: this.session.state.conversationTargetId ?? null,
     };
+    if (outboundKind === "tool_result") pendingOutbound.toolResultReminder = reminder;
     await this.#queueSessionUpdate({ pendingOutbound });
     try {
       const sendResult = await this.#sendMessageWithReconnect(message, {
@@ -616,10 +625,9 @@ export class AgentRuntime {
     return { blockers, transcript, rebuildInstruction };
   }
 
-  buildToolResultMessage(result, { suffix = "" } = {}) {
+  buildToolResultMessage(result, { suffix = "", reminder = this.#replyReminder() } = {}) {
     const limit = this.limits.maxBrowserToolResultBytes;
-    const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix,
-      this.nativeImageReceiver ? NATIVE_IMAGE_SYSTEM_REMINDER : DEFAULT_SYSTEM_REMINDER))
+    const nonResultBytes = utf8ByteLength(appendSystemReminder(suffix, reminder))
       + OUTBOUND_CORRELATION_RESERVE_BYTES;
     const resultBudget = limit - nonResultBytes;
     if (resultBudget < 512) {
@@ -634,6 +642,7 @@ export class AgentRuntime {
     suffix = "",
     runtimeTurn = null,
   } = {}) {
+    await this.emit("tool.result_sending", { name: result.name });
     return await this.sendMessage(
       this.buildToolResultMessage(result, { suffix }),
       {
@@ -851,6 +860,66 @@ export class AgentRuntime {
     return refreshed;
   }
 
+  #savedToolReplyHash(handoff) {
+    const text = handoff?.rawResponse;
+    if (typeof text !== "string" || createHash("sha256").update(text).digest("hex") !== handoff.responseHash) return null;
+    // Gemini's archived renderer can append a layout newline to the same reply.
+    return createHash("sha256").update(text.trimEnd()).digest("hex");
+  }
+
+  async #retrySavedToolResult(recovery, previousHandoff) {
+    const { pendingOutbound } = recovery;
+    const result = this.session.state.pendingToolResult;
+    const acknowledgement = pendingOutbound?.pendingToolAcknowledgement;
+    const responseHash = this.#savedToolReplyHash(previousHandoff);
+    if (typeof this.adapter.prepareToolResultRetry !== "function"
+      || pendingOutbound?.kind !== "tool_result" || pendingOutbound.status !== "commit-unknown"
+      || pendingOutbound.retryStartedAt || !result || !acknowledgement
+      || !result.callId || result.callId !== acknowledgement.callId || result.name !== acknowledgement.name
+      || (result.operationSignature ?? null) !== (acknowledgement.operationSignature ?? null)
+      || previousHandoff?.status !== "complete" || !responseHash
+      || previousHandoff.userMessageId !== recovery.lastUserMessageId
+      || previousHandoff.assistantMessageId !== recovery.lastAssistantMessageId) {
+      throw new BrowserAdapterError("This session has no eligible saved tool result to retry on the original tab.", {
+        code: "TOOL_RESULT_RETRY_UNAVAILABLE", recoverable: false,
+      });
+    }
+    const reminder = pendingOutbound.toolResultReminder
+      ?? LEGACY_TOOL_RESULT_REMINDERS[this.nativeImageReceiver ? "nativeImage" : "text"];
+    const message = this.#outboundMessage(
+      this.buildToolResultMessage(result, { reminder }),
+      pendingOutbound.outboundId,
+      reminder,
+    );
+    if (createHash("sha256").update(message).digest("hex") !== pendingOutbound.messageHash) {
+      throw new BrowserAdapterError("The saved tool result no longer matches the original outbound. Review the original tab before continuing.", {
+        code: "TOOL_RESULT_RETRY_MISMATCH", recoverable: false,
+      });
+    }
+    const retryOptions = { ...recovery, responseHash };
+    await this.adapter.prepareToolResultRetry(retryOptions);
+    if (await this.confirmToolResultRetry?.() !== true) return null;
+    // The page can change while the user considers the confirmation.
+    const retry = await this.adapter.prepareToolResultRetry(retryOptions);
+    const checkpoint = { ...pendingOutbound, retryStartedAt: new Date().toISOString() };
+    await this.#queueSessionOperation(async () => {
+      if (this.session.state.pendingOutbound?.outboundId !== pendingOutbound.outboundId) {
+        throw new BrowserAdapterError("The pending outbound changed before retry.", { code: "OUTBOUND_COMMIT_UNCERTAIN", recoverable: false });
+      }
+      await this.session.update({ pendingOutbound: checkpoint });
+    });
+    await this.emit("tool.result_sending", { name: result.name, retry: true });
+    try {
+      await retry(message, { outboundId: pendingOutbound.outboundId, maxBytes: this.limits.maxBrowserToolResultBytes });
+    } catch (error) {
+      if (this.adapter.getLastSendStatus?.() === "not-submitted") {
+        await this.#queueSessionUpdate({ pendingOutbound }).catch(() => null);
+      }
+      throw error;
+    }
+    return result;
+  }
+
   async #recoverPendingConversation({ pendingOutbound, pendingAssistantTurn }) {
     const outboundId = pendingOutbound?.outboundId
       ?? pendingAssistantTurn?.sourceOutboundId
@@ -882,7 +951,7 @@ export class AgentRuntime {
         { code: "OUTBOUND_COMMIT_UNCERTAIN", recoverable: false },
       );
     }
-    const targetId = boundTargetId ?? rootTargetId;
+    let targetId = boundTargetId ?? rootTargetId;
     if (!targetId) {
       throw new BrowserAdapterError(
         "Pending outbound recovery requires the exact saved browser target.",
@@ -890,24 +959,62 @@ export class AgentRuntime {
       );
     }
 
-    await this.adapter.launchRecoveryTarget(targetId);
+    let reopened = false;
+    try {
+      await this.adapter.launchRecoveryTarget(targetId);
+    } catch (error) {
+      if (error?.code !== "RECOVERY_TARGET_UNAVAILABLE"
+        || pendingOutbound?.kind !== "tool_result" || pendingAssistantTurn?.status !== "complete"
+        || typeof this.adapter.reopenSavedToolResultConversation !== "function") throw error;
+      this.deferConversationIdentityPersistence = true;
+      try {
+        await this.conversationIdentityQueue.catch(() => null);
+        targetId = await this.adapter.reopenSavedToolResultConversation({
+          conversationUrl: pendingOutbound.conversationUrl,
+          lastUserMessageId: this.session.state.lastUserMessageId,
+          lastAssistantMessageId: this.session.state.lastAssistantMessageId,
+          responseHash: this.#savedToolReplyHash(pendingAssistantTurn),
+        });
+        pendingOutbound = { ...pendingOutbound, conversationTargetId: targetId };
+        pendingAssistantTurn = { ...pendingAssistantTurn, conversationTargetId: targetId };
+        await this.#queueSessionUpdate({ conversationTargetId: targetId, pendingOutbound, pendingAssistantTurn });
+        reopened = true;
+      } finally {
+        this.deferConversationIdentityPersistence = false;
+      }
+    }
     await this.emit("browser.started", {
       profileDir: this.adapter.profileDir,
       recovery: true,
       targetId,
+      reopened,
     });
     const priorForReconciliation = pendingOutbound
       && pendingAssistantTurn?.sourceOutboundId !== pendingOutbound.outboundId
       ? null
       : pendingAssistantTurn;
-    const outcome = await this.adapter.reconcilePendingOutbound({
+    const recovery = {
       pendingOutbound,
       priorHandoff: priorForReconciliation,
       conversationTargetId: targetId,
       lastUserMessageId: this.session.state.lastUserMessageId ?? null,
       lastAssistantMessageId:
         this.session.state.lastAssistantMessageId ?? null,
-    });
+    };
+    let outcome;
+    let retriedResult = null;
+    try {
+      outcome = await this.adapter.reconcilePendingOutbound(recovery);
+    } catch (error) {
+      const eligible = pendingOutbound?.kind === "tool_result" && pendingOutbound.status === "commit-unknown"
+        && !pendingOutbound.retryStartedAt
+        && typeof this.adapter.prepareToolResultRetry === "function"
+        && ["OUTBOUND_TRACE_MISSING", "OUTBOUND_DRAFT_PRESENT"].includes(error?.code);
+      if (!eligible) throw error;
+      retriedResult = await this.#retrySavedToolResult(recovery, pendingAssistantTurn);
+      if (!retriedResult) return null;
+      outcome = await this.adapter.reconcilePendingOutbound(recovery);
+    }
     if (!["waiting", "complete"].includes(outcome?.status)) {
       throw new BrowserAdapterError(
         "Pending outbound recovery did not return a durable assistant boundary.",
@@ -956,6 +1063,9 @@ export class AgentRuntime {
         status: outcome.status,
         userMessageId: outcome.userMessageId ?? null,
       });
+      if (retriedResult) {
+        await this.emit("tool.result_sent", { name: retriedResult.name, ok: retriedResult.ok, retry: true });
+      }
     } else if (handoff) {
       handoff = await this.#queueSessionOperation(() => (
         this.session.refreshPendingAssistantTurn(
@@ -1081,6 +1191,11 @@ export class AgentRuntime {
         pendingOutbound: pendingOutboundAtStart,
         pendingAssistantTurn: pendingAssistantAtStart,
       });
+      if (!recoveredHandoff) {
+        await this.session.update({ phase: "awaiting_user" });
+        await this.emit("run.tool_result_retry_deferred");
+        return { sessionId: this.session.sessionId, toolResultRetryDeferred: true };
+      }
       // Recovery proves the browser boundary before touching a possibly-running
       // side-effect ledger. The existing local exactly-once rules then apply.
       await this.session.recoverInterruptedSideEffects();
@@ -1369,6 +1484,9 @@ export class AgentRuntime {
     }
 
     if (!legacyAssistantRecoveryAtStart) {
+      if (initialKind === "pending_tool_result") {
+        await this.emit("tool.result_sending", { name: pendingToolResult?.name });
+      }
       await this.sendMessage(initialMessage, {
         files,
         maxBytes: initialKind === "pending_tool_result"
@@ -1397,6 +1515,9 @@ export class AgentRuntime {
         }
         : null;
       await this.emit("model.message_sent", { kind: initialKind });
+      if (initialKind === "pending_tool_result") {
+        await this.emit("tool.result_sent", { name: pendingToolResult?.name, ok: pendingToolResult?.ok });
+      }
     }
     }
 
@@ -1819,7 +1940,7 @@ export class AgentRuntime {
         // done=true or invoke a local tool to make progress.
         await this.sendMessage(
           "If the current request is deliverable, reply with <done>true</done> and the result. "
-            + "If you need to take action on the user's machine, request one local tool. "
+            + "If you need to take action on the user's machine, request the next local operation. "
             + "If you need information from the user, ask one specific question in <message> "
             + "and set <done>true</done> so control returns to the user.",
           {

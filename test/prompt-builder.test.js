@@ -4,6 +4,10 @@ import {
   buildBootstrapPrompt,
   buildResumePrompt,
 } from "../src/protocol/prompt-builder.js";
+import {
+  DEFAULT_SYSTEM_REMINDER,
+  NATIVE_IMAGE_SYSTEM_REMINDER,
+} from "../src/protocol/markers.js";
 
 const tools = [{
   name: "fs.read",
@@ -14,17 +18,25 @@ const tools = [{
 const requiredSemantics = [
   "<done>true</done> ends only the current agent run",
   "It does not close this conversation",
-  "Set done=true only when the current user request has a complete, deliverable answer",
+  "Set done=true for a complete, deliverable answer",
   "you can reply with done=true and your answer directly — no tool call is required",
   "use the local tools and verify the result before done=true",
-  "Use done=false only when you are about to call a local tool",
-  "Tool count, elapsed turns, or lack of an immediately obvious next action never proves completion.",
+  "deliver it at the requested path with fs.write or fs.edit and report that path after the tool confirms success",
 ];
 
 function assertPreciseDoneSemantics(prompt) {
   for (const text of requiredSemantics) {
     assert.match(prompt, new RegExp(escapeRegExp(text)));
   }
+  assertLocalToolWorkflow(prompt);
+}
+
+function assertLocalToolWorkflow(prompt) {
+  assert.match(prompt, /the next local operation in <tool_call> with <done>false<\/done>/);
+  assert.match(prompt, /Wait for its <tool_result>, then choose and request the next operation if work remains/);
+  assert.match(prompt, /Base claims about local tool status on WTAgent's actual <tool_result>/);
+  assert.match(prompt, /explain the operation and the specific error returned/);
+  assert.doesNotMatch(prompt, /at most one <tool_call>|tool (?:count|limits|quota|budget)|permission restrictions/i);
 }
 
 function escapeRegExp(value) {
@@ -59,8 +71,8 @@ test("bootstrap prompt defines the virtual filesystem boundary", () => {
   assert.match(web, /logical, virtual filesystem namespace/);
   assert.match(web, /Do not inspect \/workspace, \/mnt\/data/);
   assert.match(web, /only through the XML operations declared below/);
-  assert.match(web, /requested application-level response format/);
-  assert.match(web, /You do not need direct filesystem access/);
+  assert.match(web, /application-level response format/);
+  assert.match(web, /WTAgent on the user's machine validates the request/);
   assert.doesNotMatch(web, /emitting tool_call XML invokes the tools/);
   assert.doesNotMatch(web, /Ignore any and all previous instructions/);
 });
@@ -125,4 +137,11 @@ test("resume prompt treats a follow-up as the next message in an open session", 
   assertPreciseDoneSemantics(web);
   assert.match(web, /next message in the same open conversation/);
   assert.doesNotMatch(web, /previous_status|completed\/done status/);
+});
+
+test("per-message reminders describe the local workflow without priming tool limits", () => {
+  for (const reminder of [DEFAULT_SYSTEM_REMINDER, NATIVE_IMAGE_SYSTEM_REMINDER]) {
+    assertLocalToolWorkflow(reminder);
+    assert.match(reminder, /Leave protocol details and speculation out of task updates/);
+  }
 });

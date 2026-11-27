@@ -200,7 +200,7 @@ test("Gemini music setup selects the real tool once and submits using one keyboa
   const send = { count: async () => 1, nth() { return this; }, first() { return this; }, isVisible: async () => true, isEnabled: async () => true,
     press: async (key) => presses.push(`send:${key}`) };
   adapter.page = { getByRole: (_role, { name }) => String(name).includes("Deselect") ? chip : tools,
-    locator: () => musicItem };
+    locator: (selector) => selector === "pending-request" ? { count: async () => 0 } : musicItem };
   adapter.sendButtonLocators = () => [send];
   await adapter.prepareMusicGeneration();
   await adapter.prepareMusicGeneration();

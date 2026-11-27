@@ -105,13 +105,13 @@ export class Renderer {
     this.stream.write(`\r\x1b[2K${line}`);
   }
 
-  beginProcessing() {
-    if (this.spinner?.kind === "processing") {
+  beginProcessing(label = t("renderer.processing")) {
+    if (this.spinner?.kind === "processing" && this.spinner.label === label) {
       return;
     }
     this.spinner = {
       kind: "processing",
-      label: t("renderer.processing"),
+      label,
       start: Date.now(),
       bytes: 0,
     };
@@ -404,11 +404,18 @@ export class Renderer {
           })}${RESET}`,
         );
         break;
-      case "tool.result_sent":
-        // A tool result was just sent to the model; we are waiting on the next
-        // reply, so bring the processing spinner back.
-        this.beginProcessing();
+      case "tool.result_sending": {
+        const label = t("renderer.sendingToolResult", { provider: this.providerLabel });
+        this.note(label);
+        this.beginProcessing(label);
         break;
+      }
+      case "tool.result_sent": {
+        const label = t("renderer.waitingAfterToolResult", { provider: this.providerLabel });
+        this.note(label);
+        this.beginProcessing(label);
+        break;
+      }
       default:
         break;
     }

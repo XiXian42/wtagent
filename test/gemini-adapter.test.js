@@ -131,6 +131,11 @@ test("exposes Gemini's new-chat and saved-conversation URLs", () => {
   assert.ok(adapter.conversationUrlPattern().test("/app/38f5d1b168f9c3c5"));
 });
 
+test("allows ten minutes for Gemini to confirm a send", () => {
+  const adapter = new GeminiWebAdapter({ profileDir: "." });
+  assert.equal(adapter.sendConfirmationTimeoutMs(), 10 * 60_000);
+});
+
 test("uses Gemini's content ids as stable message identities", async () => {
   const adapter = new GeminiWebAdapter({ profileDir: "." });
   const model = new GeminiRow({
@@ -286,6 +291,17 @@ test("does not read innerText from an absent Gemini alert", async () => {
   assert.equal(await adapter.findUsageLimitMarker(row), null);
 });
 
+test("recognizes an actual Gemini usage-limit alert during a protocol reply", async () => {
+  const adapter = new GeminiWebAdapter({ profileDir: "." });
+  const notice = "已达到使用次数上限";
+  const row = new GeminiRow({ role: "model", text: "<agent_response><done>true</done></agent_response>" });
+  adapter.page = createGeminiPage([row], { alert: notice });
+  assert.equal(await adapter.findUsageLimitMarker(row), notice);
+  const noticeRow = new GeminiRow({ role: "model", text: notice });
+  adapter.page = createGeminiPage([noticeRow]);
+  assert.equal(await adapter.findUsageLimitMarker(noticeRow), notice);
+});
+
 test("rejects a completed Gemini error turn instead of returning it", async () => {
   const adapter = new GeminiWebAdapter({ profileDir: "." });
   const row = new GeminiRow({
@@ -406,7 +422,7 @@ test("clicks Gemini's visible Upload files menu item and handles its filechooser
   ]);
 });
 
-test("uses native pointer focus and keyboard input for Gemini sends", async () => {
+test("fills Gemini through the composer and clicks Send once", async () => {
   const adapter = new GeminiWebAdapter({ profileDir: "." });
   const events = [];
   let currentValue = "";
@@ -426,6 +442,7 @@ test("uses native pointer focus and keyboard input for Gemini sends", async () =
     nth() { return this; },
     async isVisible() { return true; },
     async isEnabled() { return true; },
+    async click() { events.push(["send"]); },
     async scrollIntoViewIfNeeded() {},
     async boundingBox() { return { x: 200, y: 40, width: 60, height: 30 }; },
   };
@@ -458,11 +475,11 @@ test("uses native pointer focus and keyboard input for Gemini sends", async () =
   assert.deepEqual(events.filter(([type]) => type === "insertText"), [
     ["insertText", "hello"],
   ]);
-  assert.equal(events.filter(([type]) => type === "down").length, 2);
-  assert.equal(events.filter(([type]) => type === "up").length, 2);
+  assert.equal(events.filter(([type]) => type === "down").length, 1);
+  assert.equal(events.filter(([type]) => type === "up").length, 1);
+  assert.equal(events.filter(([type]) => type === "send").length, 1);
   assert.deepEqual(events.filter(([type]) => type === "move"), [
     ["move", 60, 40, 8],
-    ["move", 230, 55, 8],
   ]);
   const insertIndex = events.findIndex(([type]) => type === "insertText");
   assert.equal(events[insertIndex - 1][0], "wait");
